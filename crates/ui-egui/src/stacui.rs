@@ -1765,6 +1765,9 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
     }
     want_thumbs(app);
     let (mut zoom, mut add, mut details) = (None, None, None);
+    // The band combination picked on a card: its item's place and the combination's id.
+    #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
+    let mut bands: Option<(usize, &'static str)> = None;
     // A window starts from its last size: without a floor the list would get egui's 64 px back.
     let tall = (app.ui.stac.items.len() as f32 * 96.0 + if app.ui.stac.details.is_some() { 200.0 } else { 0.0 }).min(440.0);
     egui::ScrollArea::vertical().max_height(440.0).min_scrolled_height(tall).show(ui, |ui| {
@@ -1816,6 +1819,24 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
                             if ui.button(tl!("Add")).clicked() {
                                 add = Some(i);
                             }
+                            // The band combinations this item's files can make (the browser has no
+                            // thread to read several files on).
+                            #[cfg(not(target_arch = "wasm32"))]
+                            {
+                                let offered = combinations_offered(item);
+                                if !offered.is_empty() {
+                                    ui.menu_button(tl!("Bands"), |ui| {
+                                        for (id, name) in &offered {
+                                            if ui.button(tl!(*name)).clicked() {
+                                                bands = Some((i, *id));
+                                                ui.close();
+                                            }
+                                        }
+                                    })
+                                    .response
+                                    .on_hover_text(tl!("Add the item's bands as one image, for the part of the map in view"));
+                                }
+                            }
                             if ui.selectable_label(st.details == Some(i), tl!("Details")).clicked() {
                                 details = Some(i);
                             }
@@ -1835,11 +1856,42 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
         app.session.zoom_to(&rustgis_engine::geom::Extent::new(e[0], e[1], e[2], e[3]));
         app.map.invalidate();
     }
+    if let Some((i, id)) = bands {
+        let Some(item) = app.ui.stac.items.get(i).cloned() else { return };
+        add_item_bands(app, &item, id);
+    }
     if let Some(i) = add {
         let Some(item) = app.ui.stac.items.get(i).cloned() else { return };
         let key = app.ui.stac.chosen.get(i).cloned().unwrap_or_default();
         add_item_asset(app, &item, Some(key.as_str()).filter(|k| !k.is_empty()));
     }
+}
+
+/// The band combinations an item's files can make, as (id, name): only those whose three bands it
+/// has ([`stac::bands::available`]).
+#[cfg(not(target_arch = "wasm32"))]
+fn combinations_offered(item: &Item) -> Vec<(&'static str, &'static str)> {
+    stac::bands::available(&stac::bands::bands(item)).into_iter().map(|(c, _)| (c.id, c.name)).collect()
+}
+
+/// The Workflows section that shows a band combination's progress and Cancel while it is read: one
+/// no extension owns, so it opens with the Imagery extension off too (its Indices section would not).
+#[cfg(not(target_arch = "wasm32"))]
+const BANDS_SECTION: &str = "rasterFunctions";
+
+/// Adds an item's band combination as one image for the part of the map in view: `stac.addBands`
+/// reads the three files' windows on a thread of its own, with progress and Cancel in the Workflows
+/// pane, and the layer lands when they are read.
+#[cfg(not(target_arch = "wasm32"))]
+fn add_item_bands(app: &mut RustGisApp, item: &Item, combination: &str) {
+    let p = json!({"item": stac::item_json(item), "combination": combination, "bbox": "view"});
+    crate::analysispane::run_elsewhere(app, BANDS_SECTION, "stac.addBands", p);
+}
+
+/// The browser makes no band combination yet (its menu isn't shown).
+#[cfg(target_arch = "wasm32")]
+fn add_item_bands(app: &mut RustGisApp, _item: &Item, _combination: &str) {
+    app.ui.stac.error = Some(tl!("Band combinations are made on the desktop for now").to_string());
 }
 
 /// An item's properties, a row each (the first hundred, long values cut).
@@ -1973,6 +2025,47 @@ mod tests {
         assert!(!keeps_preset_sort(&app.ui.stac));
         keep_preset_sort_for_its_api(&mut app.ui.stac);
         assert_eq!((app.ui.stac.sortby.as_str(), app.ui.stac.sort_is_default), ("", false));
+    }
+
+    /// An item with a file a colour band, at an address that never resolves (`.invalid`).
+    fn scene(bands: &[&str]) -> Item {
+        let assets: serde_json::Map<String, serde_json::Value> = bands
+            .iter()
+            .map(|b| {
+                let a = json!({"href": format!("https://scene.invalid/{b}.tif"), "type": "image/tiff; application=geotiff; profile=cloud-optimized",
+                    "eo:bands": [{"common_name": b}]});
+                (b.to_string(), a)
+            })
+            .collect();
+        let feature = json!({"type": "Feature", "id": "scene", "bbox": [0, 0, 1, 1], "properties": {"datetime": "2024-06-01T00:00:00Z"}, "assets": assets});
+        stac::item_from_json(&feature, None).unwrap()
+    }
+
+    #[test]
+    fn a_card_offers_the_band_combinations_its_item_can_make_and_adds_one_in_the_background() {
+        let mut app = RustGisApp::with_sample();
+        assert_eq!(combinations_offered(&scene(&["red", "green", "blue"])), [("trueColor", "True color")]);
+        let infrared = combinations_offered(&scene(&["red", "green", "blue", "nir"]));
+        assert_eq!(infrared.iter().map(|(id, _)| *id).collect::<Vec<_>>(), ["trueColor", "colorInfrared"]);
+        assert!(combinations_offered(&scene(&["red"])).is_empty(), "no three bands, no menu");
+        // Picking one starts the command on a thread, without holding the window, whether or not the
+        // Imagery extension is on: its progress is shown in a section no extension owns.
+        assert!(crate::analysispane::section_extension(BANDS_SECTION).is_none());
+        app.run("extension.disable", json!({"id": "imagery"})).unwrap();
+        assert!(crate::analysispane::section_blocked(&app.session, "indices").is_some(), "the Indices section is what was refused");
+        let layers = app.session.map().layers.len();
+        add_item_bands(&mut app, &scene(&["red", "green", "blue"]), "trueColor");
+        assert!(app.workflow.job.is_some() && app.workflow.error.is_none(), "{:?}", app.workflow.error);
+        // The files are never found: it ends as an error, and no layer is added.
+        for _ in 0..1000 {
+            if !crate::analysispane::land_job(&mut app) {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(app.workflow.job.is_none());
+        assert!(app.workflow.error.is_some(), "the read's failure is said");
+        assert_eq!(app.session.map().layers.len(), layers);
     }
 
     #[test]

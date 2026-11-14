@@ -5063,6 +5063,13 @@ fn window_box(s: &Session, p: &Value, seen: Option<[f64; 4]>) -> Result<[f64; 4]
     if w < e && so < n && lon(w) && lon(e) && lat(so) && lat(n) { Ok([w, so, e, n]) } else { Err(NEED.into()) }
 }
 
+/// A window's box as `layer.addUrl` settles it from `p`'s `"bbox"` (the view, or a box in degrees),
+/// for another command that reads windows.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn window_box_of(s: &Session, p: &Value) -> Result<[f64; 4], String> {
+    window_box(s, p, None)
+}
+
 /// `"bbox": "view"`, in any case or spacing.
 #[cfg(not(target_arch = "wasm32"))]
 fn is_view(bbox: Option<&Value>) -> bool {

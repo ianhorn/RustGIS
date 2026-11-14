@@ -6,6 +6,7 @@
 use serde_json::Value;
 
 pub mod area;
+pub mod bands;
 pub mod catalog;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod dated;
@@ -65,6 +66,51 @@ pub struct Asset {
     /// Whether its metadata names such codes but they couldn't be read whole (one isn't a number,
     /// or there are more than are kept): its values can't be told from them.
     pub codes_unread: bool,
+    /// Each band of its file as the catalog describes it (`eo:bands`, `raster:bands`, or STAC 1.1's
+    /// `bands`), in file order; empty when it describes none. See [`bands`].
+    pub bands: Vec<BandInfo>,
+}
+
+/// One band of an asset's file, as its catalog describes it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct BandInfo {
+    /// Its common name (`red`, `nir`, `swir16`…), lower case; empty when it has none.
+    pub common: String,
+    /// Its `raster:bands` scale and offset: a stored value `v` means `v · scale + offset`.
+    pub scale: Option<f64>,
+    pub offset: Option<f64>,
+    /// Its stored no-data value, when the catalog gives a number (`"nan"` is not one).
+    pub nodata: Option<f64>,
+}
+
+/// The most bands of one asset that are kept.
+const MAX_BANDS: usize = 64;
+
+/// The bands an asset describes, from `eo:bands` (names) or STAC 1.1's unified `bands`, and
+/// `raster:bands` (scale, offset, no-data), matched by position. Both spellings of the raster
+/// terms are read (`scale` and `raster:scale`). Hostile input: at most [`MAX_BANDS`], text cut.
+fn asset_bands(asset: &Value) -> Vec<BandInfo> {
+    let list = |key: &str| asset.get(key).and_then(Value::as_array);
+    let named = list("eo:bands").or_else(|| list("bands"));
+    let raster = list("raster:bands");
+    let count = named.map_or(0, |l| l.len()).max(raster.map_or(0, |l| l.len())).min(MAX_BANDS);
+    let number = |band: Option<&Value>, keys: &[&str]| keys.iter().find_map(|k| band?.get(*k)?.as_f64()).filter(|v| v.is_finite());
+    (0..count)
+        .map(|i| {
+            let (named, raster) = (named.and_then(|l| l.get(i)), raster.and_then(|l| l.get(i)));
+            let pick = |keys: &[&str]| number(raster, keys).or_else(|| number(named, keys));
+            BandInfo {
+                common: named
+                    .and_then(|b| b.get("common_name").or_else(|| b.get("eo:common_name")))
+                    .and_then(Value::as_str)
+                    .map(|t| t.trim().to_ascii_lowercase().chars().take(32).collect())
+                    .unwrap_or_default(),
+                scale: pick(&["scale", "raster:scale"]),
+                offset: pick(&["offset", "raster:offset"]),
+                nodata: pick(&["nodata"]),
+            }
+        })
+        .collect()
 }
 
 /// An item: a scene (or tile) with its footprint, time and assets.
@@ -512,6 +558,7 @@ fn item(f: &Value, from: Option<&str>) -> Option<Item> {
                 nodata: band_number(a, "nodata"),
                 invalid: invalid.clone().unwrap_or_default(),
                 codes_unread: invalid.is_none(),
+                bands: asset_bands(a),
             })
         })
         .collect();
@@ -859,9 +906,40 @@ pub fn item_json_with(i: &Item, all: bool) -> Value {
         "bbox": i.bbox,
         "geometry": i.geometry,
         "properties": props,
-        "assets": i.assets.iter().map(|a| (a.key.clone(), serde_json::json!({"href": a.href, "type": a.media_type, "roles": a.roles, "title": a.title}))).collect::<serde_json::Map<_, _>>(),
+        "assets": i.assets.iter().map(|a| (a.key.clone(), asset_json(a))).collect::<serde_json::Map<_, _>>(),
         "links": i.url.as_ref().map(|u| vec![serde_json::json!({"rel": "self", "href": u})]).unwrap_or_default(),
     })
+}
+
+/// An asset as [`item_json_with`] writes it. Its bands are written as STAC 1.1's `bands` (name,
+/// scale, offset and no-data), which [`item_from_json`] reads back, so an item passed on to a
+/// command (`stac.addBands`) keeps what it needs to find and scale them. An asset that names no
+/// band but has a first band's scale, offset or no-data keeps them as one unnamed band.
+fn asset_json(a: &Asset) -> Value {
+    let number = |v: Option<f64>| v.filter(|v| v.is_finite());
+    let band = |b: &BandInfo| {
+        let mut o = serde_json::Map::new();
+        if !b.common.is_empty() {
+            o.insert("eo:common_name".into(), Value::String(b.common.clone()));
+        }
+        for (key, v) in [("raster:scale", b.scale), ("raster:offset", b.offset), ("nodata", b.nodata)] {
+            if let Some(v) = number(v) {
+                o.insert(key.into(), serde_json::json!(v));
+            }
+        }
+        Value::Object(o)
+    };
+    let bands: Vec<Value> = if a.bands.is_empty() {
+        let first = BandInfo { common: String::new(), scale: a.scale, offset: a.offset, nodata: a.nodata };
+        if first == BandInfo::default() { Vec::new() } else { vec![band(&first)] }
+    } else {
+        a.bands.iter().map(band).collect()
+    };
+    let mut out = serde_json::json!({"href": a.href, "type": a.media_type, "roles": a.roles, "title": a.title});
+    if let (false, Some(o)) = (bands.is_empty(), out.as_object_mut()) {
+        o.insert("bands".into(), Value::Array(bands));
+    }
+    out
 }
 
 /// A GeoJSON FeatureCollection of items' footprints (their geometry, or their bbox), with the
@@ -1151,6 +1229,7 @@ mod tests {
             nodata: None,
             invalid: Vec::new(),
             codes_unread: false,
+            bands: Vec::new(),
         }];
         // A Planetary Computer asset is added after signing it with its container's token.
         let (_, href) = pc.asset_href(None).unwrap();
