@@ -1057,7 +1057,10 @@
           "terrain-water",
           "shaded-relief-effects",
           "normalized-legend-urls",
-          "field-origin"
+          "field-origin",
+          "slope-percent",
+          "table-export-order",
+          "tabulate-intersection-unit"
         ],
         "type": "string"
       },
@@ -1126,7 +1129,10 @@
     "terrain-water",
     "shaded-relief-effects",
     "normalized-legend-urls",
-    "field-origin"
+    "field-origin",
+    "slope-percent",
+    "table-export-order",
+    "tabulate-intersection-unit"
   ],
   "x-rustgis-reads-format": 2,
   "x-rustgis-writes-format": 2
