@@ -225,7 +225,7 @@ fn run(app: &mut RustGisApp, id: &str, p: Value) {
 /// in the background, the pane opened at `section` to show its progress, Cancel and result; one
 /// that can't start (another is under way) is said in the status bar too. The rest run here, a
 /// failure said in the status bar.
-#[cfg_attr(target_arch = "wasm32", allow(unused_variables))]
+#[cfg_attr(target_arch = "wasm32", expect(unused_variables, reason = "the browser has no background runs"))]
 pub fn run_elsewhere(app: &mut RustGisApp, section: &str, id: &str, p: Value) {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some((command, name)) = background(id) {
@@ -618,6 +618,9 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     _ => {}
                 }
             });
+            if app.workflow.function == "slope" {
+                ui.label(egui::RichText::new(tl!("Slope is in degrees (0–90), not percent.")).small().weak());
+            }
             let step = json!({"function": app.workflow.function, "expression": app.workflow.text, "value": num(&app.workflow.number, 0.0)});
             if app.workflow.section == "rasterFunctions" {
                 if ui.button(tl!("Apply")).clicked() {
@@ -667,11 +670,12 @@ pub fn workflows(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         .map(|b| (b.stats.min, b.stats.max))
                         .unwrap_or((0.0, 1.0));
                     let step = (st.1 - st.0) / 10.0;
+                    // A constant raster gives empty middle ranges: they match nothing, so leave them out.
                     let ranges: Vec<Value> = (0..10)
-                        .map(|i| {
-                            let lo = st.0 + step * i as f64;
-                            let hi = if i == 9 { f64::MAX } else { lo + step };
-                            json!([if i == 0 { f64::MIN } else { lo }, hi, if high { i + 1 } else { 10 - i }])
+                        .filter_map(|i| {
+                            let lo = if i == 0 { f64::MIN } else { st.0 + step * i as f64 };
+                            let hi = if i == 9 { f64::MAX } else { st.0 + step * (i + 1) as f64 };
+                            (lo < hi).then(|| json!([lo, hi, if high { i + 1 } else { 10 - i }]))
                         })
                         .collect();
                     json!({"layer": n, "ranges": ranges, "weight": w})
@@ -1974,7 +1978,7 @@ fn script(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, fit: bool) {
     }
     // Braces, brackets and quotes closing themselves (#662): what the box does with the keys,
     // followed through after it.
-    let before = crate::scriptcomplete::before(ui, box_id, &app.workflow.script);
+    let before = crate::completion::before(ui, box_id, &app.workflow.script);
     let out = egui::ScrollArea::vertical().id_salt("script_box").max_height(room).auto_shrink([false, true]).show(ui, |ui| {
         egui::TextEdit::multiline(&mut app.workflow.script)
             .id(box_id)
@@ -2302,7 +2306,7 @@ mod tests {
             let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
             while crate::readjob::land(app) {
                 assert!(std::time::Instant::now() < end, "the script never landed");
-                std::thread::sleep(std::time::Duration::from_millis(5));
+                std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for script completion
             }
         };
         // The results say Running… until it lands, then each line's result, as Run #1.
@@ -2612,7 +2616,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while land_job(&mut app) {
             assert!(std::time::Instant::now() < end, "the run never landed");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for workflow completion
         }
         assert!(app.workflow.job.is_none() && app.workflow.error.is_none(), "{:?}", app.workflow.error);
         assert!(app.workflow.result.as_ref().is_some_and(|r| r["layer"].is_u64()), "{:?}", app.workflow.result);
@@ -2638,7 +2642,7 @@ mod tests {
         assert!(app.session.notices.iter().any(|n| n.text.contains("still running")));
         while land_job(&mut app) {
             assert!(std::time::Instant::now() < end, "the run never landed");
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for workflow completion
         }
     }
 
@@ -2683,7 +2687,7 @@ mod tests {
         while h.state().export_job.is_some() {
             assert!(std::time::Instant::now() < end, "conversion never landed");
             h.step();
-            std::thread::sleep(std::time::Duration::from_millis(5));
+            std::thread::sleep(std::time::Duration::from_millis(5)); // test-wait: legacy polling for the export result
         }
         h.run();
         let text = std::fs::read_to_string(&path).unwrap();

@@ -63,6 +63,8 @@ pub const NETWORK: &[&str] = &[
     "arcgis.signIn",
     "arcgis.signOut",
     "arcgis.token",
+    // A sign-in reaches Copernicus Data Space's sign-in host.
+    "copernicus.login",
 ];
 
 /// Registers commands for tile-layer sources, drawing properties, coverage and celestial bodies.
@@ -76,7 +78,7 @@ pub fn commands() -> Vec<C> {
         C::new("map.setTiles", "Tile Layer Properties", "Home › Add", set).inputs(set_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
             r#"{"name"?: text | "index"?: number (0 = top) | "id"?: catalog id, "visible"?: bool, "opacity"?: 0–1, "blend"?: "normal"|"multiply"|"screen"|"overlay"|"darken"|"lighten"|"difference", "move"?: "up"|"down"|"top"|"bottom" (past the next layer in the drawing order of all the map's layers, a feature or raster layer too), "to"?: number (its place in that order among the other layers, 0 = top; the Layers pane lists it), "rename"?: text, "bands"?: [red, green, blue] | [band] (a cloud-optimised GeoTIFF's bands shown, from 1; [] for its own), "range"?: [low, high] (the values shown from black to full colour; null: each band's 2nd–98th percentile), "dequantize"?: "aef" (AlphaEarth's quantised embeddings) | "none", "legend"?: as map.addTiles's, or null for none, "hiddenLayers"?: [source layer name] (vector tiles' source layers not drawn or identified, as map.tiles's sourceLayers names them; replaces the list, [] or null for none), "singleImage"?: bool (as map.addTiles's), "tileSize"?: 256|512|1024 (a WMS or map service asked for in Web Mercator: its tiles' size)}"#,
         ),
-        C::new("map.tiles", "Tile Layers", "Home › Add", |s, _| Ok(list(s, false))).inputs(listing_inputs).roles(&[]).effects(crate::policy::Effects::NONE).view(),
+        C::new("map.tiles", "Tile Layers", "Home › Add", |s, _| Ok(list(s, !s.policy_user()))).inputs(listing_inputs).roles(&[]).effects(crate::policy::Effects::NONE).view(),
         // As `layer.expand` for a layer's classes: what the pane shows, not an edit to undo.
         C::new("map.expandTiles", "Expand Tile Legend", "Layers", |s, p| {
             let i = find(s, p)?.ok_or("name or index is required")?;
@@ -153,13 +155,16 @@ fn body(s: &mut Session, p: &Value) -> CmdResult {
 /// drops the credentials from their addresses.
 pub(crate) fn list(s: &Session, redact: bool) -> Value {
     let picked = s.selected_tile();
+    let shown = |address: &str| {
+        if redact { crate::sources::redact_output(address) } else { crate::sources::strip_capabilities(address) }
+    };
     Value::Array(
         s.map()
             .tiles
             .iter()
             .enumerate()
             .map(|(i, t)| {
-                let url = if redact { crate::sources::redact(&t.url) } else { t.url.clone() };
+                let url = shown(&t.url);
                 let mut o = json!({"index": i, "name": t.name, "id": t.id, "kind": t.kind.code(), "url": url, "visible": t.visible, "error": t.error,
                     "opacity": t.opacity, "blend": t.blend.code(), "overlay": t.overlay, "attribution": t.attribution, "minZoom": t.min_zoom, "maxZoom": t.max_zoom});
                 // Its place in the drawing order: over this map layer, or (none) under them all.
@@ -177,7 +182,7 @@ pub(crate) fn list(s: &Session, redact: bool) -> Value {
                     let legends: Vec<_> = t
                         .legends
                         .iter()
-                        .map(|l| rustgis_data::ogc::Legend { url: if redact { crate::sources::redact(&l.url) } else { l.url.clone() }, ..l.clone() })
+                        .map(|l| rustgis_data::ogc::Legend { url: shown(&l.url), ..l.clone() })
                         .collect();
                     o["legends"] = json!(legends);
                     o["expanded"] = json!(t.expanded);
@@ -342,7 +347,7 @@ pub(crate) fn add_with_metadata_wait(s: &mut Session, p: &Value, metadata_wait: 
     let at = if top { 0 } else { m.tiles.iter().position(|o| !o.overlay && o.over.is_none()).unwrap_or(m.tiles.len()) };
     let mut out = json!({"name": t.name, "kind": t.kind.code(), "index": at});
     if t.time_url.is_some() {
-        out["url"] = json!(crate::sources::redact(&t.url));
+        out["url"] = json!(crate::sources::redact_output(&t.url));
         out["dated"] = json!(true);
     }
     // A file added as data (a catalog's archive, kept where the user put it, excepted) frames the
@@ -536,8 +541,7 @@ fn follow_archive(s: &mut Session, t: &TileLayer, wait: web_time::Duration) -> b
     if whole_world(&e) {
         return false;
     }
-    s.zoom_to(&e);
-    true
+    s.zoom_to(&e)
 }
 
 /// The tile layer a command names by `index`, `name` or `id`.
@@ -831,7 +835,6 @@ pub(crate) fn address_look(look: &Look) -> rustgis_map::raster::AddressLook {
 
 /// A change of a COG layer's look a command asks for (`bands`, `range`, `dequantize`), applied to
 /// the look it has; `None` when it asks for none.
-#[allow(clippy::type_complexity)]
 fn cog_look(p: &Value) -> Result<Option<Box<dyn Fn(Look) -> Look>>, String> {
     if p.get("bands").is_none() && p.get("range").is_none() && p.get("dequantize").is_none() {
         return Ok(None);
@@ -932,6 +935,12 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     let i = find(s, p)?.ok_or("name or index is required")?;
     let mode = blend(p)?;
     let look = cog_look(p)?;
+    // Before the legends are prepared: a refused name must leave no login activated.
+    let rename = ps(p, "rename")
+        .map(str::trim)
+        .filter(|r| !r.is_empty())
+        .map(|r| super::within("rename", "a tile layer's name", r, 120))
+        .transpose()?;
     let mut new_legends = match p.get("legend") {
         None => None,
         Some(Value::Null) => Some(Vec::new()),
@@ -1002,8 +1011,8 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(m) = mode {
         t.blend = m;
     }
-    if let Some(r) = ps(p, "rename").map(str::trim).filter(|r| !r.is_empty()) {
-        t.name = r.chars().take(120).collect();
+    if let Some(r) = rename {
+        t.name = r;
     }
     if let Some(url) = new_url {
         // A dated layer keeps the look at every date: its template takes it too, and a data
@@ -1034,7 +1043,7 @@ fn set(s: &mut Session, p: &Value) -> CmdResult {
     if let Some(old) = old_name.filter(|o| *o != new_name) {
         super::layer::legends_follow_layer(s, &old, Some(&new_name));
     }
-    Ok(list(s, false))
+    Ok(list(s, !s.policy_user()))
 }
 
 #[cfg(test)]

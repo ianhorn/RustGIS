@@ -34,7 +34,10 @@ Select a layer in Layers and open **Style › Symbology** (or the Symbology pane
   (`layer.symbology={"type": "unique", "expression": "…"}`).
 - **Graduated Colors**: 1 to 12 classes of a numeric field by natural breaks (Jenks), equal
   interval, quantile, geometric interval, standard deviation, arithmetic progression or head/tail
-  breaks (the Method list is in alphabetical order). Geometric interval makes class
+  breaks (the Method list is in alphabetical order). Quantile sorts the values and places each
+  class's upper bound at an **observed value**, without interpolation between values. It aims for
+  similar record counts per class; ties can give unequal counts or fewer distinct classes.
+  Geometric interval makes class
   widths grow by one ratio, for values piled up at the low end; for a field that reaches zero or
   below, the minimum is taken as if it sat at a hundredth of the range, so the widths grow by
   101^(1/classes). Standard deviation makes classes one deviation wide about the mean, and leaves
@@ -678,7 +681,11 @@ ribbon and the layer's right-click menu. A tab per topic shows one part at a tim
 - **Display**: the visibility range (**Out Beyond**, **In Beyond**, **Clear Limits**),
   **Transparency**, **Masking**, a raster's **Layer Blend** or a feature layer's **Reference
   scale**, and the **Depth priority** that View › Scene › Raise and Lower Priority change (a
-  higher one draws on top, whatever the layer order).
+  higher one draws on top, whatever the layer order). A polygon layer also has its
+  **Extrusion**, as Style › Extrusion, Faces and Light and Shadow set it: the **Type** (None,
+  Constant height or By a numeric field) and, once extruded, the **Height (m)** of a constant
+  height (the ribbon sets 50 km), **Factor**, **Base** with **Base (m)**, **Face Culling**,
+  **Lighting** and **Cast Shadow**. Each change undoes on its own.
 - **Query**, for a feature layer: its definition query, the SQL clause the features must match to
   draw (the grammar is in [Expressions](expressions.md)). Buttons add a field or an operator, and
   the **Functions** and **Variables** menus add a function (left open for its arguments, with what
@@ -710,6 +717,19 @@ range); **Aggregation** draws points as hexagon or square bins coloured by count
 **Factor**, with **Face Culling**, **Lighting** and **Cast Shadow** controls. It draws in an
 oblique view on an untilted flat map and in perspective on a tilted map; the globe draws the
 polygons flat. See [Rotating and tilting the map](maps.md#navigating).
+
+An extrusion can stand on a **base**: its walls rise from the base to the base plus the height,
+so a balcony or a bridge floats above the ground. The base is a numeric field's value (such as the
+`base_height` the CityGML and CityJSON readers give each part), else a constant in metres, both
+multiplied by the same **Factor** as the height. A value that is no number takes the constant,
+and a negative base is the ground. Shadows fall from the base, roof labels sit at the top, and a
+web scene (**Publish › Share As › Web Scene**) raises the parts too. Once a layer is extruded,
+**Style › Extrusion › Base** chooses **Ground** (which also sets **Base (m)** to 0), a field
+(**By base_height**), or the constant **Base (m)** sets, listed once it is above 0; neither changes
+the height or the factor. The `layer.extrusionBase` command does the same (`field`, `base`;
+`"field": null` clears the field). Turning extrusion off drops the base with it. Without a tilt,
+and on a tilted map drawn without the graphics card, extrusions are painted in the order they
+stand on the ground, so a part raised over a building behind it may be painted under it.
 
 For a raster layer, the **Style** tab also has **Layer Blend** (multiply, screen, overlay,
 darken, lighten, difference), **Swipe** (the layer shows only left of a divider you slide, to

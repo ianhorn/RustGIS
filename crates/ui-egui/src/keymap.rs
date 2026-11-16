@@ -64,6 +64,8 @@ pub const MAP_TOOLS: &[(&str, &str)] = &[
     ("createLine", "Create Line"),
     ("createPolygon", "Create Polygon"),
     ("editVertices", "Edit Vertices"),
+    ("rotatedBox", "Rotated Box"),
+    ("circle", "Circle"),
     ("cutPolygon", "Cut Polygon"),
     ("reshape", "Reshape"),
 ];

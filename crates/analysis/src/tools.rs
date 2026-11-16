@@ -1628,6 +1628,24 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
     }
 }
 
+/// Clip's part and whether its total polygon area is less than one millionth of the input's:
+/// a possible boundary sliver, kept unchanged. Measure both in the overlay plane while they
+/// are already projected, once per feature, without projecting the result back again to measure
+/// it. The input's overlapping polygon parts must first be dissolved, as for [`part`].
+fn clip_part(g: &Geometry, mask: &MultiPolygon<f64>) -> Option<(Geometry, bool)> {
+    use geo::Area;
+    if let Some(whole) = to_multipolygon(g) {
+        let piece = whole.intersection(mask);
+        if piece.0.is_empty() {
+            return None;
+        }
+        let sliver = piece.unsigned_area() < whole.unsigned_area() * 1e-6;
+        from_multipolygon(&piece).map(|g| (g, sliver))
+    } else {
+        part(g, mask, true).map(|g| (g, false))
+    }
+}
+
 /// Clip each input feature to the union of only the selected clip polygons whose projected
 /// extents meet it. Union candidates together so overlapping masks never duplicate output.
 /// Cancel is looked at, and progress counted, mask by mask and feature by feature; one mask's
@@ -1798,6 +1816,7 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
     // The masks reaching each pole: a point at one is in them at any longitude (#1033).
     let at_poles = AtPoles::new(masks.iter().map(|(m, _)| plane_poles(m)));
     let mut out = copy_schema(ds, out_name(p, format!("{}_Clip", ds.name)), ds.geometry_type);
+    let mut slivers = 0;
     let input_rows = rows(inp, p, "input", ds);
     // Input features without geometry, or with an empty one: nothing of them can be kept.
     let without = input_rows
@@ -1868,14 +1887,15 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
                 let shape = dissolved(g);
                 Ok(if let [i] = near.as_slice() {
                     cache.big = None;
-                    masks.get(*i).and_then(|(m, _)| part(&shape, m, true))
+                    masks.get(*i).and_then(|(m, _)| clip_part(&shape, m))
                 } else {
-                    part(&shape, &cache.union_of(&near, &masks), true)
+                    clip_part(&shape, &cache.union_of(&near, &masks))
                 })
             },
         )?;
         for (&r, c) in batch.iter().zip(clipped) {
-            let (Some(f), Some(c)) = (ds.features.get(r), c) else { continue };
+            let (Some(f), Some((c, sliver))) = (ds.features.get(r), c) else { continue };
+            slivers += usize::from(sliver);
             out.push(Some(c), f.attrs.clone());
         }
     }
@@ -1885,6 +1905,9 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
         r.messages.push(format!("Clip: {without} feature(s) of '{}' left out: they have no geometry to clip", ds.name));
     }
     r.messages.extend(left.notes("Clip", &clip_ds.name));
+    if slivers > 0 {
+        r.messages.push(format!("Clip: {slivers} output feature(s) have less than one millionth of their input feature's area in the overlay plane; they may be slivers along the clip boundary (kept unchanged)"));
+    }
     Ok(r)
 }
 
@@ -2490,7 +2513,8 @@ const SPLIT_PART_CHUNK: usize = if cfg!(test) { 64 } else { 65_536 };
 /// as the other half holds of twice the largest input feature's and area's coordinates. Cancel
 /// is looked at, and progress counted, item by item in each step; one feature made ready, one
 /// area's union and one part are each a step without a look, which can be long for an area of
-/// many large polygons.
+/// many large polygons. Candidate ordering is another unchecked step, bounded by the
+/// layer's feature count when adding pole candidates; its reused buffer is sorted in place.
 fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
@@ -2511,6 +2535,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
     let mut groups: Vec<(String, Vec<usize>)> = Vec::new();
     let mut by_key: HashMap<(bool, String), usize> = HashMap::new();
     for (zi, z) in zones.iter().enumerate() {
+        crate::control::check()?;
         let Some(f) = sp.features.get(z.row) else { continue };
         let value = field.and_then(|i| f.attrs.get(i)).filter(|v| !v.is_null());
         // -0 is 0, in the key and the name alike.
@@ -2531,34 +2556,81 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
         }
     }
     let prefix = out_name(p, ds.name.clone());
-    let located: Vec<(usize, Extent)> =
-        rows(inp, p, "input", ds).into_iter().filter_map(|r| Some((r, ds.features.get(r)?.geometry.as_ref()?.extent()))).collect();
-    let index = ExtentIndex::new(located.iter().map(|(_, e)| *e));
+    let mut located = Vec::new();
+    for row in rows(inp, p, "input", ds) {
+        crate::control::check()?;
+        if let Some(geometry) = ds.features.get(row).and_then(|feature| feature.geometry.as_ref()) {
+            located.push((row, geometry.extent()));
+        }
+    }
+    let index = ExtentIndex::with_checks(located.iter().map(|(_, e)| *e), crate::control::check)?;
     // The input points at each pole: in a split polygon reaching it, at any longitude (#1033).
     let point = |r: usize| {
         ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(|g| matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)))
     };
-    let points_at_poles = AtPoles::new(located.iter().map(|(r, e)| if point(*r) { poles(e) } else { (false, false) }));
+    let mut points_at_poles = AtPoles::default();
+    for (i, (row, extent)) in located.iter().enumerate() {
+        crate::control::check()?;
+        let (north, south) = if point(*row) { poles(extent) } else { (false, false) };
+        if north {
+            points_at_poles.north.push(i);
+        }
+        if south {
+            points_at_poles.south.push(i);
+        }
+    }
     // Each split area: its polygons, their extent and the poles they reach.
     let areas: Vec<(String, Vec<&Zone>, Extent, (bool, bool))> = groups
         .into_iter()
         .map(|(name, members)| {
-            let polys: Vec<&Zone> = members.iter().filter_map(|zi| zones.get(*zi)).collect();
-            let ext = polys.iter().fold(Extent::EMPTY, |e, z| e.union(&z.ext));
-            let reached = polys.iter().map(|z| poles(&z.ext)).fold((false, false), |(n, s), (zn, zs)| (n || zn, s || zs));
-            (name, polys, ext, reached)
+            crate::control::check()?;
+            let mut polys = Vec::new();
+            let mut ext = Extent::EMPTY;
+            let mut reached = (false, false);
+            for zi in members {
+                crate::control::check()?;
+                if let Some(zone) = zones.get(zi) {
+                    polys.push(zone);
+                    ext = ext.union(&zone.ext);
+                    let (north, south) = poles(&zone.ext);
+                    reached = (reached.0 || north, reached.1 || south);
+                }
+            }
+            Ok((name, polys, ext, reached))
         })
-        .collect();
+        .collect::<Result<_, String>>()?;
     // The input features an area meets, by their place in `located`, in the index's order.
-    let met_by = |ext: &Extent, reached: (bool, bool), cand_buf: &mut Vec<usize>| {
-        index.candidates_into(ext, cand_buf);
-        points_at_poles.add_to(reached, cand_buf);
-        cand_buf.retain(|&li| {
-            located.get(li).is_some_and(|(r, e)| {
+    let met_by = |ext: &Extent, reached: (bool, bool), cand_buf: &mut Vec<usize>| -> Result<(), String> {
+        index.checked_candidates_into(ext, cand_buf)?;
+        for rows in [reached.0.then_some(&points_at_poles.north), reached.1.then_some(&points_at_poles.south)].into_iter().flatten() {
+            for chunk in rows.chunks(4096) {
+                crate::control::check()?;
+                cand_buf.extend_from_slice(chunk);
+            }
+        }
+        if reached.0 || reached.1 {
+            cand_buf.sort_unstable();
+            crate::control::check()?;
+            cand_buf.dedup();
+        }
+        let mut kept = 0;
+        for position in 0..cand_buf.len() {
+            if position % 4096 == 0 {
+                crate::control::check()?;
+            }
+            let Some(li) = cand_buf.get(position).copied() else { continue };
+            if located.get(li).is_some_and(|(r, e)| {
                 ds.features.get(*r).is_some_and(|f| f.geometry.is_some())
                     && (e.intersects(ext) || (point(*r) && meet_at_a_pole(poles(e), reached)))
-            })
-        });
+            }) {
+                if let Some(slot) = cand_buf.get_mut(kept) {
+                    *slot = li;
+                }
+                kept += 1;
+            }
+        }
+        cand_buf.truncate(kept);
+        Ok(())
     };
     // Which features some area meets, and how many parts there are to make: looked up area by
     // area (the index's lookups, quick), counted area by area, with Cancel looked at for each and
@@ -2570,7 +2642,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
     for (done, (_, _, ext, reached)) in areas.iter().enumerate() {
         crate::control::check()?;
         crate::control::reached(done);
-        met_by(ext, *reached, &mut cand_buf);
+        met_by(ext, *reached, &mut cand_buf)?;
         pairs = pairs.saturating_add(cand_buf.len());
         for (k, &li) in cand_buf.iter().enumerate() {
             if k % 4096 == 4095 {
@@ -2662,7 +2734,7 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
         };
         let mut work: Vec<(usize, usize)> = Vec::new();
         for (ai, (_, _, ext, reached)) in batch.iter().enumerate() {
-            met_by(ext, *reached, &mut cand_buf);
+            met_by(ext, *reached, &mut cand_buf)?;
             for &li in &cand_buf {
                 work.push((ai, li));
                 if work.len() >= SPLIT_PART_CHUNK {
@@ -2755,8 +2827,8 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         if !requests.is_empty() {
             record_order(&mut records);
             // Each record is in one group: counted here, each is counted once.
-            rounded.count_texts(ds, &records, &requests, false);
-            attrs.extend(statistic_values(ds, &records, &requests, false, separator, &mut rounded));
+            rounded.count_texts(ds, &records, &requests, false)?;
+            attrs.extend(statistic_values(ds, &records, &requests, false, separator, &mut rounded)?);
         }
         out.push(from_multipolygon(&u), attrs);
     }
@@ -3995,9 +4067,110 @@ fn simplify_ring(ring: &geo::LineString<f64>, tol_m: f64, run: &SimplifyRun) -> 
 }
 
 /// A geometry simplified (Douglas–Peucker) to a tolerance in meters, converted at each vertex's
-/// latitude ([`simplify_coords`]).
-pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> Geometry {
-    simplify_checked(g, tol_m).geometry
+/// latitude ([`simplify_coords`]), with what Simplify says about it ([`SimplifyNotes`]): a caller
+/// outside the Simplify tool says them too (#1811).
+pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> (Geometry, SimplifyNotes) {
+    let s = simplify_checked(g, tol_m);
+    let mut notes = SimplifyNotes { broken: usize::from(s.broken), capped: usize::from(s.capped), ..SimplifyNotes::default() };
+    // A line or polygon with a coordinate missing, or a longitude too far out for the analysis
+    // plane, is left exactly as it was (`simplify_checked`), and the feature is counted. Otherwise
+    // a latitude past ±90° (bad data), infinite ones included, is taken as that pole by the plane,
+    // and the vertices are counted; a line part of fewer than 2 vertices has no line to keep
+    // (`from_line`), and is counted. Points aren't simplified.
+    if tol_m > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
+        let mut beyond = false;
+        g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+        notes.polar = usize::from(beyond);
+        // The vertices taken to a pole are those in what's kept: a line's parts of 2 vertices or
+        // more, a polygon's rings. A line whose parts are all that short is kept as it was
+        // (`from_line` has none to give), so only the short parts beside a longer one go.
+        (notes.past_pole, notes.short) = match g {
+            Geometry::Line(parts) if parts.iter().any(|p| p.len() >= 2) => {
+                (past_pole(parts.iter().filter(|p| p.len() >= 2).flatten()), parts.iter().filter(|p| p.len() < 2).count())
+            }
+            Geometry::Line(_) => (0, 0),
+            Geometry::Polygon(polygons) => (past_pole(polygons.iter().flatten().flatten()), 0),
+            _ => (0, 0),
+        };
+        // A geometry given back as it was (nothing to keep in the plane, or canceled) moved nothing
+        // and left nothing out: looked at only when there's something to say.
+        if (notes.past_pole > 0 || notes.short > 0) && s.geometry == *g {
+            (notes.past_pole, notes.short) = (0, 0);
+        }
+    }
+    (s.geometry, notes)
+}
+
+/// The vertices with a latitude past a pole (bad data), infinite ones included: Simplify takes
+/// them as that pole ([`SimplifyNotes::past_pole`]).
+pub fn past_pole<'a>(coords: impl IntoIterator<Item = &'a Coord>) -> usize {
+    coords.into_iter().filter(|c| !c.y.is_nan() && c.y.abs() > 90.0).count()
+}
+
+/// What Simplify left alone or changed beyond simplifying, counted over the geometries it was
+/// given ([`simplify_geometry`]); [`SimplifyNotes::messages`] says it, one notice per kind.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SimplifyNotes {
+    /// Lines and polygons reaching beyond 85.05°, where the tolerance is taken east–west at 85°'s
+    /// scale (less is simplified away there than asked, #1033).
+    pub polar: usize,
+    /// Lines and polygons left as they were: a coordinate missing, or a longitude too far out.
+    pub broken: usize,
+    /// Features too intricate to simplify whole within the work allowed ([`SIMPLIFY_WORK`]).
+    pub capped: usize,
+    /// Line parts of fewer than 2 vertices left out.
+    pub short: usize,
+    /// Vertices with a latitude past a pole, taken as that pole before simplifying.
+    pub past_pole: usize,
+}
+
+impl SimplifyNotes {
+    /// Counts `other`'s too.
+    pub fn add(&mut self, other: &SimplifyNotes) {
+        self.polar += other.polar;
+        self.broken += other.broken;
+        self.capped += other.capped;
+        self.short += other.short;
+        self.past_pole += other.past_pole;
+    }
+
+    /// All but [`SimplifyNotes::polar`], for a caller that simplifies to its own tolerance (a
+    /// package, a locator's sketch): reaching beyond 85.05° only simplifies a little less there, and
+    /// any world map reaches it (Antarctica, to -90°), so saying it would be said every time.
+    pub fn without_polar(&self) -> SimplifyNotes {
+        SimplifyNotes { polar: 0, ..*self }
+    }
+
+    /// One notice per kind counted, each starting with `lead` (who simplified: "Simplify"); none
+    /// when nothing was.
+    pub fn messages(&self, lead: &str) -> Vec<String> {
+        let SimplifyNotes { polar, broken, capped, short, past_pole } = *self;
+        let mut said = Vec::new();
+        if polar > 0 {
+            said.push(format!(
+                "{lead}: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
+            ));
+        }
+        if broken > 0 {
+            said.push(format!(
+                "{lead}: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
+            ));
+        }
+        if capped > 0 {
+            said.push(format!(
+                "{lead}: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
+            ));
+        }
+        if short > 0 {
+            said.push(format!("{lead}: {short} line part(s) of fewer than 2 vertices left out"));
+        }
+        if past_pole > 0 {
+            said.push(format!(
+                "{lead}: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"
+            ));
+        }
+        said
+    }
 }
 
 /// What [`simplify_checked`] made of a geometry, and what it said no to.
@@ -4085,7 +4258,8 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
     let ds = input(inp, p, "input")?;
     let tol = num(p, "tolerance").ok_or("Tolerance must be a number")?.abs() * 1000.0;
     let mut out = copy_schema(ds, out_name(p, format!("{}_Simplified", ds.name)), ds.geometry_type);
-    let (mut before, mut after, mut polar) = (0usize, 0usize, 0usize);
+    let (mut before, mut after, mut without) = (0usize, 0usize, 0usize);
+    let mut notes = SimplifyNotes::default();
     let input_rows = rows(inp, p, "input", ds);
     crate::control::begin(input_rows.len());
     let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(input_rows.len(), PARALLEL_FEATURES));
@@ -4094,86 +4268,28 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         threads,
         || (),
         |_, _, &r| {
-            let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
-                // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`):
-                // a line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
-                // ground is far narrower, so less is taken out there than asked (#1033). Points
-                // aren't simplified.
-                // A line or polygon with a coordinate missing, or a longitude too far out for the
-                // analysis plane, is left exactly as it was (`simplify_checked`), and the feature is
-                // counted. Otherwise a latitude past ±90° (bad data), infinite ones included, is
-                // taken as that pole by the plane, and the vertices are counted; a line part of fewer
-                // than 2 vertices has no line to keep (`from_line`), and is counted.
-                let s = simplify_checked(g, tol);
-                let (mut beyond, mut past_pole, mut short) = (false, 0usize, 0usize);
-                // A geometry given back as it was (nothing to keep in the plane) moved nothing.
-                let changed = s.geometry != *g;
-                if tol > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
-                    let past = |c: &Coord| !c.y.is_nan() && c.y.abs() > 90.0;
-                    g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
-                    // The vertices taken to a pole are those in what's kept: a line's parts of 2
-                    // vertices or more, a polygon's rings.
-                    past_pole = match g {
-                        _ if !changed => 0,
-                        Geometry::Line(parts) => parts.iter().filter(|p| p.len() >= 2).flatten().filter(|c| past(c)).count(),
-                        _ => {
-                            let mut n = 0;
-                            g.for_each_coord(|c| n += usize::from(past(&c)));
-                            n
-                        }
-                    };
-                    // A line whose parts are all that short is kept as it was (`from_line` has none
-                    // to give), so only the short parts beside a longer one go.
-                    if let Geometry::Line(parts) = g
-                        && parts.iter().any(|p| p.len() >= 2)
-                    {
-                        short = parts.iter().filter(|p| p.len() < 2).count();
-                    }
-                }
-                (g.coord_count(), beyond, past_pole, short, s)
-            });
+            // Each vertex's tolerance is taken at its own latitude, at most 85°'s (`merc_scale`): a
+            // line or polygon reaching beyond 85.05° has it east–west there at 85°'s, where the
+            // ground is far narrower, so less is taken out there than asked (#1033). What it left
+            // alone or changed is counted ([`SimplifyNotes`]).
+            let made = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| (g.coord_count(), simplify_geometry(g, tol)));
             Ok::<_, String>(made)
         },
     )?;
-    let (mut broken, mut without, mut past_pole, mut short, mut capped) = (0usize, 0usize, 0usize, 0usize, 0usize);
     for (r, made) in input_rows.into_iter().zip(simplified) {
         let Some(f) = ds.features.get(r) else { continue };
         // A feature without geometry has nothing to simplify: left out, and counted.
-        let Some((count, beyond, past, parts, s)) = made else {
+        let Some((count, (geometry, said))) = made else {
             without += 1;
             continue;
         };
         before += count;
-        polar += usize::from(beyond);
-        broken += usize::from(s.broken);
-        capped += usize::from(s.capped);
-        past_pole += past;
-        short += parts;
-        after += s.geometry.coord_count();
-        out.push(Some(s.geometry), f.attrs.clone());
+        notes.add(&said);
+        after += geometry.coord_count();
+        out.push(Some(geometry), f.attrs.clone());
     }
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
-    if polar > 0 {
-        messages.push(format!(
-            "Simplify: {polar} line or polygon feature(s) reach beyond 85.05°, where the tolerance is taken east–west at 85°'s scale: less is simplified away there than asked"
-        ));
-    }
-    if broken > 0 {
-        messages.push(format!(
-            "Simplify: {broken} line or polygon feature(s) have a coordinate missing, or a longitude too far out to place: they are left as they were"
-        ));
-    }
-    if capped > 0 {
-        messages.push(format!(
-            "Simplify: {capped} feature(s) were too intricate to simplify whole within the work allowed: parts of them keep more vertices than asked"
-        ));
-    }
-    if short > 0 {
-        messages.push(format!("Simplify: {short} line part(s) of fewer than 2 vertices left out"));
-    }
-    if past_pole > 0 {
-        messages.push(format!("Simplify: {past_pole} vertex(es) with a latitude past a pole found (taken as that pole before simplifying, so some may then go)"));
-    }
+    messages.extend(notes.messages("Simplify"));
     if without > 0 {
         messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
     }
@@ -4741,6 +4857,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         ));
     };
 
+    if crs.is_geocentric() {
+        return Err("kernel density requires a projected coordinate system with linear units (such as UTM or State Plane), not a geocentric one (X, Y and Z from the Earth's centre). Provide a projected system under 'crs' (e.g. EPSG:32618)".into());
+    }
     if crs.is_geographic() {
         if !crs_text.is_empty() {
             return Err("crs must be a projected coordinate system with linear units (such as UTM or State Plane, e.g. EPSG:32618), not geographic coordinates (degrees)".into());
@@ -5044,14 +5163,14 @@ fn count_points_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
         out.fields.extend(added);
         // A point in several overlapping polygons is read for each of them: counted over the
         // points, not the polygons' lists, each is counted once.
-        rounded.count_texts(pts, &summarised, &requests, false);
+        rounded.count_texts(pts, &summarised, &requests, false)?;
         let width = out.fields.len();
         for (f, mut records) in out.features.iter_mut().zip(members) {
             if f.attrs.len() < width {
                 f.attrs.resize(width, Value::Null);
             }
             record_order(&mut records);
-            let values = statistic_values(pts, &records, &requests, false, separator, &mut rounded);
+            let values = statistic_values(pts, &records, &requests, false, separator, &mut rounded)?;
             for (i, v) in values.into_iter().enumerate() {
                 if let Some(slot) = f.attrs.get_mut(first + i) {
                     *slot = v;
@@ -5073,7 +5192,7 @@ fn lonlat_line(coords: &[Coord]) -> geo::LineString<f64> {
 /// lon/lat polygon geometry on the WGS 84 ellipsoid, as Calculate Geometry Attributes gives them;
 /// zero for any other geometry.
 fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
-    use geo::GeodesicArea;
+    use geo::{BoundingRect, GeodesicArea};
     let (mut a, mut per) = (0.0, 0.0);
     let Geometry::Polygon(polys) = g else { return (a, per) };
     for rings in polys {
@@ -5101,10 +5220,15 @@ fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
             let polar = ring.0.first().zip(ring.0.last()).is_some_and(|(a, b)| (a.x - b.x).abs() > 180.0);
             let orientable = !polar && ring.0.iter().all(|c| c.x.is_finite() && (-90.0..=90.0).contains(&c.y));
             let polygon = geo::Polygon::new(ring, vec![]);
-            let (rp, ra) = if orientable {
+            // Within an unwrapped longitude span of 180°, the ring cannot enclose more than a
+            // hemisphere.
+            // Use signed magnitude there: a tiny overlay sliver can have opposite planar and
+            // geodesic windings, making its unsigned area nearly the whole Earth (#1966).
+            let wide = orientable && polygon.bounding_rect().is_some_and(|bounds| bounds.width() > 180.0);
+            let (rp, ra) = if wide {
                 polygon.orient(Direction::Default).geodesic_perimeter_area_unsigned()
             } else {
-                // Keep smaller polar caps; invalid coordinates bypass planar orientation.
+                // Keep smaller local rings and polar caps; invalid coordinates bypass orientation.
                 let (perimeter, area) = polygon.geodesic_perimeter_area_signed();
                 (perimeter, area.abs())
             };
@@ -5423,11 +5547,11 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     rs.sort_unstable();
     rs.dedup();
     let mut rounded = Rounded::new(requests.len());
-    rounded.count_texts(ds, &rs, &requests, as_numbers);
+    rounded.count_texts(ds, &rs, &requests, as_numbers)?;
     for group in stats::group_rows(ds, &rs, &cases) {
         let mut row = group.key;
         row.push(stats::count(group.rows.len()));
-        row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded));
+        row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded)?);
         // One past the last id: `push` would search them all for each group.
         out.push_next(None, row);
     }
@@ -5474,7 +5598,7 @@ impl Rounded {
     /// records `rows` are whole numbers written as text past the i64 range, read as decimals.
     /// Called once over the records a tool reads, each once, so a value is counted once however
     /// many groups (Summarize Within's polygons) it is summarised in.
-    fn count_texts(&mut self, ds: &Dataset, rows: &[usize], requests: &[crate::stats::Request], as_numbers: bool) {
+    fn count_texts(&mut self, ds: &Dataset, rows: &[usize], requests: &[crate::stats::Request], as_numbers: bool) -> Result<(), String> {
         // Each field once, in the requests' order, which names them in the notice.
         let mut fields: Vec<usize> = Vec::new();
         for r in requests {
@@ -5483,7 +5607,7 @@ impl Rounded {
             }
         }
         for field in fields {
-            let n = crate::stats::column(ds, rows, field, as_numbers).rounded_texts();
+            let n = crate::stats::checked_column(ds, rows, field, as_numbers)?.rounded_texts();
             if n == 0 {
                 continue;
             }
@@ -5493,6 +5617,7 @@ impl Rounded {
                 None => self.texts.push((name.to_string(), n)),
             }
         }
+        Ok(())
     }
 }
 
@@ -5509,30 +5634,33 @@ fn statistic_values(
     as_numbers: bool,
     separator: &str,
     rounded: &mut Rounded,
-) -> Vec<Value> {
+) -> Result<Vec<Value>, String> {
     use crate::stats;
     let mut read: Vec<(usize, stats::Column)> = Vec::new();
     let mut out = Vec::with_capacity(requests.len());
     for r in requests {
+        crate::control::check()?;
         let i = match read.iter().position(|(f, _)| *f == r.field) {
             Some(i) => i,
             None => {
-                read.push((r.field, stats::column(ds, rows, r.field, as_numbers)));
+                read.push((r.field, stats::checked_column(ds, rows, r.field, as_numbers)?));
                 read.len() - 1
             }
         };
-        let value = read.get(i).map_or(Value::Null, |(_, c)| {
-            let v = stats::compute(r.stat, c, separator);
+        let value = if let Some((_, c)) = read.get(i) {
+            let v = stats::checked_compute(r.stat, c, separator)?;
             if stats::rounded(r.stat, c, &v)
                 && let Some(n) = rounded.results.get_mut(out.len())
             {
                 *n += 1;
             }
             v
-        });
+        } else {
+            Value::Null
+        };
         out.push(value);
     }
-    out
+    Ok(out)
 }
 
 /// The notices for what a statistics list lost to decimals: the statistics that came out rounded,
@@ -5720,7 +5848,7 @@ fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     // numbers written as text past the i64 range that a statistic read as decimals, each once.
     let mut rounded = Rounded::new(columns.len());
     if let Some(stat) = stat {
-        rounded.count_texts(ds, &rs, &[Request { field: value, stat }], false);
+        rounded.count_texts(ds, &rs, &[Request { field: value, stat }], false)?;
     }
     let mut column_of: HashMap<usize, usize> = HashMap::with_capacity(rs.len());
     for (c, column) in columns.iter().enumerate() {
@@ -5915,12 +6043,13 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     }
     let (zones_shapeless, classes_shapeless) = (shapeless(zones, &zone_rows), shapeless(classes, &class_rows));
     // Features with a ring that jumps across the antimeridian unsplit: the overlay, like the map,
-    // takes such a ring the long way round, while `area_km2` takes its ground shape.
+    // takes such a ring the long way round, while `area_km2` takes its ground shape. A ring that
+    // loops around a pole jumps too, but is no crossing: it has a notice of its own (#1354).
     let unsplit = |ds: &Dataset, rs: &[usize]| {
         let jumps = |g: &Geometry| {
             has_shape(g)
                 && matches!(g, Geometry::Polygon(polys) if polys.iter().flatten().any(|r| {
-                    r.iter().zip(r.iter().cycle().skip(1)).any(|(a, b)| (b.x - a.x).abs() > 180.0)
+                    r.iter().zip(r.iter().cycle().skip(1)).any(|(a, b)| (b.x - a.x).abs() > 180.0) && rustgis_geom::ring_pole_turns(r) == 0
                 }))
         };
         rs.iter().filter(|&&r| ds.features.get(r).and_then(|f| f.geometry.as_ref()).is_some_and(jumps)).count()
@@ -6444,8 +6573,21 @@ impl ExtentIndex {
 
     /// An index of these extents, numbered in order from 0.
     pub(crate) fn new(extents: impl Iterator<Item = Extent>) -> Self {
-        let extents: Vec<Extent> = extents.collect();
-        let total = extents.iter().fold(Extent::EMPTY, |t, e| t.union(e));
+        match Self::with_checks(extents, || Ok::<(), std::convert::Infallible>(())) {
+            Ok(index) => index,
+            Err(never) => match never {},
+        }
+    }
+
+    fn with_checks<E>(extents: impl Iterator<Item = Extent>, mut check: impl FnMut() -> Result<(), E>) -> Result<Self, E> {
+        let mut collected = Vec::new();
+        let mut total = Extent::EMPTY;
+        for extent in extents {
+            check()?;
+            total = total.union(&extent);
+            collected.push(extent);
+        }
+        let extents = collected;
         let n_cells = (extents.len() as f64).sqrt().clamp(4.0, 256.0);
         let mut index = ExtentIndex {
             total,
@@ -6456,20 +6598,23 @@ impl ExtentIndex {
             references: 0,
         };
         if extents.len() <= Self::MAX_LINEAR_FEATURES || total.is_empty() {
-            return index;
+            return Ok(index);
         }
         let mut references = 0usize;
         for e in &extents {
+            check()?;
             let ((x0, y0), (x1, y1)) = (index.key(e.min_x, e.min_y), index.key(e.max_x, e.max_y));
             references = references.saturating_add(((x1 - x0 + 1) as usize).saturating_mul((y1 - y0 + 1) as usize));
             if references > Self::MAX_REFERENCES {
-                return index;
+                return Ok(index);
             }
         }
         let mut grid: std::collections::HashMap<(i64, i64), Vec<usize>> = std::collections::HashMap::new();
         for (i, e) in extents.iter().enumerate() {
+            check()?;
             let ((x0, y0), (x1, y1)) = (index.key(e.min_x, e.min_y), index.key(e.max_x, e.max_y));
             for x in x0..=x1 {
+                check()?;
                 for y in y0..=y1 {
                     grid.entry((x, y)).or_default().push(i);
                 }
@@ -6477,7 +6622,7 @@ impl ExtentIndex {
         }
         index.grid = Some(grid);
         index.references = references;
-        index
+        Ok(index)
     }
 
     /// Conservative retained grid allocation estimate: spare reference capacity plus table
@@ -6551,6 +6696,37 @@ impl ExtentIndex {
         }
         out.sort_unstable();
         out.dedup();
+    }
+
+    /// Split's potentially layer-wide preparation lookup, with Cancel during collection.
+    /// The single in-place sort is an unchecked step, bounded by MAX_REFERENCES (one million).
+    fn checked_candidates_into(&self, ext: &Extent, out: &mut Vec<usize>) -> Result<(), String> {
+        out.clear();
+        let Some(grid) = &self.grid else {
+            for i in 0..self.len {
+                if i % 4096 == 0 {
+                    crate::control::check()?;
+                }
+                out.push(i);
+            }
+            return Ok(());
+        };
+        let Some(((x0, y0), (x1, y1))) = self.query_cells(ext) else { return Ok(()) };
+        for x in x0..=x1 {
+            for y in y0..=y1 {
+                crate::control::check()?;
+                if let Some(indices) = grid.get(&(x, y)) {
+                    for chunk in indices.chunks(4096) {
+                        crate::control::check()?;
+                        out.extend_from_slice(chunk);
+                    }
+                }
+            }
+        }
+        out.sort_unstable();
+        crate::control::check()?;
+        out.dedup();
+        Ok(())
     }
 
     /// The features whose extents may meet `ext`, in order and once each: every feature without a
@@ -7645,6 +7821,15 @@ fn feature_envelope_to_polygon(inp: &dyn Inputs, p: &Json) -> Result<ToolResult,
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn split_extent_preparation_checks_cancel_before_finishing_the_layer() {
+        let cancelled = crate::control::Control::cancelled_at_look(7);
+        let _installed = crate::control::install(Some(cancelled.clone()));
+        let extent = Extent { min_x: 0.0, min_y: 0.0, max_x: 1.0, max_y: 1.0 };
+        assert!(ExtentIndex::with_checks(std::iter::repeat_n(extent, 10_000), crate::control::check).is_err());
+        assert_eq!(cancelled.looked(), 7);
+    }
+
     use super::*;
     use crate::geodesic::geodesic_buffer;
     use rustgis_data::Feature;
@@ -7721,6 +7906,128 @@ mod tests {
         }
     }
 
+    /// A polygon looping around a pole without being cut at ±180° (#1354): the tools that read
+    /// areas in the analysis plane don't see the area it goes around, and now say so, once per
+    /// layer with a count, instead of dropping it without a word. Cut at ±180° and closed along
+    /// the pole, the same cap says nothing; tools that don't read areas in the plane say nothing.
+    #[test]
+    fn a_polygon_looping_around_a_pole_is_said_not_dropped() {
+        let ring = |pts: &[(f64, f64)]| Geometry::Polygon(vec![vec![pts.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]);
+        let lp: Vec<(f64, f64)> = (0..=12).map(|i| (f64::from(i % 12) * 30.0, 80.0)).collect();
+        let cut = [(-180.0, 80.0), (0.0, 80.0), (180.0, 80.0), (180.0, 90.0), (-180.0, 90.0), (-180.0, 80.0)];
+        let about = |t: &str| t.contains("around a pole without reaching it");
+        let run_with_cap = |cap: Geometry| {
+            let mut caps = Dataset::new("loop", GeometryType::Polygon, vec![Field::new("v", FieldType::Double)]);
+            caps.push(Some(cap), vec![Value::Float(1.0)]);
+            let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+            pts.push(Some(Geometry::Point(Coord::new(45.0, 85.0))), vec![Value::Float(1.0)]);
+            let m = Map(HashMap::from([("loop".to_string(), caps), ("pts".to_string(), pts)]));
+            let said = |r: &ToolResult| r.messages.iter().filter(|t| about(t)).cloned().collect::<Vec<_>>();
+            let sj = crate::run("spatialJoin", &m, &serde_json::json!({"target": "pts", "join": "loop"})).unwrap();
+            // Clip refuses a mask with no area: the loop is said in its reason, after one period.
+            let clip = match crate::run("clip", &m, &serde_json::json!({"input": "pts", "clip": "loop"})) {
+                Ok(r) => said(&r),
+                Err(e) => {
+                    assert!(!e.contains(".."), "{e}");
+                    e.split(". ").filter(|t| about(t)).map(str::to_string).collect()
+                }
+            };
+            let ftp = crate::run("featureToPoint", &m, &serde_json::json!({"input": "loop"})).unwrap();
+            let dissolve = crate::run("dissolve", &m, &serde_json::json!({"input": "loop"})).unwrap();
+            // Statistics read attributes only: nothing to say.
+            let stats = crate::run("summaryStatistics", &m, &serde_json::json!({"input": "loop", "field": "v"})).unwrap();
+            assert!(said(&stats).is_empty(), "{:?}", stats.messages);
+            let buffer = crate::run("buffer", &m, &serde_json::json!({"input": "loop", "distance": 10})).unwrap();
+            [said(&sj), clip, said(&ftp), said(&dissolve), said(&buffer)]
+        };
+        let note = "'loop': 1 ring in 1 feature goes around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area it encloses (along one parallel, none at all); if it goes around the pole on purpose, cut it at ±180° and close it along the pole";
+        for said in run_with_cap(ring(&lp)) {
+            assert_eq!(said, [note]);
+        }
+        for said in run_with_cap(ring(&cut)) {
+            assert!(said.is_empty(), "{said:?}");
+        }
+        // The same layer named twice, whatever the case of its name, is said once.
+        let mut caps = Dataset::new("loop", GeometryType::Polygon, vec![]);
+        caps.push(Some(ring(&lp)), vec![]);
+        caps.push(Some(ring(&lp)), vec![]);
+        caps.push(Some(sq(0.0, 0.0, 1.0)), vec![]);
+        struct Ci(HashMap<String, Dataset>, Vec<usize>);
+        impl Inputs for Ci {
+            fn dataset(&self, layer: &str) -> Option<&Dataset> {
+                self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(layer)).map(|(_, d)| d)
+            }
+            fn selection(&self, _: &str) -> &[usize] {
+                &self.1
+            }
+        }
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        pts.push(Some(Geometry::Point(Coord::new(0.5, 0.5))), vec![]);
+        let all = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("pts".to_string(), pts.clone())]), vec![]);
+        let r = crate::run("spatialJoin", &all, &serde_json::json!({"target": "Loop", "join": "loop"})).unwrap();
+        let said: Vec<&String> = r.messages.iter().filter(|t| about(t)).collect();
+        assert_eq!(
+            said,
+            [
+                "'loop': 2 rings in 2 features go around a pole without reaching it, each step in longitude taken the short way; the analysis reads longitude and latitude as x and y, so it doesn't see the area they enclose (along one parallel, none at all); if they go around the pole on purpose, cut them at ±180° and close them along the pole"
+            ]
+        );
+        // Two layers with loops: one notice naming both, with their counts together.
+        let mut more = caps.clone();
+        more.name = "more".into();
+        let two = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("more".to_string(), more)]), vec![]);
+        let r = crate::run("union", &two, &serde_json::json!({"input": "loop", "overlay": "more"})).unwrap();
+        let said: Vec<&String> = r.messages.iter().filter(|t| about(t)).collect();
+        assert_eq!(said.len(), 1, "{:?}", r.messages);
+        assert!(said[0].starts_with("'loop' and 'more': 4 rings in 4 features go around"), "{said:?}");
+        // A row selected twice is read, and counted, once.
+        let twice = Ci(HashMap::from([("loop".to_string(), caps.clone())]), vec![0, 0]);
+        let r = crate::run("featureToPoint", &twice, &serde_json::json!({"input": "loop"})).unwrap();
+        assert!(r.messages.iter().any(|t| about(t) && t.contains("1 ring in 1 feature")), "{:?}", r.messages);
+        // Clip's refusal names the layer as stored: the note joins it however the name was typed.
+        let only_loops = {
+            let mut d = Dataset::new("Loop", GeometryType::Polygon, vec![]);
+            d.push(Some(ring(&lp)), vec![]);
+            d
+        };
+        let typed = Ci(HashMap::from([("Loop".to_string(), only_loops), ("pts".to_string(), pts.clone())]), vec![]);
+        let e = crate::run("clip", &typed, &serde_json::json!({"input": "pts", "clip": "LOOP"})).unwrap_err();
+        assert!(e.contains("'Loop': 1 ring in 1 feature goes around a pole"), "{e}");
+        // Only the selected square: a tool reading the selection says nothing; Count Points, which
+        // reads every polygon whatever is selected, says what it read.
+        let third = Ci(HashMap::from([("loop".to_string(), caps.clone()), ("pts".to_string(), pts)]), vec![2]);
+        let r = crate::run("featureToPoint", &third, &serde_json::json!({"input": "loop"})).unwrap();
+        assert!(!r.messages.iter().any(|t| about(t)), "{:?}", r.messages);
+        let r = crate::run("countPoints", &third, &serde_json::json!({"polygons": "loop", "points": "pts"})).unwrap();
+        assert!(r.messages.iter().any(|t| about(t) && t.contains("2 rings")), "{:?}", r.messages);
+        // An error that doesn't name the layer with loops is left as it was, even one about an area.
+        let e = crate::run("spatialJoin", &all, &serde_json::json!({"target": "pts", "join": "loop", "match": "Nowhere"})).unwrap_err();
+        assert!(!about(&e), "{e}");
+        let e = crate::run("spatialJoin", &all, &serde_json::json!({"target": "study_area", "join": "loop"})).unwrap_err();
+        assert!(!about(&e), "{e}");
+        // A loop layer named `area` and a field error naming 'area': not a refusal of no area.
+        let mut area = caps.clone();
+        area.name = "area".into();
+        let named = Ci(HashMap::from([("area".to_string(), area)]), vec![]);
+        let e = crate::run("dissolve", &named, &serde_json::json!({"input": "area", "field": "area"})).unwrap_err();
+        assert!(!about(&e), "{e}");
+        // One layer read through two names with different selections: every row read through
+        // either is counted, once. Spatial Join reads the square (row 2) as target and a loop
+        // (row 1) as join.
+        struct ByName(HashMap<String, Dataset>);
+        impl Inputs for ByName {
+            fn dataset(&self, layer: &str) -> Option<&Dataset> {
+                self.0.iter().find(|(k, _)| k.eq_ignore_ascii_case(layer)).map(|(_, d)| d)
+            }
+            fn selection(&self, layer: &str) -> &[usize] {
+                if layer == "Loop" { &[2] } else { &[1] }
+            }
+        }
+        let both = ByName(HashMap::from([("loop".to_string(), caps.clone())]));
+        let r = crate::run("spatialJoin", &both, &serde_json::json!({"target": "Loop", "join": "loop"})).unwrap();
+        assert!(r.messages.iter().any(|t| about(t) && t.contains("1 ring in 1 feature")), "{:?}", r.messages);
+    }
+
     #[test]
     fn simplify_rings_do_not_grow_with_tolerance() {
         use geo::{Distance, Euclidean};
@@ -7739,7 +8046,7 @@ mod tests {
         let inputs = Map(HashMap::from([("zones".into(), ds)]));
         let mut previous = original.coord_count();
         for tolerance in [0.0, 100.0, 500.0, 1000.0, 2000.0, 5000.0, 25000.0, 100000.0] {
-            let simple = simplify_geometry(&original, tolerance);
+            let simple = simplify_geometry(&original, tolerance).0;
             assert!(simple.coord_count() <= previous, "{tolerance} m: {} > {previous}", simple.coord_count());
             previous = simple.coord_count();
             let Geometry::Polygon(parts) = &simple else { panic!("polygon required") };
@@ -7781,7 +8088,7 @@ mod tests {
             let ring = [(-30.0, 60.0), (0.0, 60.0 + dy), (30.0, 60.0), (30.0, 89.0), (0.0, 89.0), (-30.0, 89.0), (-30.0, 60.0)]
                 .map(|(x, y)| Coord::new(x, y))
                 .to_vec();
-            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0);
+            let g = simplify_geometry(&Geometry::Polygon(vec![vec![ring]]), 3_000.0).0;
             let Geometry::Polygon(p) = g else { return false };
             p.iter().flatten().flatten().any(|c| c.x.abs() < 1e-9 && c.y < 61.0)
         };
@@ -7954,7 +8261,7 @@ mod tests {
         let control = crate::control::Control::new();
         control.cancel();
         let _installed = crate::control::install(Some(control));
-        assert_eq!(simplify_geometry(&polygon, 1_000.0), polygon);
+        assert_eq!(simplify_geometry(&polygon, 1_000.0).0, polygon);
     }
 
     /// The bound holds on WGS 84, not only on the sphere: at 60°N, a vertex 0.01795° east of a
@@ -8121,13 +8428,51 @@ mod tests {
         assert!(res.messages.iter().all(|m| !m.contains("beyond 85.05°")), "{:?}", res.messages);
     }
 
+    /// [`simplify_geometry`] gives what Simplify says with the geometry, for callers outside the
+    /// tool (#1811): a line reaching 95° (bad data) with a part of one vertex is counted as reaching
+    /// beyond 85.05°, its vertex past the pole and its short part; a clean line has nothing to say.
+    /// The notices are the tool's, each led by who simplified.
+    #[test]
+    fn simplify_geometry_says_what_it_did() {
+        let bad =
+            Geometry::Line(vec![vec![Coord::new(0.0, 80.0), Coord::new(1.0, 95.0), Coord::new(2.0, 80.0)], vec![Coord::new(5.0, 5.0)]]);
+        let (_, notes) = simplify_geometry(&bad, 100.0);
+        assert_eq!(notes, SimplifyNotes { polar: 1, short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // All but reaching beyond 85.05°, for callers simplifying to their own tolerance.
+        assert_eq!(notes.without_polar(), SimplifyNotes { short: 1, past_pole: 1, ..SimplifyNotes::default() });
+        // Canceled (a part whose set-up alone reaches a look at Cancel), the line is given back as
+        // it was: its short part didn't go, so it isn't said to.
+        let long: Vec<Coord> = (0..(crate::control::PACE_WORK / SETUP_WORK + 1)).map(|i| Coord::new(i as f64 * 1e-6, 0.0)).collect();
+        let canceled_line = Geometry::Line(vec![long, vec![Coord::new(5.0, 5.0)]]);
+        let control = crate::control::Control::new();
+        control.cancel();
+        {
+            let _installed = crate::control::install(Some(control));
+            let (back, notes) = simplify_geometry(&canceled_line, 100.0);
+            assert_eq!(back, canceled_line);
+            assert_eq!(notes, SimplifyNotes::default());
+        }
+        let mut all = SimplifyNotes::default();
+        all.add(&notes);
+        all.add(&notes);
+        let said = all.messages("Packaging");
+        assert_eq!(said.len(), 3, "{said:?}");
+        assert!(said.iter().all(|m| m.starts_with("Packaging: ")), "{said:?}");
+        assert!(said.contains(&"Packaging: 2 line part(s) of fewer than 2 vertices left out".to_string()), "{said:?}");
+        let clean = Geometry::Line(vec![vec![Coord::new(0.0, 40.0), Coord::new(1.0, 40.001), Coord::new(2.0, 40.0)]]);
+        let (simple, notes) = simplify_geometry(&clean, 1_000.0);
+        assert_eq!(simple.coord_count(), 2);
+        assert_eq!(notes, SimplifyNotes::default());
+        assert!(notes.messages("Packaging").is_empty());
+    }
+
     #[test]
     fn simplify_keeps_points_lines_and_degenerate_rings() {
         use geo::Area;
         let point = Geometry::Point(Coord::new(10.0, 46.0));
-        assert_eq!(simplify_geometry(&point, 1e6), point);
+        assert_eq!(simplify_geometry(&point, 1e6).0, point);
         let line = Geometry::Line(vec![vec![Coord::new(10.0, 46.0), Coord::new(10.1, 46.0), Coord::new(10.2, 46.0)]]);
-        assert_eq!(simplify_geometry(&line, 1e6).coord_count(), 2);
+        assert_eq!(simplify_geometry(&line, 1e6).0.coord_count(), 2);
         let repeated = geo::LineString::new(vec![geo::Coord { x: 1.0, y: 1.0 }; 6]);
         assert_eq!(simplify_ring(&repeated, 1e6, &SimplifyRun::default()), repeated);
         let collinear = geo::LineString::from(vec![(0.0, 0.0), (1.0, 0.0), (2.0, 0.0), (3.0, 0.0), (0.0, 0.0)]);
@@ -10864,6 +11209,31 @@ mod tests {
     }
 
     #[test]
+    fn kernel_density_refuses_explicit_and_inherited_geocentric_systems() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![]);
+        // At the equator, dropping geocentric Z can even round-trip these points, so the
+        // existing unplaceable-point check alone cannot refuse this three-dimensional CRS.
+        pts.push(Some(Geometry::Point(Coord::new(-75.0, 0.0))), vec![]);
+        pts.push(Some(Geometry::Point(Coord::new(-74.99, 0.0))), vec![]);
+        let mut m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let projected = serde_json::json!({"input": "pts", "crs": "EPSG:32618", "radius": 1000.0, "pixelSize": 250.0});
+        crate::run("kernelDensity", &m, &projected).unwrap();
+        for text in ["EPSG:4978", "+proj=geocent +datum=WGS84 +units=m +no_defs"] {
+            let mut explicit = projected.clone();
+            explicit["crs"] = serde_json::json!(text);
+            let error = crate::run("kernelDensity", &m, &explicit).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected") && error.contains("EPSG:32618"), "{error}");
+            m.0.get_mut("pts").unwrap().crs = Some(Crs::parse(text).unwrap());
+            let mut inherited = projected.clone();
+            inherited.as_object_mut().unwrap().remove("crs");
+            let error = crate::run("kernelDensity", &m, &inherited).unwrap_err();
+            assert!(error.contains("geocentric") && error.contains("projected"), "{error}");
+            // An explicit projected target still overrides the layer's default system.
+            crate::run("kernelDensity", &m, &projected).unwrap();
+        }
+    }
+
+    #[test]
     fn kernel_density_skips_points_its_system_cant_hold() {
         // In Web Mercator, points past 85.05° would land on the map's edge: they're left out and
         // counted, not piled up on the raster's top row (#1033), a multipoint's members each, and
@@ -11385,7 +11755,7 @@ mod tests {
             .unwrap();
         let mut table =
             Dataset::new("Coordinates", GeometryType::None, vec![Field::new("x", FieldType::Double), Field::new("y", FieldType::Double)]);
-        table.push(None, vec![Value::Float(0.0), Value::Float(5_009_377.085_697_311)]);
+        table.push(None, vec![Value::Float(0.0), Value::Float(4_984_944.377_977_743)]);
         let mut points = Dataset::new("Density points", GeometryType::Point, vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.0, 45.0))), vec![]);
         points.push(Some(Geometry::Point(Coord::new(0.01, 45.01))), vec![]);
@@ -13120,6 +13490,53 @@ mod tests {
         );
         let clean = clip(&m, &serde_json::json!({"input": "clean", "clip": "masks"})).unwrap();
         assert!(!clean.messages.iter().any(|m| m.contains("no geometry")), "{:?}", clean.messages);
+    }
+
+    /// A shared diagonal becomes a small positive-area overlap when the mask is normalized.
+    /// Count kept features once, across workers, without changing their geometry; an ordinary
+    /// partial clip needs no notice.
+    #[test]
+    fn clip_reports_kept_boundary_slivers_but_not_ordinary_pieces() {
+        use geo::Area;
+        let poly = |pts: &[(f64, f64)]| Geometry::Polygon(vec![vec![pts.iter().map(|&(x, y)| Coord::new(x, y)).collect()]]);
+        let (x, y, d) = (-89.7, 35.05, 0.01);
+        let tract = poly(&[(x, y), (x + d, y + d), (x - d, y + d), (x, y)]);
+        let town = poly(&[(x, y), (x + d, y + d), (x + 6.0 * d, y - 0.3 * d), (x, y)]);
+        let mask = union_all(to_multipolygon(&town).unwrap().0.iter());
+        // The old part path keeps this sliver: exactly-zero checks miss it. Keep its coordinates
+        // bit for bit, and count the two output features rather than dropped boundary contacts.
+        let expected = part(&tract, &mask, true).unwrap();
+        let area = to_multipolygon(&expected).unwrap().unsigned_area();
+        assert!(area > 0.0 && area < to_multipolygon(&tract).unwrap().unsigned_area() * 1e-6, "{area}");
+        let mut tracts = Dataset::new("tracts", GeometryType::Polygon, vec![]);
+        for _ in 0..2 {
+            tracts.push(Some(tract.clone()), vec![]);
+        }
+        let ordinary = sq(x + 0.2 * d, y - 0.1 * d, 0.8 * d);
+        let ordinary_area = to_multipolygon(&ordinary).unwrap().unsigned_area();
+        let mut clean = Dataset::new("clean", GeometryType::Polygon, vec![]);
+        clean.push(Some(ordinary), vec![]);
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        masks.push(Some(town), vec![]);
+        let m = Map(HashMap::from([("tracts".into(), tracts), ("clean".into(), clean), ("masks".into(), masks)]));
+        for threads in [1, 4] {
+            let r = clip_on(&m, &serde_json::json!({"input": "tracts", "clip": "masks"}), Some(threads), None).unwrap();
+            assert_eq!(
+                r.messages,
+                [
+                    "Clip: 2 features kept",
+                    "Clip: 2 output feature(s) have less than one millionth of their input feature's area in the overlay plane; they may be slivers along the clip boundary (kept unchanged)",
+                ]
+            );
+            let out = layer(r);
+            assert_eq!(out.features.len(), 2);
+            assert!(out.features.iter().all(|f| f.geometry.as_ref() == Some(&expected)));
+            let clean = clip_on(&m, &serde_json::json!({"input": "clean", "clip": "masks"}), Some(threads), None).unwrap();
+            assert_eq!(clean.messages, ["Clip: 1 features kept"]);
+            let clean = layer(clean);
+            let area = to_multipolygon(clean.features[0].geometry.as_ref().unwrap()).unwrap().unsigned_area();
+            assert!(area > ordinary_area * 1e-6 && area < ordinary_area, "{area} / {ordinary_area}");
+        }
     }
 
     /// Clip gives the same rows, bit for bit, on several threads as on one (#1252), and whatever its

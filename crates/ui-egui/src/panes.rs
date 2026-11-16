@@ -7,7 +7,7 @@ use egui::{Align2, CornerRadius, Rect, Sense, Stroke, Ui, pos2, vec2};
 use rustgis_engine::Session;
 use rustgis_engine::analysis::{ParamKind, tools};
 use rustgis_engine::data::GeometryType;
-use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle};
+use rustgis_engine::map::raster::{Normalizer, RasterLegend, RasterStyle, Rock};
 use rustgis_engine::map::symbology::{
     ClassRef, ClassStyle, Dash, LineCap, LineJoin, LineMark, LineMarkers, LineStroke, MAX_EXPRESSION_CLASSES, MAX_LABEL,
     MAX_LINE_MARKER_SIZE, MAX_MARKER_INTERVAL, MAX_STROKE_OFFSET, MAX_STROKE_WIDTH, MAX_STROKES, MIN_MARKER_INTERVAL, OTHER_VALUES,
@@ -947,7 +947,7 @@ fn source_name(src: &str) -> SourceName {
         // a path, its %-escapes decoded.
         if scheme == "file" || host.is_empty() {
             let path = if host.eq_ignore_ascii_case("localhost") { rest.find('/').and_then(|i| rest.get(i..)).unwrap_or("") } else { rest };
-            return path_name(&percent_decoded(path));
+            return path_name(&rustgis_engine::data::address::percent_decode(path));
         }
         // Only the host ignores case: a database's name doesn't.
         let db = DATABASE_SCHEMES
@@ -959,30 +959,6 @@ fn source_name(src: &str) -> SourceName {
         return SourceName { key, label: name.clone(), hover: name };
     }
     path_name(src)
-}
-
-/// `%XX` escapes in a `file://` path decoded (`My%20Data.gpkg` is `My Data.gpkg`); a `%` not
-/// followed by two hex digits stays as it is.
-fn percent_decoded(s: &str) -> String {
-    let b = s.as_bytes();
-    let mut out = Vec::with_capacity(b.len());
-    let mut i = 0;
-    while let Some(&c) = b.get(i) {
-        // Two hex digits exactly (`from_str_radix` alone would take a sign).
-        let digits = b.get(i + 1..i + 3).filter(|h| h.iter().all(u8::is_ascii_hexdigit));
-        let hex = digits.and_then(|h| std::str::from_utf8(h).ok()).and_then(|h| u8::from_str_radix(h, 16).ok());
-        match (c, hex) {
-            (b'%', Some(v)) => {
-                out.push(v);
-                i += 3;
-            }
-            _ => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// A path as a source group: its last part, with the whole path as hover text.
@@ -1276,7 +1252,6 @@ fn service_group_row(
 /// Under it, indented, its layers and subgroups (#836) in drawing order; `depth` is its level (1
 /// at the top). With `reorder` the row drags the whole group, and it and its layers' rows join
 /// `rows`, where layers drop (see [`layer_drop`]).
-#[allow(clippy::too_many_arguments)]
 fn layer_group_row(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -1905,6 +1880,48 @@ fn disk_note(app: &RustGisApp, layer: Option<&Layer>, tile: Option<usize>) -> Op
     }
 }
 
+/// The note after a layer's name, its details and tint, as [`disk_note`] gives them. A layer read
+/// whole from a Shapefile or GeoJSON file it publishes to (`source.publish`) also says whether it
+/// holds edits the file lacks (`syncmark`), and its file's changes point to Publish to Source,
+/// which refuses to overwrite them, rather than Reload Data, which can't read it again.
+pub(crate) fn layer_note(app: &mut RustGisApp, l: &Layer, ctx: &egui::Context) -> Option<(String, String, Option<bool>)> {
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use crate::diskwatch::Status;
+        if !crate::diskwatch::publishes(l) || crate::diskwatch::reloadable(l) {
+            return disk_note(app, Some(l), None);
+        }
+        let edited = crate::syncmark::edited(app, l, ctx) == Some(true);
+        let status = if app.watch_files { crate::diskwatch::layer_status(app, l) } else { Status::Unchanged };
+        let unpublished = tl!("This layer has edits its file doesn't have yet. Publish to Source writes them to the file.");
+        match (status, edited) {
+            (Status::Changed, true) => Some((
+                tl!("(edits not published, changed on disk)").to_string(),
+                tl!("This layer has edits its file doesn't have, and the file changed on disk since it was read. Publish to Source refuses rather than overwrite that change; Export Features keeps the edits in a new file.").to_string(),
+                Some(false),
+            )),
+            (Status::Changed, false) => Some((
+                tl!("(changed on disk)").to_string(),
+                tl!("Changed on disk: the file may have changed since it was read. Add it again to see the change; Source File State checks it.").to_string(),
+                Some(false),
+            )),
+            (Status::Unchanged | Status::Folder, true) => Some((tl!("(edits not published)").to_string(), unpublished.to_string(), None)),
+            // Missing or unreadable: Publish refuses a file unlike its record, so edits can only be
+            // exported until it's back.
+            (status, edited) => crate::diskwatch::row_note(&status, false).map(|(note, detail, tint)| {
+                let blocked = tl!("This layer has edits its file doesn't have. Publish to Source can't write them until the file is back as it was read; Export Features keeps them in a new file.");
+                let detail = if edited { crate::i18n::fmt("{detail}\n{blocked}", &[("detail", &detail), ("blocked", blocked)]) } else { detail };
+                (note, detail, tint)
+            }),
+        }
+    }
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = ctx;
+        disk_note(app, Some(l), None)
+    }
+}
+
 /// A layer's row and, expanded, its legend; returns the rectangle of both. With `reorder` off
 /// (the list is filtered or children are sorted by name) the row can't be dragged.
 fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: bool, t: &Tokens) -> Rect {
@@ -1919,7 +1936,7 @@ fn layer_row(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, scale: f64, reorder: 
         (text, w)
     });
     let mut shown = if l.definition_query.is_some() { format!("{}  {}", l.name, tl!("(filtered)")) } else { l.name.clone() };
-    let disk = disk_note(app, Some(l), None);
+    let disk = layer_note(app, l, ui.ctx());
     if let Some((note, _, _)) = disk.as_ref().filter(|(note, _, _)| !note.is_empty()) {
         shown = format!("{shown}  {note}");
     }
@@ -2663,6 +2680,12 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "json",
                         "csv",
                         "tsv",
+                        "txt",
+                        "dat",
+                        "csv.gz",
+                        "tsv.gz",
+                        "txt.gz",
+                        "dat.gz",
                         "shp",
                         "tif",
                         "tiff",
@@ -2676,6 +2699,7 @@ fn folder_browser(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                         "rgis",
                         "rgisx",
                         "rgispkg",
+                        "rgisfield",
                         "rgismap",
                         "rgismpk",
                         "rgislyr",
@@ -3155,12 +3179,36 @@ impl GpForm {
     }
 }
 
+/// The card that stands for the GeoLibre tools on a phone, which can't run their program.
+fn no_geolibre_here(ui: &mut Ui, t: &Tokens) {
+    ui.add_space(6.0);
+    egui::Frame::NONE.stroke(Stroke::new(1.0, t.border)).corner_radius(CornerRadius::same(6)).inner_margin(egui::Margin::same(10)).show(
+        ui,
+        |ui| {
+            ui.set_width(ui.available_width());
+            ui.label(egui::RichText::new(tl!("Whitebox and GeoLibre tools")).font(semibold(13.0)));
+            ui.label(
+                egui::RichText::new(tl!(
+                    "Not on a phone: these tools run as a program of their own, which a phone can't run. Use them in RustGIS on a computer."
+                ))
+                .size(11.5)
+                .color(t.text_dim),
+            );
+        },
+    );
+}
+
 /// Where to get the GeoLibre tools when the runner isn't installed (desktop and CLI builds only).
 fn geolibre_card(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // Read directly, not through Session::run: a command each frame would bump the session's
     // revision and make the views redraw. The status itself is cached in the runner module.
     let status = rustgis_engine::cmd::gp::geolibre_status();
     if status["supported"] != true {
+        // A phone's build leaves the suite out (its runner is a program, which a phone's apps
+        // can't start): said where the card would be, so the tools aren't simply missing (#1902).
+        if !rustgis_engine::data::RUNS_PROGRAMS && !cfg!(target_arch = "wasm32") {
+            no_geolibre_here(ui, t);
+        }
         return;
     }
     // An install that just finished: use the runner, and remember it.
@@ -5539,7 +5587,6 @@ fn marker_preview(ui: &Ui, m: &LineMarkers, x: (f32, f32), y: f32, k: f32, c: eg
 
 /// The stroke editor's rows for a stroke of markers or hash marks (`st`, its markers `m`): the
 /// shape, its size, where it goes and how far apart, and whether it turns with the line.
-#[allow(clippy::too_many_arguments)]
 fn marker_rows(
     app: &mut RustGisApp,
     ui: &mut Ui,
@@ -6732,10 +6779,13 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
         RasterRenderer::Colormap => {
             ui.label(egui::RichText::new(tl!("Colors from the raster's own color table.")).size(11.5).color(t.text_dim));
         }
-        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky } => {
-            let (az, alt, zf, sh, sk, rp) = (*azimuth, *altitude, *z_factor, *shadow, *sky, ramp.as_ref().map(|r| r.name().to_string()));
+        RasterRenderer::ShadedRelief { band, ramp, azimuth, altitude, z_factor, shadow, sky, fill, rock } => {
+            let (az, alt, zf, sh, sk, fl) = (*azimuth, *altitude, *z_factor, *shadow, *sky, *fill);
+            let rp = ramp.as_ref().map(|r| r.name().to_string());
             let relief = move |band: usize, az: f64, alt: f64, zf: f64, sh: f64| {
-                let mut p = json!({"type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk});
+                let mut p = json!({
+                    "type": "shadedRelief", "band": band + 1, "azimuth": az, "altitude": alt, "zFactor": zf, "shadow": sh, "sky": sk, "fill": fl
+                });
                 match &rp {
                     Some(r) => p["ramp"] = json!(r),
                     None => p["grey"] = json!(true),
@@ -6750,6 +6800,7 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                     ("Z factor", zf, 0.001..=1000.0, 0.01, 2),
                     ("Cast shadows", sh, 0.0..=1.0, 0.01, 3),
                     ("Sky visibility", sk, 0.0..=1.0, 0.01, 4),
+                    ("Fill light", fl, 0.0..=1.0, 0.01, 5),
                 ] {
                     let input_label = ui.label(tl!(label));
                     let mut x = v;
@@ -6763,6 +6814,9 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                         4 => r.on_hover_text(tl!(
                             "How much the sky each cell sees, over the terrain around it, scales its ambient light, from 0 (not at all) to 1"
                         )),
+                        5 => r.on_hover_text(tl!(
+                            "A light from the side opposite the sun that lightens the slopes turned toward it, from 0 (none) to 1"
+                        )),
                         _ => r,
                     };
                     if drag.settled(ui, &r, &mut x) && x != v {
@@ -6774,14 +6828,17 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
                             _ => (az, alt, zf, sh),
                         };
                         let mut p = relief(*band, a, b, c, d);
-                        if which == 4 {
-                            p["sky"] = json!(x);
+                        match which {
+                            4 => p["sky"] = json!(x),
+                            5 => p["fill"] = json!(x),
+                            _ => {}
                         }
                         let _ = app.run("raster.symbology", p);
                     }
                     ui.end_row();
                 }
             });
+            rock_on_slopes(app, ui, l.id, *rock, relief(*band, az, alt, zf, sh));
             let mut tint = ramp.is_some();
             if ui.checkbox(&mut tint, tl!("Tint by elevation")).changed() {
                 let mut p = relief(*band, az, alt, zf, sh);
@@ -6935,6 +6992,50 @@ fn raster_symbology(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, t: &Tokens) {
     ui.separator();
     ui.label(egui::RichText::new(tl!("Layer")).size(11.5).color(t.text_dim));
     transparency_row(app, ui, l);
+}
+
+/// Shaded Relief's Rock on steep slopes (#1913): a check box and, when it is on, the slopes in
+/// degrees the rock colour starts and ends at and the colour. `relief` is the layer's Shaded
+/// Relief as `raster.symbology` takes it, to which the rock is added.
+fn rock_on_slopes(app: &mut RustGisApp, ui: &mut Ui, layer: u32, rock: Option<Rock>, relief: Value) {
+    let send = |app: &mut RustGisApp, rock: Value| {
+        let mut p = relief.clone();
+        p["rock"] = rock;
+        let _ = app.run("raster.symbology", p);
+    };
+    let mut on = rock.is_some();
+    if ui
+        .checkbox(&mut on, tl!("Rock on steep slopes"))
+        .on_hover_text(tl!("Tints steep ground toward a rock colour before the light shades it, by the ground's own slope"))
+        .changed()
+    {
+        send(app, if on { json!({}) } else { json!(false) });
+    }
+    let Some(rock) = rock else { return };
+    egui::Grid::new(("relief_rock", layer)).num_columns(2).spacing(vec2(10.0, 4.0)).show(ui, |ui| {
+        for (label, v, which) in [("From", rock.from, 0), ("To", rock.to, 1)] {
+            let input_label = ui.label(tl!(label));
+            let mut x = v;
+            // Kept across a drag until it is let go (#607).
+            let drag = Dragged::lend(ui, egui::Id::unique(("relief_rock_drag", layer, which)), &mut x);
+            let r = ui
+                .add(egui::DragValue::new(&mut x).update_while_editing(false).range(0.0..=90.0).speed(0.5).max_decimals(1).suffix("°"))
+                .labelled_by(input_label.id);
+            if drag.settled(ui, &r, &mut x) && x != v {
+                // The other end moves along rather than cross it.
+                let (from, to) =
+                    if which == 0 { (x.min(89.0), rock.to.max(x.min(89.0) + 1.0)) } else { (rock.from.min(x.max(1.0) - 1.0), x.max(1.0)) };
+                send(app, json!({"from": from, "to": to}));
+            }
+            ui.end_row();
+        }
+        let input_label = ui.label(tl!("Color"));
+        let mut c = egui::Color32::from_rgb(rock.color.r(), rock.color.g(), rock.color.b());
+        if crate::widgets::color_button(ui, &mut c).labelled_by(input_label.id).changed() {
+            send(app, json!({"color": rustgis_engine::map::Rgba::rgb(c.r(), c.g(), c.b()).hex()}));
+        }
+        ui.end_row();
+    });
 }
 
 /// The Masking section of a raster's symbology (#348): values drawn as no data, and a range of
@@ -7226,7 +7327,7 @@ mod tests {
         let end = std::time::Instant::now() + std::time::Duration::from_secs(60);
         while h.state().gp.tool_run.is_some() {
             assert!(std::time::Instant::now() < end, "the run never landed");
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for the background tool
             h.step();
         }
         let app = h.state();
@@ -7463,7 +7564,7 @@ mod tests {
                 let ctx = ui.ctx().clone();
                 app.logic(&ctx);
                 if frame.get() {
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    std::thread::sleep(std::time::Duration::from_millis(300)); // test-wait: simulate a slow frame between double-clicks
                 }
                 app.ui(ui);
             },
@@ -7555,7 +7656,7 @@ mod tests {
             if rustgis_engine::render::tile_source_layers(&app.session.map().tiles[0]).is_some() {
                 break;
             }
-            std::thread::sleep(std::time::Duration::from_millis(10));
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: legacy polling for archive source layers
         }
         let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
             |ui, app: &mut RustGisApp| {

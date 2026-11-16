@@ -11,7 +11,15 @@ For selecting, grouping, reordering and copying layers between maps, see
 Drag to pan and scroll to zoom; ++home++ (or **Full Extent**) shows all the data. **Home › Navigate**
 has fixed zoom steps, **Previous** and **Next** extents, **Bookmarks** (the World Atlas has World,
 Europe, Africa, Americas and East Asia), and **Locate**: **By Coordinates…** pans to a longitude
-and latitude; **By Place or Address…** finds a place or address with a geocoder. **New Bookmark…**
+(X) and latitude (Y), each in decimal degrees or degrees, minutes and seconds (`-74.006` or
+`74°0'22"W`; `40.7128` or `40°42'46"N`; an N or S in the longitude is refused, not swapped), or on
+the Earth's map to a UTM or MGRS grid reference in place of both (`18north 583959 4507351`,
+`18TWL8395907350`). `map.goToXY` takes the same: `lon` and `lat` as numbers or text, or a
+`position` read as the search box reads it, latitude first; two bare numbers there are said back
+as the latitude and longitude they were read as. A reference that names no place says why; an
+MGRS reference coarser than a meter (`18TWL`) goes to the center of its square and says so.
+**By Place or Address…** finds a place or address with a geocoder.
+**New Bookmark…**
 saves the current view under a name, with an optional description of the place. The Bookmarks menu
 removes a bookmark with the button beside it, and exports or imports them as a `.rgisbookmarks`
 file. Imported bookmarks show the same place on a map in another projection; places that projection
@@ -37,7 +45,9 @@ tile layers whose capabilities advertise geographic bounds, including WMS. WMS 1
 bounds and WMS 1.1 latitude/longitude bounds are inherited from parent layers when needed and
 saved with the project. Re-add a service layer saved by an older version to retain its bounds.
 Tile layers without known bounds (such as plain XYZ/TMS or MVT templates, styles and MBTiles
-archives) have no **Zoom To Layer** action unless bounds were supplied when adding them.
+archives) have no **Zoom To Layer** action unless bounds were supplied when adding them. A zoom to a
+place the map's projection doesn't reach (wholly past Web Mercator's 85°, say) doesn't move the
+view to it, and says so.
 
 **Rotating and tilting the map.** Drag with the right mouse button, or hold ++ctrl++ and drag
 with the Pan tool, to turn the map about the centre of the view (to the right turns it clockwise)
@@ -84,6 +94,55 @@ no terrain is on, or `{"tiles": "https://…/{z}/{x}/{y}.png", "encoding": "terr
 maps; a flat (untilted) view, the globe and other projections stay flat, extruded layers are
 not lifted onto the relief yet, and identify and selection still pick on the flat ground.
 
+A **block diagram** cuts the relief to a box, as geomorphology and soil science figures do:
+`map.terrain` with `"block": {}` draws only the ground inside the DEM layer's extent (for a DEM
+in a projection such as UTM, a north-up box between its corners, close to the largest inside
+it for one turned a little; one turned a lot can leave a sliver past its edges), with the map's sky and fog
+around it, and the box's sides facing the eye as walls from the ground's profile down to a flat
+base. `"extent": [xmin, ymin, xmax, ymax]` gives another box, in the map's units (Web Mercator
+metres, at least 10 a side, not all within ±180 by ±90; needed over elevation tiles, which have no extent of their own; a box
+in degrees, off the world or off the DEM is refused, and the result gives the box cut to as
+numbers, or `"layer"` while the DEM's data isn't read); `"depth"` puts the base
+that many metres below the lowest ground in the box (ground with no height, drawn at 0, counts as 0; default half the box's relief, at least
+100 m; both are stretched by the exaggeration), and `"walls": "#RRGGBB"` colours the walls
+(default `#C8B89A`, a sandy brown). The walls are lit by the way they face the light, as extruded
+walls are, darker toward their foot, and outlined. Left out, the block stays as it was;
+`"block": false` takes it off. It shows in the settled view and in exported maps (over elevation tiles, the walls once the
+box's tiles are read); while the map
+moves the ground is drawn whole, and labels, markers and extruded features outside the box still
+draw (hide those layers, or clip them to the box). The walls are schematic: say so in the
+figure's caption.
+
+`"walls": {"color": "#C8B89A", "layer": "Geology"}` colours the walls by a polygon layer, such as
+a geology or soil map: along each wall, the colour the layer's symbology gives the polygon under
+the box's edge at that point (its Unique Values or Graduated Colors classes, so the legend
+matches; the topmost polygon where they overlap, among the features its definition query keeps;
+a fill colour partly transparent is laid over `color`). The contacts go straight down to the base,
+outlined: only where they cross the box's edge comes from the map, and the walls show no dip or
+thickness. Off every polygon, and in a polygon with no solid fill (hatches and other patterns
+aren't drawn on walls yet), the walls are `color`. The layer may be hidden, so the walls can
+show geology while the ground shows soils. It must be a polygon layer that holds all its
+features (not one read a view at a time), with a name of its own; it follows the layer's renames,
+and when it is removed, or a project opens without it, the walls are `color` (said) until a
+polygon layer of that name comes back. A plain `"walls": "#RRGGBB"` takes the layer off.
+
+**Water** on the terrain lies flat: `map.terrain` with `{"water": {"layer": "Lakes"}}` names a
+polygon layer of water bodies, and inside each polygon the ground is level, at the lowest height
+of the DEM along its shore, instead of rising and falling with a surface model that is noisy or
+stepped over water (Copernicus GLO-30 is one). `"level": "field"` takes each polygon's level
+(metres) from a numeric field instead; a row with no value there keeps its shore's. Each part of
+a multipolygon is a water body of its own. A polygon whose shore lies off the DEM, with no level
+given, stays on the ground, and a notice says how many. Shores are read every half DEM cell, up
+to about 4 million heights in all (and one a ring); when the water layer's shores together are
+longer, all of them are read at one wider step, and a notice says how
+many polygons were. A layer read a view at a time (in chunks, by range) can't be the water. `{"water": false}` takes the water off;
+left out (or `null`), it stays as it was. The water layer is kept by name, follows its renames, and can stay
+hidden; its own symbology still draws it. Rivers stay lines. Over elevation tiles, the levels are
+read again until the tiles along the shores have come. A Shaded Relief layer draws the water's
+cells at their level with the even light of flat ground, flat or tilted: no hillshade, cast
+shadow, sky, fill light or rock on the water, so a semi-transparent water fill over it shows one
+tone. The relief's ramp colours them at the water's level.
+
 <figure markdown="span">
   ![Mount Rainier in USGS imagery draped over Terrarium elevation tiles, tilted 65°](https://assets.rustgis.app/images/terrain.webp)
   <figcaption>Mount Rainier: USGS imagery draped over Terrarium elevation tiles.</figcaption>
@@ -98,10 +157,16 @@ ending in `.gif` gives an animated GIF that loops, each frame shown for `"speed"
 (default 50; a GIF keeps times to the hundredth of a second, so 55 shows as 50 or 60); one ending in `.zip` gives the frames as PNGs (`frame_0001.png`…), to build a video
 with another tool, since a GIF's 256 colours can band a smooth relief. A turn of 360° stops one
 step short of where it began, so the loop has no frame twice; a part of a turn ends on its last
-bearing. The light of a shaded relief stays with the ground, not the camera. The view comes back
-to where it was afterwards. The export runs to its end before the command answers; the frames
-count against a limit of 300 million pixels in all (170 frames at 1600 × 1100, say), and a size
-past it is refused:
+bearing. The light of a shaded relief stays with the ground, not the camera. The frames are drawn
+from a copy of the map, so the view doesn't move. The frames count against a limit of 300 million
+pixels in all (170 frames at 1600 × 1100, say), and a size past it is refused.
+
+In the desktop app, **View › Scene › Export Orbit…** opens a dialog with the frames, the turn,
+the size and a GIF's frame time (an empty box keeps the default); **Export…** checks them and
+only then asks where to write the file. The frames are then drawn in the background, so the window stays free: the status bar
+shows the export, how many frames it has drawn, and **Cancel**, which stops it between frames
+and writes nothing. From a script or the command line the command runs to its end before it
+answers:
 
 ```bash
 rustgis-cli run --cmd 'project.open={"path":"massif.rgis"}' --cmd 'map.setPitch={"pitch":60}' --cmd 'map.exportOrbit={"path":"massif.gif","frames":72,"width":800,"height":500}'
@@ -397,7 +462,9 @@ selectable or editable; a tile not yet loaded may need another click once it arr
 **Reload** in the Basemap gallery (`map.reloadWebLayers`) clears cached tiles and styles and
 fetches them again.
 
-**Reloading a local tile archive (desktop).** After changing a PMTiles or MBTiles file on disk,
+### Reloading a local tile archive (desktop)
+
+After changing a PMTiles or MBTiles file on disk,
 right-click its row in Layers and choose **Reload Data** (**Reload Tile Archive** in Command
 Search). CLI, Python, MCP and the Assistant use
 `map.reloadTiles={"index":0}`; `"name"` or catalog `"id"` can select the archive instead.
@@ -445,6 +512,10 @@ every tile payload. It allows at most **64 MiB stored and 64 MiB decoded index b
 index entries**, **4,096 unique directories** (including the root), and **four leaf levels**;
 each stored directory read is limited to **16 MiB**. An invalid index or an exceeded validation
 budget is an explicit error without eviction, even if an unusually large index is otherwise valid.
+Validation also refuses a stored tile range over **16 MiB**, or one outside the header's declared
+tile-data section (including a zero-length section with nonempty tile entries). Ordinary loading
+can still draw other tiles from such an archive; reload and repair require the replacement's
+entire index to pass these checks before changing the source or dropping cached data.
 
 Neither action is available for local archives in the web app, or for remote tile services.
 On Windows, an open MBTiles file may not be replaceable while RustGIS holds it open: reload
@@ -554,8 +625,12 @@ projection, and clicking the coordinate system in the status bar opens the **Coo
 System** dialog, which also takes a projected EPSG code (such as `3035`, `32633` for UTM zone
 33N or `2056` for Switzerland) or an ESRI code, the one `.prj` files and ArcGIS name (such as
 `ESRI:102033` for South America Albers Equal Area Conic, or `ESRI:54030` for World Robinson). A
-code whose projection method or datum grid RustGIS can't use (Laborde such as `8441`, or a NAD27
-code that needs a grid) is refused with the reason, rather than drawn in another projection.
+code whose projection method RustGIS can't compute is refused with the reason, rather than drawn
+in another projection. Projections and datum transformations are computed by
+[terrio-crs](https://github.com/opengeos/terrio), as PROJ 9.8 computes them. Datum shift grids
+aren't used yet, neither those installed for PROJ nor downloaded: a datum whose most accurate
+transformation needs one takes the next PROJ lists (a NAD27 code: NAD27 to WGS 84 (4), about
+10 m), and says so once.
 RustGIS supports a subset of Esri's projected systems, checked against
 PROJ at representative points; unsupported codes such as World Miller (`ESRI:54003`) and the
 two-point oblique Mercators (`ESRI:53025`, `ESRI:54025`) are refused as unknown codes. The presets:
@@ -685,6 +760,7 @@ masking, swipe, blending, aggregation, graphics, stacked strokes, fills or label
 on the CPU. Extrusions use the GPU only on a tilted map. In the desktop app, if the graphics
 card runs out of memory (a card with 2 GB at a large window size, with other programs using it
 too), the map switches to the CPU, with a notice, instead of the app closing; clicking **CPU**
-in the status bar tries the GPU again, as does the next start (the setting stays on). Any other
-error the graphics card reports is said once, as the map (or, with the map on the CPU, the
-window) may then be drawn wrongly.
+in the status bar tries the GPU again, as does the next start (the setting stays on); errors
+that follow from running out in the same moment aren't said on their own. Any other error the
+graphics card reports is said once, as the map (or, with the map on the CPU, the window) may
+then be drawn wrongly; so is running out of memory with the map already on the CPU.

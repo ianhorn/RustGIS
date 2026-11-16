@@ -52,7 +52,7 @@ vectors as a layout's PDF is (see Layouts), in the system viewer on desktop; **C
 Clipboard** copies a map image. **Export To 3D** writes a layer as a Wavefront OBJ or binary STL model
 with polygons extruded by a field (`share.export3d` writes STL when `path` ends in `.stl`). STL
 holds closed solids only: lines and zero-height features are left out, zero-area triangles are
-skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes; one
+skipped, and a cap that can't be triangulated is fanned over its outer ring, filling any holes; a cap that
 the triangulator can only finish as a fan (a hole touching the outer ring along an edge, for
 example) is fanned over what is left of it. Either fan may spill outside the polygon; the notices
 say how many. OBJ
@@ -144,7 +144,9 @@ in the browser. The Share As commands accept a `path`; without one they use the 
   is shorter is skipped and counted separately, as are holes with fewer than three vertices and
   line parts with a single vertex. A scene carries at most 200,000 visible features with geometry;
   a counted notice says when later features are left out by this limit. Filtered-out features
-  don't count as omissions. An empty result is refused, with the reasons for its omissions.
+  don't count as omissions. An extrusion's base plus height stays within 1,000 km in the scene: a
+  notice per layer says how many of its drawn features had their base or height held to that
+  limit. An empty result is refused, with the reasons for its omissions.
 - **Web Link Chart** (`share.linkChart`): the features joined by the map's relationships as a
   node-link HTML page; `relationship` limits it to one relationship.
 

@@ -35,8 +35,8 @@ pub(crate) fn now_ms() -> u64 {
 }
 
 /// Whether command `id`, run by itself with `params`, goes into the log: one that changes the
-/// project (all but those built with `.view()`; a plugin's when its manifest asks for the Edit
-/// permission), undo and redo, a save, the log's own clearing and switching, and a command whose
+/// project (automatic edits or an explicit `Edits` effect; a plugin's when its manifest asks for
+/// the Edit permission), undo and redo, a save, the log's own clearing and switching, and a command whose
 /// parameters name a file, folder, address or connection (an export), as the plugin permission
 /// gate reads them. Reading and looking around (listing, describing, moving the view) is left
 /// out: agents, scripts and plugins call those hundreds of times, and they would push the changes
@@ -60,7 +60,7 @@ pub(crate) fn is_logged(s: &Session, id: &str, params: &Value) -> bool {
         rustgis_plugins::command(id).is_some_and(|c| c.mutates())
     } else {
         match s.registry.get(id) {
-            Some(spec) => spec.mutates,
+            Some(spec) => spec.changes_project(),
             None => return false,
         }
     };
@@ -244,17 +244,31 @@ fn embedded_redacted(v: &Value, depth: usize) -> Value {
             Value::String(sql_secrets_removed(&t))
         }
         Value::Array(a) if depth < 8 => Value::Array(a.iter().map(|x| embedded_redacted(x, depth + 1)).collect()),
-        Value::Object(o) if depth < 8 => Value::Object(
-            o.iter()
-                .map(|(k, x)| {
-                    // Preserve History's plain-key refinement; the log-only fields share diagnostics'
-                    // canonical list.
-                    let sensitive =
-                        rustgis_data::address::normalized_name(k).as_deref() != Some("key") && rustgis_data::address::log_sensitive(k);
-                    (k.clone(), if sensitive { Value::String(String::new()) } else { embedded_redacted(x, depth + 1) })
-                })
-                .collect(),
-        ),
+        Value::Object(o) if depth < 8 => {
+            // The same-object login names the key parameter that "auth" would otherwise hide.
+            let query_name = crate::cmd::history::query_login_name(o);
+            Value::Object(
+                o.iter()
+                    .map(|(k, x)| {
+                        // Preserve History's plain-key refinement; the log-only fields share diagnostics'
+                        // canonical list.
+                        let sensitive =
+                            rustgis_data::address::normalized_name(k).as_deref() != Some("key") && rustgis_data::address::log_sensitive(k);
+                        let value = if sensitive {
+                            Value::String(String::new())
+                        } else if k == "address"
+                            && let (Some(name), Some(address)) = (query_name, x.as_str())
+                        {
+                            let address = crate::render::rustgis_tiles::logins::without_query_parameter(address, name);
+                            embedded_redacted(&Value::String(address), depth + 1)
+                        } else {
+                            embedded_redacted(x, depth + 1)
+                        };
+                        (k.clone(), value)
+                    })
+                    .collect(),
+            )
+        }
         // Past eight levels, left out, as `clip` does: JSON read from a text wasn't clipped, and
         // what is that deep isn't looked at.
         Value::Array(_) | Value::Object(_) => Value::String("…".into()),

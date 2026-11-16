@@ -23,6 +23,8 @@ fn permission_review_authentication_changes_are_reserved() {
         ("arcgis.token", json!({"url":"https://auth-review.example.invalid/arcgis/rest/services","token":"RGSYNTH_review_auth"})),
         ("arcgis.signOut", json!({})),
         ("arcgis.cancelSignIn", json!({})),
+        ("copernicus.login", json!({"username":"review@example.invalid","password":"RGSYNTH_review_auth"})),
+        ("copernicus.logout", json!({})),
     ] {
         let call = Call::command(id, params);
         assert!(matches!(s.review(&agent(AgentAccess::Allow), &call), Outcome::Refused(_)), "{id} is reserved even with external access");
@@ -234,6 +236,8 @@ fn permission_review_render_owners_count_terrain_elevation_tiles() {
         s.map_mut().view.terrain = Some(rustgis_map::view::Terrain {
             source: rustgis_map::view::TerrainSource::Tiles { url, encoding: rustgis_map::view::TerrainEncoding::Terrarium },
             exaggeration: 1.0,
+            block: None,
+            water: None,
         });
     };
     terrain(&mut s, "one");

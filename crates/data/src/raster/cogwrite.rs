@@ -1056,6 +1056,7 @@ pub fn write_file(r: &Raster, band: usize, path: &Path) -> Result<CogInfo> {
         // the last look: the rename commits the file, and a Cancel after it finds it written.
         crate::progress::check()?;
         std::fs::rename(&tmp, path)?;
+        crate::io::sync_folder(path);
         Ok(info)
     })();
     if res.is_err() {
@@ -1589,7 +1590,7 @@ mod tests {
     #[test]
     fn pieces_made_on_threads_are_written_in_order() {
         let slow_first = |_: &mut (), k: usize| {
-            std::thread::sleep(std::time::Duration::from_millis(((40 - k) % 7) as u64));
+            std::thread::sleep(std::time::Duration::from_millis(((40 - k) % 7) as u64)); // test-wait: finish pieces out of order to exercise ordered writing
             Ok(vec![k as u8])
         };
         let mut written = Vec::new();

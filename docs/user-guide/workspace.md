@@ -29,6 +29,13 @@ smaller one is loaded whole.
 command line. A package opens as a new, unsaved project; Save writes a plain `.rgis` file.
 Opening or creating a project clears undo history; saving does not.
 
+This version already reads format 2, a newer `.rgis` format
+([#1853](https://github.com/opengeos/RustGIS/issues/1853)), when the file needs nothing this
+version lacks, and saves it in the format it writes today. A project, package, template, map or
+layer file that needs something this version can't read (what it lists under `requires`) is
+refused, naming what it needs, rather than opened without it; one of a newer format still asks
+you to update RustGIS.
+
 A `•` after the project's name in the title bar means it has unsaved changes. Undoing or redoing
 back to the state you last saved clears it. Before the desktop app discards unsaved changes, it
 asks **Save changes to…?** That happens when you quit or close the window, and when New, Open, the
@@ -222,10 +229,14 @@ with no basemap and no graticule, as QGIS draws it. A project in degrees (EPSG:4
 longitude/latitude systems) opens in the Equirectangular projection, the plate carrée QGIS draws
 it in; a map QGIS turned keeps its rotation. The project's bookmarks come in at their places (from
 the coordinate system each was saved in), turned as QGIS turns them; their groups are noted. Its
-relations come in as [relationships](editing.md#data-design) between the layers that came in (one on several
-pairs of fields relates by the first, noted). A layer whose time QGIS reads from a date field
-(or starts at one) is bound to the [time slider](#views-and-tools) on that field, the slider left off, as
-QGIS opens a project with its time navigation off: every feature draws until it is turned on; the
+relations come in as [relationships](editing.md#data-design) between the layers that came in; one
+on several pairs of fields relates by the first, noted. A relation to a layer that came in as
+several tables relates to the one table with its field, noted as a guess. It isn't made, and is
+noted, when several of those tables have the field, or when a layer related to itself has its
+two fields in two different tables.
+A layer whose time QGIS reads from a date field (or starts at one) is bound to the
+[time slider](#views-and-tools) on that field, the slider left off, as QGIS opens a project with
+its time navigation off: every feature draws until it is turned on; the
 project's own span and steps, when it sets one, are noted. The import is one undo step.
 Relative layer paths resolve from the project's folder on desktop. In the browser, relative
 file sources cannot be resolved and are listed in the import notes.
@@ -357,6 +368,19 @@ style is applied, noted as unchecked, and a band the file hasn't is drawn from i
 RustGIS works out a map's scale with the OGC's 0.28 mm screen pixel, QGIS at 96 pixels to the
 inch, so the same view is a larger scale in QGIS; scales from QGIS (reference scales, visibility
 ranges) are multiplied by 0.945 on the way in, so a layer shows at the same zoom in both.
+
+## Layers pane terminology
+
+- **Active layer**: the one layer that commands needing a layer act on, including the
+  Style and Data tabs, attribute table and Zoom To Layer. It is always part of the layer
+  selection. Use "active layer" rather than "current layer" or "selected layer" for this role.
+- **Layer selection**: the layers picked together in the Layers pane for an action on all
+  of them, such as removing, showing or hiding, moving or grouping. It is kept with the open
+  project's state and is not saved in the project file. Use "layer selection" rather than
+  "multi-select" or "layer set".
+- **Feature selection**: the features picked in a layer, shown by its count badge and the
+  Selection view. A bare "selection" always means feature selection. Layer selection picks
+  layers, so it is a separate concept.
 
 ## Panes and command search
 
@@ -532,7 +556,9 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
   Sync sends changed, new and deleted features back and refreshes it. A feature changed in the
   map since the last sync and also edited or deleted offline takes the offline version, with a
   warning naming it (Undo reverts the whole sync, restoring the map's version); an offline edit
-  to a feature since deleted from the map is dropped, with a warning too. **Feature Cache** prepares
+  to a feature since deleted from the map is dropped, with a warning too. **Package for the Field**
+  and **Bring Back** carry an area to a phone and its edits back (see [Field Work](field-work.md)).
+  **Feature Cache** prepares
   every layer's geometry for the current projection (Fill, Empty, Cancel, Auto Cache).
 - **Settings › Customize** chooses the ribbon's tabs and the Quick Access Toolbar's extra
   buttons. Settings and Help always remain visible. **Help** opens the user guide and the
@@ -540,7 +566,7 @@ duplication and nudging have their own [layout shortcuts](layouts.md#layouts).
 - **Plugins**: **Plugins › Plugin Manager** installs, updates and removes [plugins](../plugins.md)
   from the registry at [plugins.rustgis.app](https://plugins.rustgis.app) or from a file.
 - **Language**: **Settings › Language** switches the interface among
-  [21 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
+  [22 languages](../i18n.md) and chooses the [worldview](maps.md#worldview) of the built-in
   borders.
 - **Theme**: **Settings › Theme** picks the interface colours, spacing and text sizes, from the
   built-in Light and Dark themes, a theme [file](../themes.md) in the desktop app’s themes folder, or
