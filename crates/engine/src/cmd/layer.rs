@@ -5983,6 +5983,11 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
     // (which follow the time slider) and AlphaEarth's quantised embeddings (which raster styles
     // don't dequantise) are tile layers.
     let (file, mut look) = crate::render::rustgis_tiles::cog::split(url);
+    // A header not read first (a plugin's command in the app, a data cube's file) whose connection
+    // dropped is read again by what draws the layer now, as a probed one is (#2886).
+    if !probed {
+        crate::render::rustgis_tiles::cog::forget_dropped(file);
+    }
     // A key given as `null` (a script's unused one) asks for nothing.
     let given = |k: &str| p.get(k).filter(|v| !v.is_null());
     // A data cube's file stays a tile layer, its project opened again too: its address says so.
@@ -6010,7 +6015,14 @@ pub(crate) fn add_cog_with(s: &mut Session, p: &Value, url: &str, strict: bool, 
         let dated = s.map().tiles.get(index).ok_or("added GeoTIFF tile is missing")?.url.clone();
         // Its header read now (natively) as an undated address's is before it is added.
         #[cfg(not(target_arch = "wasm32"))]
-        let probe = if s.leave_downloads { Ok(false) } else { crate::render::rustgis_tiles::cog::probe_blocking(&dated) };
+        // Not probed off the frame: the file shown (not the template) is read again by the map's
+        // draw if its connection dropped (#2886).
+        let probe = if s.leave_downloads {
+            crate::render::rustgis_tiles::cog::forget_dropped(&dated);
+            Ok(false)
+        } else {
+            crate::render::rustgis_tiles::cog::probe_blocking(&dated)
+        };
         #[cfg(target_arch = "wasm32")]
         let probe: Result<bool, String> = Ok(false);
         (dated, probe == Ok(true), probe.err())
@@ -6742,9 +6754,10 @@ pub(crate) struct WindowRaster {
 impl WindowRaster {
     /// What to say of the read, in order, and what its raster left out (`lost`: what the header
     /// holds but isn't read, values past `f32`'s range), for a caller that makes another raster
-    /// from it and so doesn't add this one (whose `lost` the layer would say).
-    pub(crate) fn notes(&self) -> Vec<String> {
-        self.read_notes().into_iter().chain(self.raster.lost.texts().map(String::from)).collect()
+    /// from it and so doesn't add this one (whose `lost` the layer would say). The read's own notes
+    /// are plain (the box's edges are empty ground, not data left out); `lost` keeps its codes.
+    pub(crate) fn notes(&self) -> Vec<rustgis_data::loss::Note> {
+        self.read_notes().into_iter().map(rustgis_data::loss::Note::plain).chain(self.raster.lost.iter().cloned()).collect()
     }
 
     /// What to say of the read alone (its size and level, a cell size finer than the file's, the
@@ -7501,10 +7514,23 @@ fn follow_removal(s: &mut Session, names: &[String]) {
     terrain_follows_removal(s, names);
     square_labels_follow_removal(s, names);
     layouts_follow_removal(s, names);
+    pages_follow_removal(s, names);
     // A legend that left it out forgets it.
     for n in names {
         legends_follow_layer(s, n, None);
     }
+}
+
+/// The notice that `count` items name the removed layers `named`, in the first of `keys` for one
+/// name and the second for more. `None` when no item does.
+fn removed_notice(keys: [&'static str; 2], count: usize, named: &[&str]) -> Option<crate::notice_text::NoticeText> {
+    if count == 0 {
+        return None;
+    }
+    let [one, more] = keys;
+    let key = if named.len() == 1 { one } else { more };
+    let names = named.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
+    Some(crate::notice_text::NoticeText::format(key, [("count", count.to_string().into()), ("names", names.into())]))
 }
 
 /// After layers called `names` are removed: a table's, chart's or colorbar's layer, and a text's
@@ -7533,26 +7559,62 @@ fn layouts_follow_removal(s: &mut Session, names: &[String]) {
                 }
                 _ => continue,
             };
-            let mut lost = false;
-            for name in gone.iter().filter(|n| reads.iter().any(|r| r.eq_ignore_ascii_case(n))) {
-                lost = true;
-                if !named.iter().any(|n| n.eq_ignore_ascii_case(name)) {
-                    named.push(name.as_str());
-                }
-            }
-            count += usize::from(lost);
+            count += usize::from(reads_removed(&reads, &gone, &mut named));
         }
     }
-    if count == 0 {
-        return;
+    let keys = [
+        "{count} layout element(s) name the removed layer {names}: they are drawn without it until a layer of that name comes back",
+        "{count} layout element(s) name the removed layers {names}: they are drawn without it until a layer of that name comes back",
+    ];
+    if let Some(notice) = removed_notice(keys, count, &named) {
+        s.notify_text(notice, false);
     }
-    let key = if named.len() == 1 {
-        "{count} layout element(s) name the removed layer {names}: they are drawn without it until a layer of that name comes back"
-    } else {
-        "{count} layout element(s) name the removed layers {names}: they are drawn without it until a layer of that name comes back"
-    };
-    let names = named.iter().map(|n| format!("'{n}'")).collect::<Vec<_>>().join(", ");
-    s.notify_text(crate::notice_text::NoticeText::format(key, [("count", count.to_string().into()), ("names", names.into())]), false);
+}
+
+/// Whether `reads`, the layer names one item reads, hold a removed one: each of `gone` it reads
+/// joins `named`, once.
+fn reads_removed<'a>(reads: &[&str], gone: &[&'a String], named: &mut Vec<&'a str>) -> bool {
+    let mut lost = false;
+    for name in gone.iter().filter(|n| reads.iter().any(|r| r.eq_ignore_ascii_case(n))) {
+        lost = true;
+        if !named.iter().any(|n| n.eq_ignore_ascii_case(name)) {
+            named.push(name.as_str());
+        }
+    }
+    lost
+}
+
+/// After layers called `names` are removed: a map series' index layer, and the layer statistics
+/// (#2853) in a presentation map page's title, keep the name, so a layer of that name brings them
+/// back: how many series and titles, said once (#3075). Which of them read the active map is as for
+/// a rename (`references_follow_layer`).
+fn pages_follow_removal(s: &mut Session, names: &[String]) {
+    use rustgis_map::presentation::PageKind;
+
+    let gone: Vec<&String> = names.iter().filter(|n| named_layers(s, n) == 0).collect();
+    let map_name = &s.map().name;
+    let mut named: Vec<&str> = Vec::new();
+    let mut count = 0usize;
+    for layout in &s.project.layouts {
+        if let Some(series) = &layout.series
+            && frames_showing(layout, map_name).contains(&series.frame)
+        {
+            count += usize::from(reads_removed(&[&series.layer], &gone, &mut named));
+        }
+    }
+    for page in s.project.presentations.iter().flat_map(|p| &p.pages) {
+        if matches!(&page.kind, PageKind::Map { map, .. } if map.eq_ignore_ascii_case(map_name)) {
+            let reads: Vec<&str> = rustgis_map::layout::stat_tokens(&page.title).iter().map(|t| t.layer).collect();
+            count += usize::from(reads_removed(&reads, &gone, &mut named));
+        }
+    }
+    let keys = [
+        "{count} map series or presentation title(s) name the removed layer {names}: a series exports only its current page, and a title shows the figure as written, until a layer of that name comes back",
+        "{count} map series or presentation title(s) name the removed layers {names}: a series exports only its current page, and a title shows the figure as written, until a layer of that name comes back",
+    ];
+    if let Some(notice) = removed_notice(keys, count, &named) {
+        s.notify_text(notice, false);
+    }
 }
 
 /// After layers called `names` are removed: point labels turned square to one of them (#2263),

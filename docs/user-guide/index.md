@@ -12,6 +12,7 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 | [Editing](editing.md) | Creating and modifying features, data design, the clipboard and pop-ups |
 | [Analysis](analysis.md) | Selection and SQL queries, geoprocessing, the GeoLibre tools, guided workflows, imagery, data cubes and time series |
 | [Expressions](expressions.md) | The expression language of queries, filters and Calculate Field: grammar, operators, functions |
+| [Data Loss Codes](loss-codes.md) | What each data loss code means, where it is said and what to do about it |
 | [Layouts and Reports](layouts.md) | Page layouts, map series, reports, presentations and notebooks |
 | [Sharing](sharing.md) | Exports, packages and open-format web maps, layers, styles and scenes |
 | [Workspace](workspace.md) | Linked views, the Browser view, animation, profiles, offline areas, customizing the ribbon |
@@ -546,14 +547,31 @@ with `{"layer":"parcels"}`.
 | ++ctrl+equal++ / ++ctrl+minus++ | Zoom in / out |
 | ++home++ | Full extent |
 | ++esc++ | Back to Explore; cancel a sketch |
-| ++delete++ | Delete selected features; with Edit Vertices, the chosen vertex; in a layout, the selected element |
+| ++delete++ | Delete selected features; with Edit Vertices, the chosen vertex; in a layout, the selected element; in the layer list, remove the selected layers (++backspace++ too) |
 | ++ctrl+d++ | Duplicate the selected layout element |
 | Arrow keys / ++shift++ + arrow keys | Nudge the selected layout element / nudge it further |
+| Arrow keys / ++enter++ | In the attribute table, move the current cell / edit it |
 | ++alt+shift+right++ / ++alt+shift+left++ | Indent the active layer into the group above it / outdent it out of its group |
 | ++alt+shift+up++ / ++alt+shift+down++ | Move the active layer up / down one step in the Layers pane |
-| ++f2++ | Rename the active layer |
-| ++ctrl+c++ / ++ctrl+x++ / ++ctrl+v++ | Copy / Cut / Paste features |
+| ++f2++ | Rename the active layer; on the map and layout tabs, and in a layout, the map or layout in view |
+| ++ctrl+a++ | Select every feature of the active layer; in the attribute table, of the layer it shows; in a text field, its text |
+| ++ctrl+c++ / ++ctrl+x++ / ++ctrl+v++ | Copy / Cut / Paste features; in the layer list, Copy and Paste the selected layers |
 
 On macOS, ++cmd++ takes the place of ++ctrl++. **Help › Shortcuts** lists them all in the app,
 from the same table the app runs them from. While you type in a text field, undo and redo take
 back its typing, not the project's last change.
+
+++delete++, ++f2++ and the arrow keys act on the part of the window you last clicked, dragged or
+scrolled in. Click a layer in the Layers pane and ++delete++ removes it (Undo brings it back),
+whatever is selected on the map; click or scroll the map and it deletes the selected features
+again. When ++delete++ has nothing to act on, a notice says why. In the
+[attribute table](analysis.md#the-attribute-table) the arrow keys move between cells; on the map
+they pan it, and in a layout they nudge the selected element.
+
+Copy and Paste follow it too. In the Layers pane they copy and paste the selected layers, as **Copy
+Layer** and **Paste Layer** in a layer's menu do: the copies go above the active layer, or at the
+top of its group. Copying layers puts their names on the clipboard as text, and Paste adds the
+layers while the clipboard still holds those names; features or text copied after that are what
+Paste takes next, in the Layers pane as on the map. Cut does nothing in the Layers pane: copy a
+layer, then remove it with ++delete++. ++ctrl+a++ is left alone in a layout and in ModelBuilder,
+where there are no features to select.

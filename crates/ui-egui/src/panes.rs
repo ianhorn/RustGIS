@@ -49,7 +49,10 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
                 let rect = ui.available_rect_before_wrap();
                 let mut body = ui.new_child(egui::UiBuilder::new().max_rect(rect).layout(*ui.layout()));
                 match left {
-                    LeftPane::Contents => contents(app, &mut body, &t),
+                    LeftPane::Contents => {
+                        app.ui.in_use.drawn(crate::inuse::Pane::Layers, body.layer_id(), rect);
+                        contents(app, &mut body, &t);
+                    }
                     LeftPane::Catalog => catalog(app, &mut body, &t),
                     LeftPane::Sources => crate::sourcespane::show(app, &mut body, &t),
                 }
@@ -927,6 +930,10 @@ fn contents(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                             let _ = app.run("ui.gp.open", json!({"tool": "xyTableToPoint", "table": id}));
                             ui.close();
                         }
+                        if ui.button(tl!("Export Table…")).clicked() {
+                            let _ = app.run("ui.exportTable", json!({"table": id}));
+                            ui.close();
+                        }
                         // Names can repeat: the id says which table. A view open on it closes itself.
                         if ui.button(tl!("Remove")).clicked() {
                             let _ = app.run("table.remove", json!({"table": id}));
@@ -957,6 +964,52 @@ fn paste_label(app: &RustGisApp) -> &'static str {
         (n, false) if n > 1 => tl!("Paste Groups"),
         _ if c.layers.len() > 1 => tl!("Paste Layers"),
         _ => tl!("Paste Layer"),
+    }
+}
+
+/// The names a copy of layers goes by on the clipboard: its layers', or its groups' when it has no
+/// layer (an empty group was copied).
+fn copied_names(copy: &rustgis_engine::cmd::layer_copy::LayerClip) -> Vec<&str> {
+    if copy.layers.is_empty() {
+        copy.groups.iter().map(|g| g.name.as_str()).collect()
+    } else {
+        copy.layers.iter().map(|l| l.name.as_str()).collect()
+    }
+}
+
+/// Copies layers (`layer.copy` with `params`) and puts their names on the clipboard as text, one a
+/// line: a paste elsewhere gives the names, and a Paste key in the layer list can tell whether the
+/// layers are still the last thing copied ([`pastes_copied_layers`]). So what the clipboard held
+/// before (features, say) is replaced, as any copy replaces it. A copy refused is said by `run`.
+pub(crate) fn copy_layers(app: &mut RustGisApp, params: Value) {
+    if app.run("layer.copy", params).is_err() {
+        return;
+    }
+    let names = app.session.layer_clipboard.as_ref().map(copied_names).unwrap_or_default().join("\n");
+    if !names.trim().is_empty() {
+        app.ui.copy_out = Some(names);
+    }
+}
+
+/// Whether a Paste key in the layer list, with `text` on the clipboard, pastes the copied layers:
+/// while the clipboard holds the names the copy goes by ([`copied_names`]; line ends aside, which
+/// a clipboard may change). Features or text copied since are the newer copy, and layers a script
+/// copied since aren't the ones the clipboard names.
+pub(crate) fn pastes_copied_layers(app: &RustGisApp, text: &str) -> bool {
+    let lines = |text: &str| text.lines().map(str::trim_end).filter(|line| !line.is_empty()).map(str::to_owned).collect::<Vec<_>>();
+    app.session.layer_clipboard.as_ref().is_some_and(|copy| {
+        let names = lines(&copied_names(copy).join("\n"));
+        !names.is_empty() && names == lines(text)
+    })
+}
+
+/// Where `layer.paste` puts the copies when they are pasted on layer `id`: above it, or at the
+/// top of its group.
+pub(crate) fn paste_above(app: &RustGisApp, id: u32) -> Value {
+    let m = app.session.map();
+    match m.group_of(id) {
+        Some(g) => json!({"group": g.id}),
+        None => json!({"to": m.layer_index(id).unwrap_or(0)}),
     }
 }
 
@@ -1408,7 +1461,7 @@ fn layer_group_row(
             }
             ui.separator();
             if ui.button(tl!("Copy Group")).clicked() {
-                let _ = app.run("layer.copy", json!({"group": group.id}));
+                copy_layers(app, json!({"group": group.id}));
                 ui.close();
             }
             if ui.add_enabled(app.session.layer_clipboard.is_some(), egui::Button::new(paste_label(app))).clicked() {
@@ -2564,15 +2617,11 @@ fn layer_menu(app: &mut RustGisApp, ui: &mut Ui, l: &Layer, reorder: bool) {
     ui.separator();
     // Whole layers (#491): pasted on a layer, the copies go above it, or at the top of its group.
     if ui.button(tl!("Copy Layer")).clicked() {
-        let _ = app.run("layer.copy", json!({"layer": l.id}));
+        copy_layers(app, json!({"layer": l.id}));
         ui.close();
     }
     if ui.add_enabled(app.session.layer_clipboard.is_some(), egui::Button::new(paste_label(app))).clicked() {
-        let m = app.session.map();
-        let at = match m.group_of(l.id) {
-            Some(g) => json!({"group": g.id}),
-            None => json!({"to": m.layer_index(l.id).unwrap_or(0)}),
-        };
+        let at = paste_above(app, l.id);
         let _ = app.run("layer.paste", at);
         ui.close();
     }
@@ -8819,6 +8868,63 @@ pub(crate) mod tests {
         crate::click_in_one_frame(&mut h, at, 0.7);
         h.run_steps(3);
         assert_eq!(h.state().ui.right, Some(RightPane::Symbology));
+    }
+
+    /// A standalone table's menu opens Export Table on it, which offers the formats that hold a
+    /// table without geometry and writes the one picked on the export thread.
+    #[test]
+    fn a_standalone_tables_menu_exports_it() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::data::{Dataset, Field, FieldType, GeometryType, Value as Cell};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("totals.csv");
+        let mut app = RustGisApp::with_sample();
+        let mut ds = Dataset::new("zone_totals", GeometryType::None, vec![Field::new("total", FieldType::Integer)]);
+        ds.push(None, vec![Cell::Int(42)]);
+        let table = app.session.project.add_table(ds);
+        // Added later: the menu's table is the one written, not the last.
+        app.session.project.add_table(Dataset::new("other", GeometryType::None, vec![]));
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1200.0, 900.0)).with_max_steps(64).build_ui_state(
+            |ui, app: &mut RustGisApp| {
+                let ctx = ui.ctx().clone();
+                app.logic(&ctx);
+                app.ui(ui);
+            },
+            app,
+        );
+        h.run_steps(6);
+        h.get_by_label("zone_totals").click_secondary();
+        h.run_steps(2);
+        h.get_by_label("Export Table…").click();
+        h.run_steps(4);
+        assert_eq!(h.state().dialogs.open, Some("exportTable"));
+        assert_eq!(h.state().dialogs.export_table.map(|(id, _)| id), Some(table));
+        h.get_by_label("Format").click();
+        h.run_steps(4);
+        for (label, offered) in [
+            ("GeoJSON", true),
+            ("GeoPackage", true),
+            ("GeoParquet", true),
+            ("Shapefile", false),
+            ("FlatGeobuf", false),
+            ("KML", false),
+            ("KMZ", false),
+            ("GPX", false),
+        ] {
+            assert_eq!(h.query_all_by_label(label).count() > 0, offered, "{label}");
+        }
+        h.key_press(egui::Key::Escape);
+        h.run_steps(4);
+        crate::dialogs::PICKED.with(|p| *p.borrow_mut() = Some(path.display().to_string()));
+        h.get_by_label("Export…").click();
+        h.run_steps(2);
+        assert_eq!(h.state().dialogs.open, None);
+        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        while crate::exportjob::land(h.state_mut()) {
+            assert!(std::time::Instant::now() < end, "the export never landed");
+            std::thread::sleep(std::time::Duration::from_millis(10)); // test-wait: polls for the export thread's file
+        }
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "total\n42\n");
     }
 
     /// #808: a web tile layer is listed at its place among the map's layers, moves past them

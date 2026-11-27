@@ -3443,6 +3443,15 @@ impl Session {
         }
     }
 
+    /// [`Session::say`] for a read that always warned: a note that reports a loss as that loss, with
+    /// its code, any other as a warning ([`Session::warn`]), not information.
+    pub fn say_warning(&mut self, note: rustgis_data::loss::Note) {
+        match note.loss {
+            Some(code) => self.notify_loss(code, note.text.into()),
+            None => self.warn(note.text),
+        }
+    }
+
     /// [`Session::say`] for what a committed external write said, which restoring a project
     /// cannot undo ([`Session::notify_written`]).
     pub(crate) fn say_written(&mut self, note: rustgis_data::loss::Note) {
@@ -3590,7 +3599,7 @@ impl Session {
         if severity == rustgis_data::diagnostics::Severity::Error && self.rerun_said.iter().any(|said| said == text.as_str()) {
             return;
         }
-        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text);
+        self.diagnostics.push_redacted(severity, source.unwrap_or("Application"), &text, loss);
         self.notices.push(Notice {
             text: text.into_string(),
             error: severity == rustgis_data::diagnostics::Severity::Error,

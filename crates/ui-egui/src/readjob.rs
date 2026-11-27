@@ -766,6 +766,15 @@ impl Reads {
     }
 }
 
+/// The read or table edit under way, by its name, while one runs or waits: an export started now
+/// would read the data before it lands.
+pub(crate) fn under_way(app: &RustGisApp) -> Option<&'static str> {
+    match &app.reads.job {
+        Some(job) => Some(job.name),
+        None => (!app.reads.waiting.is_empty()).then(|| crate::tl_raw!("A read")),
+    }
+}
+
 /// Whether the status bar shows a read.
 pub fn showing(app: &RustGisApp) -> bool {
     app.reads.job.is_some()
@@ -1711,7 +1720,7 @@ mod tests {
         assert_eq!(step.params["layer"], json!("towns"));
     }
 
-    /// Import QGIS Style reads its file and its raster image markers' images on a thread first
+    /// Import QGIS Style reads its file and its raster image and SVG markers' images on a thread first
     /// (#2620): the layer is styled when they have been read, with the notes the command gives.
     #[test]
     fn a_qgis_style_is_read_on_a_thread_before_it_lands() {
