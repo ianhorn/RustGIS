@@ -108,6 +108,10 @@ fn combo(ui: &mut Ui, id: &str, name: &str, value: &mut String, options: &[Strin
 }
 
 pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
+    crate::shapeconvert::panel(app, ui);
+    if matches!(app.session.tool, rustgis_engine::Tool::Circle | rustgis_engine::Tool::RotatedBox) {
+        ui.collapsing(tl!("New shape grid"), |ui| crate::annotation::grid_controls(app, ui));
+    }
     crate::boxedit::panel(app, ui);
     crate::circleedit::panel(app, ui);
     message(app, ui, t);
@@ -372,7 +376,11 @@ pub fn editing(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                     if rows.is_empty() { String::new() } else { format!("#{}", rows.join(", #")) }
                 );
                 if ui.link(text).on_hover_text(tl!("Zoom to the error")).clicked() {
-                    let _ = app.run("map.goToXY", json!({"lon": e.lon, "lat": e.lat}));
+                    // An issue at a place that can't be given in longitude/latitude has none
+                    // (NaN): its features are selected, with no zoom.
+                    if e.lon.is_finite() && e.lat.is_finite() {
+                        let _ = app.run("map.goToXY", json!({"lon": e.lon, "lat": e.lat}));
+                    }
                     if let Some(l) = app.session.map().layer_by_name(&e.layer).map(|l| l.id)
                         && !e.rows.is_empty()
                     {
@@ -511,7 +519,10 @@ pub fn design(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     });
     ui.horizontal(|ui| {
         let hint = if app.forms.calc { tl!("field * 2, 'text', a + b") } else { tl!("SQL that must be true, e.g. pop > 0") };
-        ui.add(egui::TextEdit::singleline(&mut app.forms.expression).hint_text(hint).desired_width(190.0));
+        // Suggestions from the layer's fields (#1240).
+        let _ = crate::exprcomplete::expr_edit(ui, egui::Id::unique("rule_expression"), &mut app.forms.expression, Some(&l.dataset), |e| {
+            e.hint_text(hint).desired_width(190.0)
+        });
         if ui.button(tl!("Add")).clicked() {
             let kind = if app.forms.calc { "calculation" } else { "constraint" };
             run(

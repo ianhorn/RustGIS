@@ -88,32 +88,42 @@ impl Kept {
     /// keeps apart from them): a bare `key` is a secret beside a web address, and an address
     /// holding a secret doesn't stop being one; `known` is the row's known details (its `extra`), a
     /// sibling too. Only then are the classified entries removed.
-    fn without_secrets(&mut self, mut o: Map<String, Value>, address: &str, known: &Value) -> Map<String, Value> {
-        // Count address-bearing siblings once; unknown preference fields are not capped.
-        let addresses =
-            o.iter().filter(|(k, v)| !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, 0)).count();
+    fn without_secrets(&mut self, o: Map<String, Value>, address: &str, known: &Value) -> Map<String, Value> {
         let beside = web_address(&Value::String(address.into()), 0) || web_address(known, 0);
-        let secret: BTreeSet<String> = o
-            .iter()
-            .filter(|(k, v)| {
-                let mut probe = Map::new();
-                probe.insert((*k).clone(), (*v).clone());
-                let own_address = !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, 0);
-                if beside || addresses > usize::from(own_address) {
-                    probe.insert("\u{1}beside".into(), "https://a".into());
-                }
-                holds_secret(&Value::Object(probe))
-            })
-            .map(|(k, _)| k.clone())
-            .collect();
-        self.secrets += secret.len();
-        o.retain(|k, _| !secret.contains(k));
+        let (o, secrets) = without_secrets(o, beside);
+        self.secrets += secrets;
         o
     }
 }
 
+/// The entries of `o` without a password, key or token, and how many were left out. Every entry
+/// is classified on the original object first, beside the others: a bare `key` is a secret beside
+/// a web address (another entry, or one outside `o` when `beside`), and an address holding a
+/// secret doesn't stop being one. Only then are the classified entries removed.
+pub(crate) fn without_secrets(mut o: Map<String, Value>, beside: bool) -> (Map<String, Value>, usize) {
+    // Count address-bearing siblings once; unknown preference fields are not capped.
+    let addresses =
+        o.iter().filter(|(k, v)| !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, 0)).count();
+    let secret: BTreeSet<String> = o
+        .iter()
+        .filter(|(k, v)| {
+            let mut probe = Map::new();
+            probe.insert((*k).clone(), (*v).clone());
+            let own_address = !k.eq_ignore_ascii_case("data") && !k.eq_ignore_ascii_case("text") && web_address(v, 0);
+            if beside || addresses > usize::from(own_address) {
+                probe.insert("\u{1}beside".into(), "https://a".into());
+            }
+            holds_secret(&Value::Object(probe))
+        })
+        .map(|(k, _)| k.clone())
+        .collect();
+    let left_out = secret.len();
+    o.retain(|k, _| !secret.contains(k));
+    (o, left_out)
+}
+
 /// Whether `v` is, or holds, a web address (not under a file's `data` or `text`).
-fn web_address(v: &Value, depth: usize) -> bool {
+pub(crate) fn web_address(v: &Value, depth: usize) -> bool {
     match v {
         Value::String(t) => t.trim_start().get(..4).is_some_and(|p| p.eq_ignore_ascii_case("http")),
         Value::Object(o) if depth < 4 => {
@@ -206,6 +216,11 @@ impl Sources {
                     }
                     _ if holds_secret(&row) => s.kept.secrets += 1,
                     read => {
+                        // A readable row past the cap is still the first of its identity, so a
+                        // later repeat of it is said as repeated, not counted past the cap again.
+                        if let Some((_, source, _)) = &read {
+                            seen.insert(identity(&source.kind, &source.address));
+                        }
                         s.kept.over += usize::from(read.is_some());
                         s.kept.rows.entry(list).or_default().push(row);
                     }
@@ -491,7 +506,20 @@ fn same(a: &Source, b: &Source) -> bool {
     identity(&a.kind, &a.address) == identity(&b.kind, &b.address)
 }
 
+/// What a `url` source's add may have had that changes how its address is read, kept in `extra`
+/// for adding it again with `layer.addUrl`: a service's features are read page by page, a WCS
+/// coverage in the system it was asked in (`coverageCrs`, kept with it).
+pub const URL_FLAGS: [&str; 2] = ["service", "coverage"];
+
+/// A flag as `extra` keeps it: its values are text.
+const FLAG_ON: &str = "true";
+
 impl Source {
+    /// Whether the add this source records had `flag` (one of [`URL_FLAGS`]).
+    pub fn flag(&self, flag: &str) -> bool {
+        self.extra.get(flag).and_then(Value::as_str) == Some(FLAG_ON)
+    }
+
     /// A source's identity: its kind and address. Everywhere a list is matched (kept, forgotten,
     /// noted as recent, shown as a favourite) it is by this; `extra` (a layer, a service type)
     /// is what the last one kept said.
@@ -907,7 +935,24 @@ pub fn added_by(id: &str, p: &Value) -> Option<Source> {
     let layer = |k: &str| text(p, k).map(|l| json!({k: l})).unwrap_or(Value::Null);
     match id {
         "layer.addData" => Some(src("file", text(p, "path")?, text(p, "name"), layer("layer"))),
-        "layer.addUrl" | "layer.addDownload" => Some(src("url", text(p, "url")?, text(p, "name"), layer("layer"))),
+        "layer.addUrl" | "layer.addDownload" => {
+            let mut extra = serde_json::Map::new();
+            if let Some(l) = text(p, "layer") {
+                extra.insert("layer".into(), json!(l));
+            }
+            for flag in URL_FLAGS {
+                if p.get(flag).and_then(crate::cmd::bool_value) == Some(true) {
+                    extra.insert(flag.into(), json!(FLAG_ON));
+                }
+            }
+            if extra.contains_key("coverage")
+                && let Some(crs) = text(p, "coverageCrs")
+            {
+                extra.insert("coverageCrs".into(), json!(crs));
+            }
+            let extra = if extra.is_empty() { Value::Null } else { Value::Object(extra) };
+            Some(src("url", text(p, "url")?, text(p, "name"), extra))
+        }
         "map.addTiles" => {
             let url = text(p, "url")?;
             let mut extra = serde_json::Map::new();
@@ -1355,6 +1400,12 @@ MIIE
         let stored: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
         s.merge(Sources::from_json(&json!({ "favourites": stored }).to_string()));
         assert!(s.unread().iter().any(|t| t.contains("past the lists' limits")), "{:?}", s.unread());
+        // A row past the limit counts once: its repeat is said as repeated, not past the limit.
+        let mut over: Vec<Value> = (0..MAX_KEPT).map(|i| json!({"kind": "file", "name": "", "address": format!("/{i}.csv")})).collect();
+        over.extend([json!({"kind": "file", "name": "", "address": "/x.csv"}), json!({"kind": "file", "name": "", "address": "/x.csv"})]);
+        let s = Sources::from_json(&json!({ "saved": over }).to_string());
+        assert_eq!((s.kept.over, s.kept.repeated), (1, 1));
+        assert!(s.unread().iter().any(|t| t.starts_with("1 saved data source is past the lists' limits")), "{:?}", s.unread());
         // A repeat past the limit is dropped, not kept as an overflow row. A bound address is the
         // bare one's identity: forgetting by either form removes a kept over-limit row of it, never
         // an unreadable row that merely shares the address.
@@ -1371,7 +1422,8 @@ MIIE
         full.push(json!({"kind": "future", "name": "", "address": twin}));
         full.push(json!({"kind": " url ", "name": 5, "address": twin}));
         let mut s = Sources::from_json(&json!({"saved": full}).to_string());
-        assert_eq!(s.kept.over, 2, "{:?}", s.unread());
+        // The twin repeats the bound row's identity, past the limit as it is: said as repeated.
+        assert_eq!((s.kept.over, s.kept.repeated), (1, 1), "{:?}", s.unread());
         let generation = s.generation;
         // Only kept rows go: that is still a removal, and the pane must still save.
         assert!(s.forget("saved", "url", &twin).unwrap() && s.generation != generation);
@@ -1675,6 +1727,16 @@ MIIE
             added_by("service.add", &json!({"url": "https://h/wms", "layer": "a", "type": "wms"})).unwrap().extra,
             json!({"layer": "a", "type": "wms"})
         );
+        let service = json!({"url": "https://h/collections/a/items", "name": "A", "service": true});
+        assert_eq!(added_by("layer.addUrl", &service).unwrap().extra, json!({"service": "true"}));
+        assert_eq!(clean(added_by("layer.addDownload", &service).unwrap()).unwrap().extra, json!({"service": "true"}));
+        assert_eq!(added_by("layer.addUrl", &json!({"url": "https://h/a.geojson", "service": false})).unwrap().extra, Value::Null);
+        let coverage = json!({"url": "https://h/wcs?REQUEST=GetCoverage", "coverage": true, "coverageCrs": "EPSG:2056"});
+        let kept = clean(added_by("layer.addDownload", &coverage).unwrap()).unwrap();
+        assert_eq!(kept.extra, json!({"coverage": "true", "coverageCrs": "EPSG:2056"}));
+        assert!(kept.flag("coverage") && !kept.flag("service"));
+        // A system without the coverage flag isn't one the address is read in.
+        assert_eq!(added_by("layer.addUrl", &json!({"url": "https://h/a.tif", "coverageCrs": "EPSG:2056"})).unwrap().extra, Value::Null);
         assert!(added_by("layer.remove", &json!({})).is_none());
         assert!(added_by("layer.addData", &json!({})).is_none());
         assert!(library().iter().all(|(_, s)| clean(s.clone()).is_ok()));

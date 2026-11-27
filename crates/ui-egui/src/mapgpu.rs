@@ -255,15 +255,23 @@ pub(crate) struct GpuMapRenderer {
     tile_mesh_layout: wgpu::BindGroupLayout,
     backdrop_layout: wgpu::BindGroupLayout,
     image_layout: wgpu::BindGroupLayout,
+    /// A picture's opacity, beside its texture.
+    opacity_layout: wgpu::BindGroupLayout,
     blit_layout: wgpu::BindGroupLayout,
     templates: wgpu::Buffer,
     sampler: wgpu::Sampler,
+    /// Each pixel a block, for tile layers set to nearest-neighbour resampling (#2804).
+    nearest_sampler: wgpu::Sampler,
     /// MSAA sample count of the offscreen scene target.
     samples: u32,
     /// The tile pictures uploaded so far, kept across scenes.
     tile_textures: std::sync::Mutex<TileTextures>,
     /// The vector tile meshes uploaded so far, kept across scenes.
     tile_meshes: std::sync::Mutex<TileMeshBuffers>,
+    /// The layers' meshes and markers the latest scene uploaded, for the next to share.
+    layer_buffers: std::sync::Mutex<LayerBuffers>,
+    /// The pictures drawn on the CPU the latest scene uploaded, for the next to share.
+    pictures: std::sync::Mutex<PictureTextures>,
     /// The live raster tile layers' pictures and per-frame instances (#635).
     pub(crate) live: std::sync::Mutex<crate::tilelayer::LiveTiles>,
     /// The last frame left live tile pictures to upload: draw again.
@@ -329,6 +337,10 @@ impl GpuMapRenderer {
             label: Some("mapgpu_blit_uv"),
             entries: &[uniform_buf(wgpu::ShaderStages::VERTEX, 0, 16)],
         });
+        let opacity_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("mapgpu_image_opacity"),
+            entries: &[uniform_buf(wgpu::ShaderStages::FRAGMENT, 1, 16)],
+        });
         let templates = buffer_init(
             device,
             &wgpu::util::BufferInitDescriptor {
@@ -341,6 +353,12 @@ impl GpuMapRenderer {
             label: Some("mapgpu_image"),
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        let nearest_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("mapgpu_image_nearest"),
+            mag_filter: wgpu::FilterMode::Nearest,
+            min_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
         let pipeline = |label: &str,
@@ -506,7 +524,8 @@ impl GpuMapRenderer {
             samples,
             flat.clone(),
         );
-        let image_pipeline = pipeline("mapgpu_image", "vs_image", "fs_image", &[], &[&image_layout], scene_format, samples, flat.clone());
+        let image_pipeline =
+            pipeline("mapgpu_image", "vs_image", "fs_image", &[], &[&image_layout, &opacity_layout], scene_format, samples, flat.clone());
         let backdrop_pipeline =
             pipeline("mapgpu_backdrop", "vs_backdrop", "fs_backdrop", &[], &[&backdrop_layout], scene_format, samples, flat.clone());
         let shadow_pipeline =
@@ -540,12 +559,16 @@ impl GpuMapRenderer {
             tile_mesh_layout,
             backdrop_layout,
             image_layout,
+            opacity_layout,
             blit_layout,
             templates,
             sampler,
+            nearest_sampler,
             samples,
             tile_textures: Default::default(),
             tile_meshes: Default::default(),
+            layer_buffers: Default::default(),
+            pictures: Default::default(),
             live: std::sync::Mutex::new(crate::tilelayer::LiveTiles::new(device, scene_format, samples, DEPTH_FORMAT)),
             live_backlog: std::sync::atomic::AtomicBool::new(false),
         }
@@ -666,6 +689,9 @@ struct TileTextures {
 struct TileTexture {
     picture: std::sync::Weak<Payload>,
     bind: wgpu::BindGroup,
+    /// The same texture sampled nearest, for a layer set to nearest-neighbour resampling
+    /// (#2804): one upload whichever way the layers that draw it sample it.
+    nearest_bind: wgpu::BindGroup,
     texture: Arc<Owned<wgpu::Texture>>,
     used: u64,
     bytes: u64,
@@ -686,7 +712,8 @@ impl TileTextures {
             && t.picture.upgrade().is_some_and(|p| Arc::ptr_eq(&p, &q.picture))
         {
             t.used = self.scene;
-            return Some((t.bind.clone(), t.texture.clone()));
+            let bind = if q.nearest { &t.nearest_bind } else { &t.bind };
+            return Some((bind.clone(), t.texture.clone()));
         }
         let pm = q.pixmap()?;
         let (w, h) = (pm.width(), pm.height());
@@ -715,24 +742,29 @@ impl TileTextures {
             size,
         );
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("mapgpu_tile_bind"),
-            layout: &r.image_layout,
-            entries: &[
-                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&r.sampler) },
-            ],
-        });
+        let bind_with = |sampler: &wgpu::Sampler| {
+            device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("mapgpu_tile_bind"),
+                layout: &r.image_layout,
+                entries: &[
+                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(sampler) },
+                ],
+            })
+        };
+        let (bind, nearest_bind) = (bind_with(&r.sampler), bind_with(&r.nearest_sampler));
+        let chosen = if q.nearest { nearest_bind.clone() } else { bind.clone() };
         let texture = Arc::new(texture);
         let t = TileTexture {
             picture: Arc::downgrade(&q.picture),
-            bind: bind.clone(),
+            bind,
+            nearest_bind,
             texture: texture.clone(),
             used: self.scene,
             bytes: u64::from(w) * u64::from(h) * 4,
         };
         self.by_picture.insert(key, t);
-        Some((bind, texture))
+        Some((chosen, texture))
     }
 
     /// Ends a scene: drops the textures of pictures the tile cache let go, and past
@@ -824,6 +856,127 @@ impl TileMeshBuffers {
             }
         }
         self.scene += 1;
+    }
+}
+
+/// The layers' meshes and markers on the GPU, by the address of their data, which the renderer
+/// shares from scene to scene while a layer looks as it did (`render::layer_meshes`): a scene
+/// draws those from the buffers an earlier one uploaded (the map's or a split view's). Both are
+/// held weakly: a buffer lives as long as a scene that draws it, so these cost no GPU memory
+/// beside the scenes on screen, and none once the map leaves the GPU.
+#[derive(Default)]
+struct LayerBuffers {
+    by_data: std::collections::HashMap<usize, LayerBuffer>,
+}
+
+struct LayerBuffer {
+    data: std::sync::Weak<dyn std::any::Any + Send + Sync>,
+    buffer: std::sync::Weak<Owned<wgpu::Buffer>>,
+}
+
+impl LayerBuffers {
+    /// The buffer holding `data`, uploaded the first time a scene draws it.
+    fn buffer<T: bytemuck::Pod + Send + Sync>(
+        &mut self,
+        device: &wgpu::Device,
+        data: &Arc<Vec<T>>,
+        label: &'static str,
+        usage: wgpu::BufferUsages,
+    ) -> Arc<Owned<wgpu::Buffer>> {
+        let key = Arc::as_ptr(data) as usize;
+        // While the data lives its address is its own: the weak reference keeps another from it.
+        if let Some(b) = self.by_data.get_mut(&key)
+            && b.data.upgrade().is_some_and(|d| Arc::as_ptr(&d).cast::<()>() as usize == key)
+            && let Some(buffer) = b.buffer.upgrade()
+        {
+            return buffer;
+        }
+        let buffer = Arc::new(owned_buffer(
+            device,
+            &wgpu::util::BufferInitDescriptor { label: Some(label), contents: bytemuck::cast_slice(data.as_slice()), usage },
+        ));
+        let shared: Arc<dyn std::any::Any + Send + Sync> = data.clone();
+        self.by_data.insert(key, LayerBuffer { data: Arc::downgrade(&shared), buffer: Arc::downgrade(&buffer) });
+        buffer
+    }
+
+    /// Ends a scene: forgets the buffers no scene draws any longer, and those of data gone.
+    fn end_scene(&mut self) {
+        self.by_data.retain(|_, b| b.data.strong_count() > 0 && b.buffer.strong_count() > 0);
+    }
+}
+
+/// A picture drawn on the CPU, on the GPU.
+pub(crate) struct PictureTexture {
+    bind: wgpu::BindGroup,
+    _texture: Owned<wgpu::Texture>,
+}
+
+/// The pictures drawn on the CPU on the GPU, by the address of their pixels, which the renderer
+/// shares from scene to scene while the layers in them look as they did (`render::frame_cache`):
+/// a scene draws those from the textures an earlier one uploaded, as [`LayerBuffers`] keeps the
+/// layers' meshes. Both are held weakly: a texture lives as long as a scene that draws it, so these
+/// cost no GPU memory beside the scenes on screen.
+#[derive(Default)]
+struct PictureTextures {
+    by_picture: std::collections::HashMap<usize, (std::sync::Weak<rustgis_engine::render::Pixmap>, std::sync::Weak<PictureTexture>)>,
+}
+
+impl PictureTextures {
+    /// The texture of `pixmap`, uploaded the first time a scene draws it.
+    fn texture(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        r: &GpuMapRenderer,
+        pixmap: &Arc<rustgis_engine::render::Pixmap>,
+    ) -> Arc<PictureTexture> {
+        let key = Arc::as_ptr(pixmap) as usize;
+        // While the picture lives its address is its own: the weak reference keeps another from it.
+        if let Some((picture, texture)) = self.by_picture.get(&key)
+            && picture.upgrade().is_some_and(|p| Arc::ptr_eq(&p, pixmap))
+            && let Some(texture) = texture.upgrade()
+        {
+            return texture;
+        }
+        let size = wgpu::Extent3d { width: pixmap.width(), height: pixmap.height(), depth_or_array_layers: 1 };
+        let texture = owned_texture(
+            device,
+            &wgpu::TextureDescriptor {
+                label: Some("mapgpu_image"),
+                size,
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                // Linear, like every egui texture: values pass through unconverted.
+                format: wgpu::TextureFormat::Rgba8Unorm,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            },
+        );
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo { texture: &texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+            pixmap.data(),
+            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(pixmap.width() * 4), rows_per_image: Some(pixmap.height()) },
+            size,
+        );
+        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("mapgpu_image_bind"),
+            layout: &r.image_layout,
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&r.sampler) },
+            ],
+        });
+        let texture = Arc::new(PictureTexture { bind, _texture: texture });
+        self.by_picture.insert(key, (Arc::downgrade(pixmap), Arc::downgrade(&texture)));
+        texture
+    }
+
+    /// Ends a scene: forgets the textures no scene draws any longer, and those of pictures gone.
+    fn end_scene(&mut self) {
+        self.by_picture.retain(|_, (picture, texture)| picture.strong_count() > 0 && texture.strong_count() > 0);
     }
 }
 
@@ -961,17 +1114,19 @@ fn record_scene(r: &GpuMapRenderer, draws: &[SceneDraw], clear: [f32; 4], tgt: &
 
 /// One uploaded draw command.
 pub(crate) enum SceneDraw {
+    /// A layer's mesh, its buffers shared with the scenes before it while it looks the same.
     Mesh {
-        vertices: Owned<wgpu::Buffer>,
-        indices: Owned<wgpu::Buffer>,
+        vertices: Arc<Owned<wgpu::Buffer>>,
+        indices: Arc<Owned<wgpu::Buffer>>,
         index_count: u32,
         uniforms: Owned<wgpu::Buffer>,
         bind: wgpu::BindGroup,
         origin: [f64; 2],
         clip: CmdClip,
     },
+    /// A layer's markers, shared as a mesh's buffers are.
     Points {
-        instances: Owned<wgpu::Buffer>,
+        instances: Arc<Owned<wgpu::Buffer>>,
         count: u32,
         uniforms: Owned<wgpu::Buffer>,
         bind: wgpu::BindGroup,
@@ -991,23 +1146,13 @@ pub(crate) enum SceneDraw {
     },
     /// A vector tile layer's meshes: what shows of them depends on the camera's zoom (its bits,
     /// rewritten by `set_camera`).
-    TileMeshes {
-        tiles: Vec<MeshTileDraw>,
-        zoom: std::sync::atomic::AtomicU32,
-    },
+    TileMeshes { tiles: Vec<MeshTileDraw>, zoom: std::sync::atomic::AtomicU32 },
     /// A tilted view's water, fog and sky, under everything.
-    Backdrop {
-        uniforms: Owned<wgpu::Buffer>,
-        bind: wgpu::BindGroup,
-    },
-    Image {
-        bind: wgpu::BindGroup,
-        _texture: Owned<wgpu::Texture>,
-    },
+    Backdrop { uniforms: Owned<wgpu::Buffer>, bind: wgpu::BindGroup },
+    /// A picture drawn on the CPU, shared with the scenes that draw it, and its opacity.
+    Image { texture: Arc<PictureTexture>, opacity: wgpu::BindGroup, _opacity: Owned<wgpu::Buffer> },
     /// The `n`th live raster tile layer of the scene, placed for each frame shown (#635).
-    LiveTiles {
-        n: usize,
-    },
+    LiveTiles { n: usize },
     /// A raster tile layer: its tiles' corners in one buffer, six per tile, and each tile's
     /// texture (from [`TileTextures`]) with the first of its corners.
     Tiles {
@@ -1035,6 +1180,8 @@ pub(crate) struct SceneBuffers {
     pub has_tiles: bool,
     /// A turned or tilted scene: the camera it was drawn for, its sky and fog.
     pub tilt: Option<SceneTilt>,
+    /// The camera its uniforms are written for (see [`SceneBuffers::set_camera`]).
+    pub shown: std::sync::Mutex<Camera>,
     /// Its live raster tile layers, in order, placed for each frame shown ([`LiveFrame`]).
     pub live: Vec<(String, rustgis_engine::render::rustgis_tiles::Spec, f32)>,
     /// The archive revision of the scene that owns the live layers' attribution.
@@ -1113,22 +1260,39 @@ impl SceneBuffers {
     /// vertices; else it is drawn again.
     pub(crate) fn fits(&self, cam: &Camera) -> bool {
         let pitch = rustgis_engine::map::camera::normalize_pitch(cam.pitch);
-        let precise = gpu_scene::f32_holds(self.reach, cam.res / f64::from(self.ppp.max(0.1)));
-        precise
+        self.follows(cam)
             && match &self.tilt {
-                None => cam.bearing == 0.0 && pitch == 0.0,
+                None => true,
                 Some(t) => {
                     let turn = rustgis_engine::map::camera::normalize_bearing(cam.bearing - t.camera.bearing).abs();
                     let zoom = cam.res / t.camera.res.max(1e-12);
-                    (t.camera.bearing != 0.0) == (cam.bearing != 0.0)
-                    && (t.camera.pitch != 0.0) == (pitch != 0.0)
-                    && turn < 0.5
+                    turn < 0.5
                     && (pitch - t.camera.pitch).abs() < 0.5
                     && (0.7..1.4).contains(&zoom)
                     // Panned less than a quarter of the view: the ground it drew still covers it.
                     && (cam.center.x - t.camera.center.x).hypot(cam.center.y - t.camera.center.y)
                         < 0.25 * self.size[0].min(self.size[1]) * t.camera.res
                 }
+            }
+    }
+
+    /// The camera the scene is drawn for now: the one it was made for, or the last one
+    /// [`SceneBuffers::set_camera`] wrote.
+    pub(crate) fn camera(&self) -> Camera {
+        *self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Whether the scene can be drawn for `cam` at all, though past [`SceneBuffers::fits`] it shows
+    /// less than a new one would (ground it left out, detail for another zoom): a turned or
+    /// tilted scene for a view still turned or tilted, a north-up flat one for a north-up flat
+    /// view, with its vertices still precise in f32. It stands in while the scene for `cam` is
+    /// made off the UI thread.
+    pub(crate) fn follows(&self, cam: &Camera) -> bool {
+        let pitch = rustgis_engine::map::camera::normalize_pitch(cam.pitch);
+        gpu_scene::f32_holds(self.reach, cam.res / f64::from(self.ppp.max(0.1)))
+            && match &self.tilt {
+                None => cam.bearing == 0.0 && pitch == 0.0,
+                Some(t) => (t.camera.bearing != 0.0) == (cam.bearing != 0.0) && (t.camera.pitch != 0.0) == (pitch != 0.0),
             }
     }
 }
@@ -1153,7 +1317,7 @@ fn cmd_fits(limits: &wgpu::Limits, cmd: &DrawCmd) -> bool {
                 && fits(std::mem::size_of_val(indices.as_slice()))
                 && u32::try_from(indices.len()).is_ok()
         }
-        DrawCmd::Image { pixmap } => {
+        DrawCmd::Image { pixmap, .. } => {
             let (w, h) = (pixmap.width(), pixmap.height());
             (1..=max_dim).contains(&w) && (1..=max_dim).contains(&h) && pixmap.data().len() as u64 == w as u64 * h as u64 * 4
         }
@@ -1194,6 +1358,8 @@ impl SceneBuffers {
         let tilt = scene.tilt.as_ref();
         let mut tile_textures = r.tile_textures.lock().unwrap_or_else(|e| e.into_inner());
         let mut tile_meshes = r.tile_meshes.lock().unwrap_or_else(|e| e.into_inner());
+        let mut layer_buffers = r.layer_buffers.lock().unwrap_or_else(|e| e.into_inner());
+        let mut pictures = r.pictures.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(t) = tilt.filter(|t| t.camera.pitch != 0.0) {
             let u = BackdropUniforms::new(&camera, size, ppp, scene.clear, t);
             let uniforms = owned_buffer(
@@ -1236,22 +1402,8 @@ impl SceneBuffers {
                         ],
                     });
                     draws.push(SceneDraw::Mesh {
-                        vertices: owned_buffer(
-                            device,
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("mapgpu_mesh_vertices"),
-                                contents: bytemuck::cast_slice(vertices),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        ),
-                        indices: owned_buffer(
-                            device,
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("mapgpu_mesh_indices"),
-                                contents: bytemuck::cast_slice(indices),
-                                usage: wgpu::BufferUsages::INDEX,
-                            },
-                        ),
+                        vertices: layer_buffers.buffer(device, vertices, "mapgpu_mesh_vertices", wgpu::BufferUsages::VERTEX),
+                        indices: layer_buffers.buffer(device, indices, "mapgpu_mesh_indices", wgpu::BufferUsages::INDEX),
                         index_count: indices.len() as u32,
                         uniforms,
                         bind,
@@ -1281,14 +1433,7 @@ impl SceneBuffers {
                         ],
                     });
                     draws.push(SceneDraw::Points {
-                        instances: owned_buffer(
-                            device,
-                            &wgpu::util::BufferInitDescriptor {
-                                label: Some("mapgpu_point_instances"),
-                                contents: bytemuck::cast_slice(instances),
-                                usage: wgpu::BufferUsages::VERTEX,
-                            },
-                        ),
+                        instances: layer_buffers.buffer(device, instances, "mapgpu_point_instances", wgpu::BufferUsages::VERTEX),
                         count: instances.len() as u32,
                         uniforms,
                         bind,
@@ -1342,46 +1487,27 @@ impl SceneBuffers {
                         shadows: *shadows,
                     });
                 }
-                DrawCmd::Image { pixmap } => {
-                    let texture = owned_texture(
+                DrawCmd::Image { pixmap, opacity } => {
+                    let texture = pictures.texture(device, queue, r, pixmap);
+                    let uniform = owned_buffer(
                         device,
-                        &wgpu::TextureDescriptor {
-                            label: Some("mapgpu_image"),
-                            size: wgpu::Extent3d { width: pixmap.width(), height: pixmap.height(), depth_or_array_layers: 1 },
-                            mip_level_count: 1,
-                            sample_count: 1,
-                            dimension: wgpu::TextureDimension::D2,
-                            // Linear, like every egui texture: values pass through unconverted.
-                            format: wgpu::TextureFormat::Rgba8Unorm,
-                            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                            view_formats: &[],
+                        &wgpu::util::BufferInitDescriptor {
+                            label: Some("mapgpu_image_opacity"),
+                            contents: bytemuck::cast_slice(&[
+                                if opacity.is_finite() { opacity.clamp(0.0, 1.0) } else { 1.0 },
+                                0.0,
+                                0.0,
+                                0.0,
+                            ]),
+                            usage: wgpu::BufferUsages::UNIFORM,
                         },
                     );
-                    queue.write_texture(
-                        wgpu::TexelCopyTextureInfo {
-                            texture: &texture,
-                            mip_level: 0,
-                            origin: wgpu::Origin3d::ZERO,
-                            aspect: wgpu::TextureAspect::All,
-                        },
-                        pixmap.data(),
-                        wgpu::TexelCopyBufferLayout {
-                            offset: 0,
-                            bytes_per_row: Some(pixmap.width() * 4),
-                            rows_per_image: Some(pixmap.height()),
-                        },
-                        wgpu::Extent3d { width: pixmap.width(), height: pixmap.height(), depth_or_array_layers: 1 },
-                    );
-                    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
                     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: Some("mapgpu_image_bind"),
-                        layout: &r.image_layout,
-                        entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&view) },
-                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&r.sampler) },
-                        ],
+                        label: Some("mapgpu_image_opacity"),
+                        layout: &r.opacity_layout,
+                        entries: &[wgpu::BindGroupEntry { binding: 1, resource: uniform.as_entire_binding() }],
                     });
-                    draws.push(SceneDraw::Image { bind, _texture: texture });
+                    draws.push(SceneDraw::Image { texture, opacity: bind, _opacity: uniform });
                     has_images = true;
                 }
                 DrawCmd::LiveTiles { name, spec, opacity, archive_revision } => {
@@ -1466,6 +1592,8 @@ impl SceneBuffers {
         }
         tile_textures.end_scene();
         tile_meshes.end_scene();
+        layer_buffers.end_scene();
+        pictures.end_scene();
         let tiles_live =
             !live.is_empty() && !has_images && !has_tiles && !scene.cmds.iter().any(|c| matches!(c, DrawCmd::TileMeshes { .. }));
         let reach = gpu_scene::reach(&scene.cmds);
@@ -1477,6 +1605,7 @@ impl SceneBuffers {
             has_images,
             has_tiles,
             tilt: scene.tilt,
+            shown: std::sync::Mutex::new(camera),
             live,
             tiles_live,
             reach,
@@ -1489,6 +1618,7 @@ impl SceneBuffers {
     /// the queue, so `&self` suffices. Callers check `has_images` first: image runs don't
     /// re-project and need a full re-render.
     pub(crate) fn set_camera(&self, queue: &wgpu::Queue, cam: &Camera) {
+        *self.shown.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = *cam;
         for d in &self.draws {
             let (uniforms, origin, clip) = match d {
                 SceneDraw::Mesh { uniforms, origin, clip, .. }
@@ -1562,9 +1692,10 @@ fn paint_draws(renderer: &GpuMapRenderer, draws: &[SceneDraw], rp: &mut wgpu::Re
                 rp.set_bind_group(0, bind, &[]);
                 rp.draw(0..6, 0..1);
             }
-            SceneDraw::Image { bind, .. } => {
+            SceneDraw::Image { texture, opacity, .. } => {
                 rp.set_pipeline(&renderer.image_pipeline);
-                rp.set_bind_group(0, bind, &[]);
+                rp.set_bind_group(0, &texture.bind, &[]);
+                rp.set_bind_group(1, opacity, &[]);
                 rp.draw(0..6, 0..1);
             }
             SceneDraw::TileMeshes { tiles, zoom, .. } => {
@@ -1760,6 +1891,7 @@ mod tests {
             has_images: false,
             has_tiles: false,
             tilt: None,
+            shown: std::sync::Mutex::new(Camera::world()),
             live: vec![(layer.name.clone(), render::tile_spec(&layer), 1.0)],
             tiles_live: true,
             reach: 0.0,
@@ -1775,20 +1907,29 @@ mod tests {
         let limits = wgpu::Limits { max_buffer_size: 1024, max_texture_dimension_2d: 2048, ..Default::default() };
         let mesh = |nv: usize, ni: usize| DrawCmd::Mesh {
             origin: [0.0, 0.0],
-            vertices: vec![MeshVertex { position: [0.0, 0.0], normal: [0.0, 0.0], color: [0.0; 4], stroke_px: 0.0, _pad: 0.0 }; nv],
-            indices: vec![0u32; ni],
+            vertices: Arc::new(vec![
+                MeshVertex { position: [0.0, 0.0], normal: [0.0, 0.0], color: [0.0; 4], stroke_px: 0.0, _pad: 0.0 };
+                nv
+            ]),
+            indices: Arc::new(vec![0u32; ni]),
         };
         assert!(cmd_fits(&limits, &mesh(4, 6)), "small mesh fits");
         assert!(!cmd_fits(&limits, &mesh(100, 6)), "a vertex buffer over max_buffer_size declines");
         assert!(!cmd_fits(&limits, &mesh(4, 300)), "an index buffer over max_buffer_size declines");
         assert!(
-            !cmd_fits(&limits, &DrawCmd::Image { pixmap: rustgis_engine::render::Pixmap::new(2049, 2).expect("pixmap") }),
+            !cmd_fits(
+                &limits,
+                &DrawCmd::Image { pixmap: Arc::new(rustgis_engine::render::Pixmap::new(2049, 2).expect("pixmap")), opacity: 1.0 }
+            ),
             "an image over max_texture_dimension_2d declines"
         );
         // 0x0 and size-mismatched images are now unconstructible (Pixmap always holds w*h*4):
         // the type does the work.
         assert!(
-            cmd_fits(&limits, &DrawCmd::Image { pixmap: rustgis_engine::render::Pixmap::new(2, 2).expect("pixmap") }),
+            cmd_fits(
+                &limits,
+                &DrawCmd::Image { pixmap: Arc::new(rustgis_engine::render::Pixmap::new(2, 2).expect("pixmap")), opacity: 1.0 }
+            ),
             "a valid 2x2 image fits"
         );
     }
@@ -1840,12 +1981,21 @@ mod tests {
         let scene = GpuScene {
             clear: [0.0, 0.0, 0.0, 1.0],
             cmds: vec![
-                DrawCmd::Mesh { origin: [0.0, 0.0], vertices: vec![v(0.0, 0.0), v(100.0, 0.0), v(0.0, 100.0)], indices: vec![0, 1, 2] },
+                DrawCmd::Mesh {
+                    origin: [0.0, 0.0],
+                    vertices: Arc::new(vec![v(0.0, 0.0), v(100.0, 0.0), v(0.0, 100.0)]),
+                    indices: Arc::new(vec![0, 1, 2]),
+                },
                 DrawCmd::Points {
                     origin: [0.0, 0.0],
-                    instances: vec![PointInstance { position: [10.0, 10.0], color: [0.0, 1.0, 0.0, 1.0], radius_px: 4.0, shape: 0 }],
+                    instances: Arc::new(vec![PointInstance {
+                        position: [10.0, 10.0],
+                        color: [0.0, 1.0, 0.0, 1.0],
+                        radius_px: 4.0,
+                        shape: 0,
+                    }]),
                 },
-                DrawCmd::Image { pixmap: rustgis_engine::render::Pixmap::new(1, 1).expect("pixmap") },
+                DrawCmd::Image { pixmap: Arc::new(rustgis_engine::render::Pixmap::new(1, 1).expect("pixmap")), opacity: 1.0 },
             ],
             labels: vec![],
             unplaced: vec![],
@@ -1861,6 +2011,64 @@ mod tests {
         let sb =
             SceneBuffers::from_scene(&rs.device, &rs.queue, &r, &scene, Camera::world(), [400.0, 300.0], 1.0).expect("fits the device");
         assert_eq!(sb.draws.len(), 3);
+        // The next scene sharing the layers' data and pictures (layers that look as they did)
+        // draws from the buffers and textures this one uploaded; new data, as a restyled layer's,
+        // is uploaded again.
+        let buffers = |sb: &SceneBuffers| -> Vec<usize> {
+            sb.draws
+                .iter()
+                .flat_map(|d| match d {
+                    SceneDraw::Mesh { vertices, indices, .. } => vec![Arc::as_ptr(vertices) as usize, Arc::as_ptr(indices) as usize],
+                    SceneDraw::Points { instances, .. } => vec![Arc::as_ptr(instances) as usize],
+                    SceneDraw::Image { texture, .. } => vec![Arc::as_ptr(texture) as usize],
+                    _ => vec![],
+                })
+                .collect()
+        };
+        let again = GpuScene { cmds: scene.cmds.iter().filter_map(share).collect(), ..scene };
+        let next = SceneBuffers::from_scene(&rs.device, &rs.queue, &r, &again, Camera::world(), [400.0, 300.0], 1.0).expect("fits");
+        assert_eq!(buffers(&next), buffers(&sb), "shared");
+        let copied = GpuScene {
+            cmds: again
+                .cmds
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCmd::Mesh { origin, vertices, indices } => {
+                        Some(DrawCmd::Mesh { origin: *origin, vertices: Arc::new(vertices.to_vec()), indices: Arc::new(indices.to_vec()) })
+                    }
+                    _ => share(c),
+                })
+                .collect(),
+            ..again
+        };
+        let last = SceneBuffers::from_scene(&rs.device, &rs.queue, &r, &copied, Camera::world(), [400.0, 300.0], 1.0).expect("fits");
+        let (was, now) = (buffers(&next), buffers(&last));
+        assert!(was[0] != now[0] && was[1] != now[1] && was[2] == now[2] && was[3] == now[3], "only the mesh is uploaded again");
+        // A picture placed at another opacity is the same texture; a new picture is uploaded.
+        let placed = GpuScene {
+            cmds: copied
+                .cmds
+                .iter()
+                .filter_map(|c| match c {
+                    DrawCmd::Image { pixmap, .. } => Some(DrawCmd::Image { pixmap: pixmap.clone(), opacity: 0.4 }),
+                    _ => None,
+                })
+                .chain(std::iter::once(DrawCmd::Image {
+                    pixmap: Arc::new(rustgis_engine::render::Pixmap::new(1, 1).expect("pixmap")),
+                    opacity: 1.0,
+                }))
+                .collect(),
+            ..copied
+        };
+        let again = SceneBuffers::from_scene(&rs.device, &rs.queue, &r, &placed, Camera::world(), [400.0, 300.0], 1.0).expect("fits");
+        let now = buffers(&again);
+        assert_eq!(now.first(), was.get(3), "the same texture at another opacity");
+        assert_ne!(now.get(1), was.get(3), "a new picture uploaded");
+    }
+
+    /// A command sharing `cmd`'s data.
+    fn share(cmd: &DrawCmd) -> Option<DrawCmd> {
+        cmd.share()
     }
 
     // ---- CPU↔GPU pixel parity: render the same map through both backends and compare ----
@@ -2397,25 +2605,39 @@ mod tests {
                 return;
             }
             let mut png = std::io::Cursor::new(Vec::new());
-            let tile = image::RgbaImage::from_fn(256, 256, |x, y| image::Rgba([40 + (x / 2) as u8, 60 + (y / 2) as u8, 140, 255]));
+            // Blocks of 8 pixels, light and dark: drawn larger, sharp edges or blended ones.
+            let blocks = url.contains("/blocks/");
+            let tile = image::RgbaImage::from_fn(256, 256, |x, y| match blocks {
+                true if (x / 8 + y / 8) % 2 == 0 => image::Rgba([230, 220, 90, 255]),
+                true => image::Rgba([30, 60, 140, 255]),
+                false => image::Rgba([40 + (x / 2) as u8, 60 + (y / 2) as u8, 140, 255]),
+            });
             match tile.write_to(&mut png, image::ImageFormat::Png) {
                 Ok(()) => done(Ok(png.into_inner())),
                 Err(e) => done(Err(e.to_string())),
             }
         });
-        let build = |opacity: f32| {
+        // `nearest`: tiles of blocks no finer than zoom 2, drawn about three times their size,
+        // each pixel a block (#2804).
+        let build = |opacity: f32, nearest: bool| {
             move || {
                 let mut m = Map::new("Map");
                 m.graticule = false;
-                let mut t = TileLayer::new("Tiles", TileKind::Raster, "https://parity.test/{z}/{x}/{y}.png");
+                let url = if nearest { "https://parity.test/blocks/{z}/{x}/{y}.png" } else { "https://parity.test/{z}/{x}/{y}.png" };
+                let mut t = TileLayer::new("Tiles", TileKind::Raster, url);
                 t.opacity = opacity;
+                if nearest {
+                    t.max_zoom = 2;
+                    t.resampling = rustgis_engine::map::raster::Resampling::Nearest;
+                }
                 m.tiles.push(t);
                 m
             }
         };
         let center = lonlat_to_merc(Coord::new(12.3, 45.6));
         // Zoom 4 at its own size, and zoom 3 drawn between levels.
-        for (res, opacity) in [(9783.939620500, 1.0), (13_000.0, 1.0), (13_000.0, 0.6)] {
+        for (res, opacity, nearest) in [(9783.939620500, 1.0, false), (13_000.0, 1.0, false), (13_000.0, 0.6, false), (13_000.0, 1.0, true)]
+        {
             let view = View {
                 width: 320.0,
                 height: 200.0,
@@ -2423,8 +2645,13 @@ mod tests {
                 camera: Camera { center, res, bearing: 0.0, pitch: 0.0 },
                 sky: false,
             };
-            let mut m = build(opacity)();
-            render::render_png(&mut m, &view).expect("tiles fetched");
+            let mut m = build(opacity, nearest)();
+            let png = render::render_png(&mut m, &view).expect("tiles fetched");
+            if nearest {
+                let mut smooth = build(opacity, nearest)();
+                smooth.tiles[0].resampling = rustgis_engine::map::raster::Resampling::Bilinear;
+                assert_ne!(png, render::render_png(&mut smooth, &view).expect("tiles fetched"), "nearest draws as bilinear");
+            }
             let Some(RenderOutput::Gpu(scene)) = render::render_backend(&mut m, &view, Backend::Gpu) else { panic!("gpu scene") };
             assert!(!scene.cmds.iter().any(|c| matches!(c, DrawCmd::Image { .. })), "no picture of the view at {res}");
             assert!(scene.cmds.iter().any(|c| matches!(c, DrawCmd::Tiles { .. })), "tiles at {res}");
@@ -2432,7 +2659,7 @@ mod tests {
             let Some(RenderOutput::Gpu(scene)) = render::render_backend(&mut m, &view, Backend::GpuLive) else { panic!("gpu scene") };
             assert!(scene.cmds.iter().any(|c| matches!(c, DrawCmd::LiveTiles { .. })), "live tiles at {res}");
             assert!(!scene.cmds.iter().any(|c| matches!(c, DrawCmd::Tiles { .. } | DrawCmd::Image { .. })), "only live tiles at {res}");
-            assert_parity(&format!("raster tiles {res} {opacity}"), build(opacity), &view);
+            assert_parity(&format!("raster tiles {res} {opacity} {nearest}"), build(opacity, nearest), &view);
         }
     }
 
@@ -2466,7 +2693,8 @@ mod tests {
         let mut pm = rustgis_engine::render::Pixmap::new(4, 4).expect("pixmap");
         pm.data_mut().chunks_mut(4).for_each(|p| p.copy_from_slice(&[200, 30, 30, 255]));
         let picture = Arc::new(Payload::Image(pm));
-        let quad = TileQuad { picture: picture.clone(), rect: [0.0, 0.0, 100.0, 100.0], uv: [0.0, 0.0, 1.0, 1.0], opacity: 1.0 };
+        let quad =
+            TileQuad { picture: picture.clone(), rect: [0.0, 0.0, 100.0, 100.0], uv: [0.0, 0.0, 1.0, 1.0], opacity: 1.0, nearest: false };
         let scene = |q: &TileQuad| GpuScene {
             clear: [0.0; 4],
             cmds: vec![DrawCmd::Tiles { origin: [0.0, 0.0], tiles: vec![q.clone()] }],
@@ -2485,13 +2713,21 @@ mod tests {
         let first = upload(&scene(&quad)).expect("fits");
         assert!(first.has_tiles && !first.has_images, "tiles move with the camera");
         let _second = upload(&scene(&quad)).expect("fits");
+        // Drawn nearest by another layer (#2804): the same texture, sampled another way.
+        let _nearest = upload(&scene(&TileQuad { nearest: true, ..quad.clone() })).expect("fits");
         let textures = r.tile_textures.lock().expect("textures");
-        assert_eq!(textures.by_picture.len(), 1, "one texture for the picture");
+        assert_eq!(textures.by_picture.len(), 1, "one texture for the picture, however it's sampled");
         drop(textures);
         // Once the tile cache lets the picture go, so does the GPU.
         drop((quad, picture, first, _second));
         let other = rustgis_engine::render::Pixmap::new(4, 4).expect("pixmap");
-        let q = TileQuad { picture: Arc::new(Payload::Image(other)), rect: [0.0, 0.0, 1.0, 1.0], uv: [0.0, 0.0, 1.0, 1.0], opacity: 1.0 };
+        let q = TileQuad {
+            picture: Arc::new(Payload::Image(other)),
+            rect: [0.0, 0.0, 1.0, 1.0],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            opacity: 1.0,
+            nearest: false,
+        };
         let _third = upload(&scene(&q)).expect("fits");
         assert_eq!(r.tile_textures.lock().expect("textures").by_picture.len(), 1);
     }
@@ -2508,7 +2744,13 @@ mod tests {
             pm.data_mut().chunks_mut(4).for_each(|p| p.copy_from_slice(&[c, 30, 30, 255]));
             Arc::new(Payload::Image(pm))
         };
-        let quad = |p: &Arc<Payload>| TileQuad { picture: p.clone(), rect: [0.0, 0.0, 10.0, 10.0], uv: [0.0, 0.0, 1.0, 1.0], opacity: 1.0 };
+        let quad = |p: &Arc<Payload>| TileQuad {
+            picture: p.clone(),
+            rect: [0.0, 0.0, 10.0, 10.0],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            opacity: 1.0,
+            nearest: false,
+        };
         // Two chunks of 64 pictures of 256 pixels.
         let chunk = 64 * 256 * 256 * 4;
         let mut live =
@@ -2562,7 +2804,13 @@ mod tests {
             pm.data_mut().chunks_mut(4).for_each(|p| p.copy_from_slice(&[c, 30, 30, 255]));
             Arc::new(Payload::Image(pm))
         };
-        let quad = |p: &Arc<Payload>| TileQuad { picture: p.clone(), rect: [0.0, 0.0, 10.0, 10.0], uv: [0.0, 0.0, 1.0, 1.0], opacity: 1.0 };
+        let quad = |p: &Arc<Payload>| TileQuad {
+            picture: p.clone(),
+            rect: [0.0, 0.0, 10.0, 10.0],
+            uv: [0.0, 0.0, 1.0, 1.0],
+            opacity: 1.0,
+            nearest: false,
+        };
         let chunk = 16u64 << 20;
         let mut live =
             crate::tilelayer::LiveTiles::new(&rs.device, wgpu::TextureFormat::Rgba8Unorm, 4, DEPTH_FORMAT).with_budget(2 * chunk);

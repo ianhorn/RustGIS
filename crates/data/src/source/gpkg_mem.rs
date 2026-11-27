@@ -3,7 +3,7 @@
 //! SQLite (`gpkg`), which uses the R-tree index; here a read scans the table, testing the envelope
 //! in each geometry's header before decoding it.
 
-use super::{Batch, FeatureSource, Reproject, Request, Sampler, Shared, SourceInfo, clamp_limit, in_request};
+use super::{Batch, FeatureSource, Reproject, Request, Sampler, Shared, SourceInfo, clamp_limit};
 use crate::sqlite::{Db, Table, Val};
 use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, wkb};
 use rustgis_geom::Extent;
@@ -158,7 +158,7 @@ impl GpkgMemSource {
                 .ok_or_else(|| DataError::Format(format!("no feature table '{l}' (tables: {})", tables.join(", "))))?,
             None => tables.first().cloned().ok_or_else(|| DataError::Format("the GeoPackage has no feature tables".into()))?,
         };
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         if layer.is_none() && tables.len() > 1 {
             notes.push(format!("the first of {} feature tables ({})", tables.len(), tables.join(", ")));
         }
@@ -245,7 +245,7 @@ impl GpkgMemSource {
             match src.peek_zm() {
                 Some(true) => src.info.drop_zm(None),
                 Some(false) => {}
-                None => src.info.notes.push("couldn't tell whether it has Z or M values, which RustGIS doesn't keep".into()),
+                None => src.info.notes.push("couldn't tell whether it has Z or M values, which RustGIS doesn't keep"),
             }
         }
         Ok(src)
@@ -335,11 +335,20 @@ impl FeatureSource for GpkgMemSource {
         &self.info
     }
 
+    fn reads_own_box(&self) -> bool {
+        true
+    }
+
+    /// Its own system, in which it gives its features as the file holds them.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.reproject.crs()
+    }
+
     /// Keeps rows without geometry in whole reads; they have no location to match an extent.
     /// Counts scanned records and checks Cancel between them.
     fn read(&self, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = self.reproject.request_box(req);
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
             return Err(super::unbounded_count());
@@ -389,13 +398,14 @@ impl FeatureSource for GpkgMemSource {
                 if known && !sample.wants() {
                     return ControlFlow::Continue(());
                 }
-                let Some(geometry) = wkb::decode(body).and_then(|g| self.reproject.geometry(g)) else {
+                let Some(placed) = wkb::decode(body).and_then(|g| self.reproject.place(g, req)) else {
                     skipped += 1;
                     return ControlFlow::Continue(());
                 };
-                if !in_request(&geometry, req) || (!known && !sample.wants()) {
+                if !placed.inside || (!known && !sample.wants()) {
                     return ControlFlow::Continue(());
                 }
+                let geometry = placed.geometry;
                 // Integer keys, negative ones too, map to distinct ids.
                 sample.keep(Feature {
                     id: rowid as u64,
@@ -408,7 +418,17 @@ impl FeatureSource for GpkgMemSource {
         if let Some(e) = failed {
             return Err(e);
         }
-        Ok(Batch { matched: sample.seen(), complete: sample.complete(), features: sample.items, skipped, unread_dates, rounded_dates })
+        Ok(Batch {
+            matched: sample.seen(),
+            complete: sample.complete(),
+            features: sample.items,
+            skipped,
+            unread_dates,
+            rounded_dates,
+            null_text: Vec::new(),
+            notes: Default::default(),
+            not_utf8: Vec::new(),
+        })
     }
 
     /// The upload is held in memory already, so every table can be visited.
@@ -420,7 +440,7 @@ impl FeatureSource for GpkgMemSource {
     /// and a Cancel check between records.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
-        let req = Request { extent, limit: usize::MAX };
+        let req = Request { extent, limit: usize::MAX, own: None };
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
         // The visitor's error, which stops the scan.
@@ -443,14 +463,14 @@ impl FeatureSource for GpkgMemSource {
                         {
                             return ControlFlow::Continue(());
                         }
-                        let Some(geometry) = wkb::decode(body).and_then(|g| self.reproject.geometry(g)) else {
+                        let Some(placed) = wkb::decode(body).and_then(|g| self.reproject.place(g, &req)) else {
                             out.skipped += 1;
                             return ControlFlow::Continue(());
                         };
-                        if !in_request(&geometry, &req) {
+                        if !placed.inside {
                             return ControlFlow::Continue(());
                         }
-                        Some(geometry)
+                        Some(placed.geometry)
                     }
                     // Without geometry (NULL, or an empty one): kept unless an extent is asked for.
                     Some(Val::Null | Val::Blob(_)) | None if req.extent.is_none() => None,

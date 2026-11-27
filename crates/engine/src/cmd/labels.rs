@@ -3,8 +3,10 @@
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Attr};
 use rustgis_geom::Coord;
-use rustgis_map::symbology::{MAX_LABEL_CLASS_NAME, MAX_LABEL_CLASSES, label_class_name};
-use rustgis_map::{LabelBackground, LabelClass, LabelMatcher, LabelPlacement, Labeling, Layer, Renderer, Rgba, Symbol};
+use rustgis_map::symbology::{LabelFit, MAX_LABEL_CLASS_NAME, MAX_LABEL_CLASSES, label_class_name};
+use rustgis_map::{
+    LabelBackground, LabelClass, LabelGuide, LabelMatcher, LabelPlacement, Labeling, Layer, Renderer, Rgba, SquareSide, SquareTo, Symbol,
+};
 use serde_json::{Value, json};
 
 use super::layer::s_req;
@@ -13,7 +15,7 @@ use crate::notice_text::NoticeText;
 use crate::{CmdResult, CommandSpec as C, Session};
 
 /// A number, or a number written as text (as `f` reads a parameter).
-fn number(v: &Value) -> Option<f64> {
+pub(crate) fn number(v: &Value) -> Option<f64> {
     v.as_f64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|x: &f64| x.is_finite())
 }
 
@@ -141,8 +143,43 @@ pub fn commands() -> Vec<C> {
                 // A position that isn't a placement name is refused, not dropped for the others (null:
                 // none, as for the other keys).
                 None if p.get("position").is_some_and(|v| !v.is_null()) => return Err("position must be a placement name".into()),
-                None if ["offset", "repeat", "lineOffset", "otherPositions", "showAll", "callout"].iter().any(|k| p.get(k).is_some()) => None,
-                None => return Err("position is required (or an offset, a repeat, a lineOffset, otherPositions, showAll or a callout)".into()),
+                None if ["offset", "repeat", "lineOffset", "otherPositions", "showAll", "weight", "clearance", "removeDuplicates", "callout", "to", "side", "fit", "abbreviations", "guide"]
+                    .iter()
+                    .any(|k| p.get(k).is_some()) =>
+                {
+                    None
+                }
+                None => {
+                    return Err("position is required (or an offset, a repeat, a lineOffset, otherPositions, showAll, a weight, a clearance, removeDuplicates, a callout, to, side, fit, abbreviations or a guide)".into());
+                }
+            };
+            // Along a line placed curved, the label fitted to the room the line gives (#2265).
+            let fit = match p.get("fit") {
+                None => None,
+                Some(Value::Null) => Some(LabelFit::Off),
+                Some(v) => Some(serde_json::from_value::<LabelFit>(v.clone()).map_err(|_| "fit must be \"auto\" or \"off\"")?),
+            };
+            // The words it abbreviates when it doesn't fit (null or {}: the built-in list alone).
+            let abbreviations = match p.get("abbreviations") {
+                None => None,
+                Some(Value::Null) => Some(std::collections::BTreeMap::new()),
+                Some(Value::Object(o)) => {
+                    let mut kept = std::collections::BTreeMap::new();
+                    for (word, short) in o {
+                        let short = short.as_str().filter(|s| rustgis_map::symbology::is_abbreviation(word, s)).ok_or_else(|| {
+                            format!(
+                                "abbreviations: {word:?} must be one word abbreviated to a text, each at most {} characters",
+                                rustgis_map::symbology::MAX_ABBREVIATION_CHARS
+                            )
+                        })?;
+                        kept.insert(word.clone(), short.to_owned());
+                    }
+                    if kept.len() > rustgis_map::symbology::MAX_ABBREVIATIONS {
+                        return Err(format!("abbreviations: at most {} words", rustgis_map::symbology::MAX_ABBREVIATIONS));
+                    }
+                    Some(kept)
+                }
+                Some(_) => return Err("abbreviations must be an object of words and their abbreviations, as {\"Creek\": \"Cr.\"}".into()),
             };
             let offset = match p.get("offset") {
                 None => None,
@@ -167,6 +204,33 @@ pub fn commands() -> Vec<C> {
             // A distance outside the range is brought within it, and says so once the layer is known.
             let line_offset_asked = line_offset.filter(|d| !rustgis_map::symbology::LABEL_OFFSET.contains(d));
             let line_offset = line_offset.map(rustgis_map::symbology::label_line_offset);
+            // Where labels compete, the heavier class's wins (#2803): 0 to 10, null back to 5. A
+            // number out of range or a fraction is held to a whole one, and says so.
+            let weight = match p.get("weight") {
+                None => None,
+                Some(Value::Null) => Some(f64::from(rustgis_map::symbology::DEFAULT_LABEL_WEIGHT)),
+                Some(v) => Some(number(v).ok_or("weight must be a number from 0 to 10 (null: 5)")?),
+            };
+            let weight_asked = weight.filter(|w| w.fract() != 0.0 || !rustgis_map::symbology::LABEL_WEIGHT.contains(w));
+            let weight = weight.map(rustgis_map::symbology::label_weight);
+            // The room its labels keep free of other labels (#2828): 0 to 100 points, null back to
+            // 2. A number out of range is held to it, and says so.
+            let clearance = match p.get("clearance") {
+                None => None,
+                Some(Value::Null) => Some(f64::from(rustgis_map::symbology::DEFAULT_LABEL_CLEARANCE)),
+                Some(v) => Some(number(v).ok_or("clearance must be a number of points from 0 to 100 (null: 2)")?),
+            };
+            let clearance_asked = clearance.filter(|c| !rustgis_map::symbology::LABEL_CLEARANCE.contains(c));
+            let clearance = clearance.map(rustgis_map::symbology::label_clearance);
+            // Duplicates removed within so far (#2847): 1 to 2000 points, false or null off. A
+            // number out of range is held to it, and says so.
+            let remove_duplicates = match p.get("removeDuplicates") {
+                None => None,
+                Some(Value::Null | Value::Bool(false)) => Some(None),
+                Some(v) => Some(Some(number(v).ok_or("removeDuplicates must be a number of points from 1 to 2000 (false or null: off)")?)),
+            };
+            let duplicates_asked = remove_duplicates.flatten().filter(|d| !rustgis_map::symbology::LABEL_DUPLICATES.contains(d));
+            let remove_duplicates = remove_duplicates.map(|d| d.map(rustgis_map::symbology::label_duplicates));
             // Every label shown, over the others where they crowd.
             let show_all = match p.get("showAll") {
                 None => None,
@@ -203,12 +267,37 @@ pub fn commands() -> Vec<C> {
                 Some(Value::Bool(on)) => Some(*on),
                 Some(_) => return Err("otherPositions must be true or false".into()),
             };
+            let to = square_to(s, p)?;
+            let side = match p.get("side") {
+                None => None,
+                Some(v) => Some(serde_json::from_value::<SquareSide>(v.clone()).map_err(|_| "side must be \"away\", \"left\" or \"right\"")?),
+            };
+            // `to: null`: this call takes the line away.
+            let clears = matches!(to, Some(None));
             let id = s.layer_id(p)?;
             let (points, lines) = points_and_lines(s.map().layer(id).ok_or("no such layer")?);
+            let guide = label_guide(s, p, s.map().layer(id).ok_or("no such layer")?)?;
+            // A repeat or line offset given where it does nothing (not along a line), kept for
+            // when the class is placed along one, and said (#2639).
+            let mut unused: Vec<&str> = Vec::new();
             let done = with_labels(s, p, |labels| {
                 let c = class_in(labels, p)?;
                 if let Some(pos) = pos {
                     c.placement = pos;
+                }
+                if let Some(to) = to {
+                    // (A new layer keeps the side asked before.)
+                    let kept = c.square_to.as_ref().map(|o| o.side);
+                    c.square_to = to.map(|t| SquareTo { side: kept.unwrap_or(t.side), ..t });
+                }
+                if let Some(side) = side {
+                    c.square_to.as_mut().ok_or("side needs a line to be square to: to {\"layer\"}")?.side = side;
+                }
+                // Asked for, or its line taken away, without a line to be square to: refused. (A
+                // class saved so, its line unread, is labelled as auto; edits that touch neither
+                // are taken.)
+                if c.placement == LabelPlacement::Perpendicular && c.square_to.is_none() && (pos.is_some() || clears) {
+                    return Err("perpendicular needs a line layer to be square to: to {\"layer\", \"within\"?}".into());
                 }
                 if let Some(on) = others {
                     c.other_positions = on;
@@ -225,6 +314,28 @@ pub fn commands() -> Vec<C> {
                 if let Some(a) = show_all {
                     c.show_all = a;
                 }
+                if let Some(w) = weight {
+                    c.weight = w;
+                }
+                if let Some(r) = clearance {
+                    c.clearance = r;
+                }
+                if let Some(d) = remove_duplicates {
+                    c.remove_duplicates = d;
+                }
+                if let Some(f) = fit {
+                    c.fit = f;
+                }
+                if let Some(g) = guide.clone() {
+                    c.guide = g;
+                }
+                // Square to its line or along a guide, not both: the guide would do nothing.
+                if c.guide.is_some() && c.placement == LabelPlacement::Perpendicular && (pos.is_some() || guide.is_some()) {
+                    return Err("a perpendicular label is square to its line, so it takes no guide: guide null, or another position".into());
+                }
+                if let Some(a) = abbreviations.clone() {
+                    c.abbreviations = a;
+                }
                 match callout {
                     Some(Callout::Off) => c.callout = None,
                     Some(Callout::On) => c.callout = Some(c.callout.unwrap_or(rustgis_map::symbology::DEFAULT_CALLOUT)),
@@ -236,10 +347,33 @@ pub fn commands() -> Vec<C> {
                 if others == Some(true) && !tries_other_places(points, lines, c) {
                     return Err("otherPositions is for points, and for lines placed parallel or curved without a repeat".into());
                 }
+                if !(lines && c.placement.along_line()) {
+                    if repeat.is_some_and(|r| r.is_some()) {
+                        unused.push("repeat");
+                    }
+                    if line_offset.is_some_and(|d| d != 0.0) {
+                        unused.push("lineOffset");
+                    }
+                }
                 Ok(())
             })?;
+            if !unused.is_empty() {
+                let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
+                s.notify_text(
+                    NoticeText::format(
+                        "{name}: {keys} kept, but it does nothing here: it places only labels along a line (parallel or curved) where the layer has lines",
+                        [("name", name.into()), ("keys", unused.join(" and ").into())],
+                    ),
+                    false,
+                );
+            }
             if let Some(note) = callout_note {
                 s.notify(note, false);
+            }
+            // A distance outside the range is brought within it, and says so.
+            if let Some(asked) = p.pointer("/to/within").and_then(number).filter(|w| !rustgis_map::symbology::SQUARE_WITHIN.contains(w)) {
+                let kept = rustgis_map::symbology::square_within(asked);
+                s.notify(format!("within {asked} points adjusted to {kept} (a perpendicular label's line is 1 to 500 points away)"), false);
             }
             if let Some(asked) = line_offset_asked {
                 let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
@@ -254,12 +388,48 @@ pub fn commands() -> Vec<C> {
                     false,
                 );
             }
+            if let Some(asked) = weight_asked {
+                let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
+                let kept = rustgis_map::symbology::label_weight(asked);
+                let asked = if asked.abs() < 1e6 { asked.to_string() } else { format!("{asked:e}") };
+                s.notify_text(
+                    NoticeText::format(
+                        "{name}: weight {asked} adjusted to {kept} (a label's weight is a whole number from 0 to 10)",
+                        [("name", name.into()), ("asked", asked.into()), ("kept", kept.to_string().into())],
+                    ),
+                    false,
+                );
+            }
+            if let Some(asked) = clearance_asked {
+                let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
+                let kept = rustgis_map::symbology::label_clearance(asked);
+                let asked = if asked.abs() < 1e6 { asked.to_string() } else { format!("{asked:e}") };
+                s.notify_text(
+                    NoticeText::format(
+                        "{name}: clearance {asked} adjusted to {kept} (a label's clearance is from 0 to 100 points)",
+                        [("name", name.into()), ("asked", asked.into()), ("kept", kept.to_string().into())],
+                    ),
+                    false,
+                );
+            }
+            if let Some(asked) = duplicates_asked {
+                let name = s.map().layer(id).map(|l| l.name.clone()).unwrap_or_default();
+                let kept = rustgis_map::symbology::label_duplicates(asked);
+                let asked = if asked.abs() < 1e6 { asked.to_string() } else { format!("{asked:e}") };
+                s.notify_text(
+                    NoticeText::format(
+                        "{name}: removeDuplicates {asked} adjusted to {kept} (duplicates are removed within 1 to 2000 points)",
+                        [("name", name.into()), ("asked", asked.into()), ("kept", kept.to_string().into())],
+                    ),
+                    false,
+                );
+            }
             Ok(done)
         }).roles(&[]).effects(crate::policy::Effects::NONE)
         .inputs(super::Inputs::single_layer)
         .when(need_feature_layer)
         .params(
-            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends) (required without offset, repeat, lineOffset, otherPositions, showAll or callout), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "lineOffset"?: points (-200 to 200) between a line and its label's nearest edge, above the line as the text reads, negative below it (0 or null: on the line; parallel and curved only), "otherPositions"?: bool (a label whose place is taken tries others: a point's round the point, corners first; a line's along the line, nearest its middle first, placed parallel or curved without a repeat; true is refused for any other line label and on polygons), "showAll"?: bool (every label drawn, over the others where they crowd), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line or with an icon)}"#,
+            r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "position"?: "auto"|"center"|"above"|"below"|"left"|"right"|"aboveRight"|"aboveLeft"|"belowRight"|"belowLeft"|"parallel" (along a line, straight)|"curved" (along a line, following its bends)|"perpendicular" (a point's, square to the nearest line of `to`, starting at the point; none that near: as auto) (required without offset, repeat, lineOffset, otherPositions, showAll, weight, clearance, removeDuplicates, callout, to, side, fit, abbreviations or guide), "to"?: {"layer": a line or polygon layer's name, "within"?: points (1 to 500; 20)} | null, "side"?: "away" (the side of the line the point isn't on; the default)|"left"|"right" (as the line runs), "offset"?: [right, down] points (-200 to 200 each) the label moves from where its position puts it ([0, 0]: none; perpendicular: [out along the normal, down as the text reads]; a label along a line isn't moved), "repeat"?: points (10 to 10000) between a line's labels, spaced out from the one at its middle, at most 32 a line (0 or null: the one at its middle; parallel and curved only), "lineOffset"?: points (-200 to 200) between a line and its label's nearest edge, above the line as the text reads, negative below it (0 or null: on the line; parallel and curved only), "otherPositions"?: bool (a label whose place is taken tries others: a point's round the point, corners first; a line's along the line, nearest its middle first, placed parallel or curved without a repeat; true is refused for any other line label and on polygons), "fit"?: "auto"|"off" (curved along a line: "auto" abbreviates a name that can't follow the line, sets one longer than a third of it on its straightest stretch, and spreads one over labels.style's stretch of a line more than three times its length; "off" or null: as placed), "abbreviations"?: {word: abbreviation} (whole words a fitted label puts short, ignoring case, over the built-in English, Portuguese and Spanish list, as {"Creek": "Cr.", "Córrego": "Cór."}; null or {}: the built-in list alone), "showAll"?: bool (every label drawn, over the others where they crowd), "weight"?: 0 to 10 (where labels compete for a place, the heavier class's wins, whatever its layer's place; equal weights: the layer above, then the class listed first; a fraction rounded; null: 5), "clearance"?: points (0 to 100: the room the class's labels keep free of other labels, two labels keeping both their clearances apart; null: 2), "removeDuplicates"?: points (1 to 2000: a label is left out within this distance of one placed before it for another feature of its layer and class with the same text; a label moved by hand always shows; false or null: off), "callout"?: true|false|points (5 to 500: a label crowded off its spot moves to a free one nearby, a line drawn back to its feature at most this long; true keeps its length, or 40; false, 0 or null: none; not labels along a line or with an icon), "guide"?: {"layer": a line layer's name (as ridge or valley lines; not drawn by this), "field"?: a field both layers have} | null (points and polygons, not perpendicular ones: each label curved along its guide line, the one with the feature's value in field, else the longest in view under the label inside its polygon, or the nearest to its point within the text's width; a feature with none its text fits along is labelled as without a guide; null: none)}"#,
         ),
         // Labels moved by hand (the Move Label tool, as QGIS's): kept by their feature's id.
         C::new("labels.move", "Move Label", "Labeling › Label Placement", |s, p| {
@@ -424,7 +594,7 @@ pub fn commands() -> Vec<C> {
         C::new("labels.by", "Labels by Expression", "View › Windows › Labeling", labels_by).roles(&[]).effects(crate::policy::Effects::NONE)
             .inputs(super::Inputs::single_layer)
         .when(need_feature_layer)
-            .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "text"?: expression|null (each label's text, in place of the class's field; a feature it gives null or blanks for isn't labelled), "size"?: expression|null (the text's size in points, 4 to 72), "color"?: expression|null (the text's colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "angle"?: expression|null (a point's or polygon's label turned by it, in degrees clockwise; labels along lines keep the line's)} (each expression in the language of queries, per feature, @map_scale the map's scale; a key left out keeps its expression, null or "" removes it; where a size, color or angle expression gives null the class's own setting is used)"#),
+            .params(r#"{"layer"?, "class"?: name (none: the Default class, by whatever name it has), "text"?: expression|null (each label's text, in place of the class's field; a feature it gives null or blanks for isn't labelled), "size"?: expression|null (the text's size in points, 4 to 72), "color"?: expression|null (the text's colour: '#RRGGBB', a CSS colour name or 'r,g,b[,a]' as color_rgb gives it), "angle"?: expression|null (a point's or polygon's label turned by it, in degrees clockwise; labels along lines keep the line's)} (each expression in the language of queries, per feature, @map_scale the map's scale, @page_feature_id, @page_name and @page_number the map series page (null off a series page); a key left out keeps its expression, null or "" removes it; where a size, color or angle expression gives null the class's own setting is used)"#),
     ]
 }
 
@@ -432,6 +602,67 @@ pub fn commands() -> Vec<C> {
 /// goes by each feature's geometry.
 fn points_and_lines(l: &Layer) -> (bool, bool) {
     (l.has_geometry(GeometryType::Point), l.has_geometry(GeometryType::Polyline))
+}
+
+/// `labels.placement`'s `to`: the line or polygon layer a perpendicular label is square to, by
+/// name, and how near (points); null clears it, none leaves it.
+fn square_to(s: &Session, p: &Value) -> Result<Option<Option<SquareTo>>, String> {
+    let to = match p.get("to") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(None)),
+        Some(v) => v,
+    };
+    let name = to.get("layer").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty());
+    let name = name.ok_or("to is {\"layer\": a line or polygon layer's name, \"within\"?: points}")?;
+    let layer = s.map().layer_by_name(name).ok_or_else(|| format!("no layer named '{name}'"))?;
+    if !layer.has_geometry(GeometryType::Polyline) && !layer.has_geometry(GeometryType::Polygon) {
+        return Err(format!("'{name}' has no lines or polygons to be square to"));
+    }
+    let within = match to.get("within") {
+        None | Some(Value::Null) => rustgis_map::symbology::square_within(f64::NAN),
+        Some(v) => rustgis_map::symbology::square_within(number(v).filter(|w| *w > 0.0).ok_or("within must be a number of points")?),
+    };
+    Ok(Some(Some(SquareTo { layer: layer.name.clone(), within, side: Default::default() })))
+}
+
+/// `labels.placement`'s `guide` (#2262): the line layer a point's or polygon's label is curved
+/// along, by name, and the field both layers have that matches a feature to its line; null clears
+/// it, none leaves it.
+fn label_guide(s: &Session, p: &Value, labelled: &Layer) -> Result<Option<Option<LabelGuide>>, String> {
+    let g = match p.get("guide") {
+        None => return Ok(None),
+        Some(Value::Null) => return Ok(Some(None)),
+        Some(v) => v,
+    };
+    if !labelled.has_geometry(GeometryType::Point) && !labelled.has_geometry(GeometryType::Polygon) {
+        return Err("guide is for point and polygon labels (a line's label follows its own line: position \"curved\")".into());
+    }
+    let name = g.get("layer").and_then(Value::as_str).map(str::trim).filter(|n| !n.is_empty());
+    let name = name.ok_or("guide is {\"layer\": a line layer's name, \"field\"?: a field both layers have}")?;
+    let layer = s.map().layer_by_name(name).ok_or_else(|| format!("no layer named '{name}'"))?;
+    if !layer.has_geometry(GeometryType::Polyline) {
+        return Err(format!("'{name}' has no lines to guide labels along"));
+    }
+    // Only a window of it at hand, a view's worth: labels couldn't follow the lines out of it.
+    if layer.source.is_some() {
+        return Err(format!(
+            "'{name}' is read in place from its file, a view at a time: Load All Features (layer.loadAll) before guiding labels along it"
+        ));
+    }
+    let field = match g.get("field") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(f)) if f.trim().is_empty() => None,
+        Some(Value::String(f)) => {
+            for l in [layer, labelled] {
+                if l.dataset.field_index(f).is_none() {
+                    return Err(format!("guide field '{f}' isn't a field of '{}'", l.name));
+                }
+            }
+            Some(f.clone())
+        }
+        Some(_) => return Err("guide's field is a field's name, or null for none".into()),
+    };
+    Ok(Some(Some(LabelGuide { layer: layer.name.clone(), field })))
 }
 
 /// Whether a class on a layer holding these has other places to try when its label's own is taken:
@@ -548,12 +779,18 @@ pub(crate) fn lock_holds(l: &Layer, b: &Labeling) -> bool {
 /// class's (#1011, #1187), so another position, or trying the others turned on or off, locks the
 /// labels again; with no class trying them a new position keeps the lock, as before. The flag only
 /// counts where it has an effect: kept on a line's class at a position off the line, or with a
-/// repeat, it does nothing ([`tries_other_places`]).
+/// repeat, it does nothing ([`tries_other_places`]). Along a line, off it, each place is tried on
+/// both sides, the label's own first: its number says which, so the other side, or a distance
+/// where there was none, locks the labels again too; another distance on the same side doesn't.
 fn same_places(l: &Layer, b: &Labeling) -> bool {
     let (points, lines) = points_and_lines(l);
     let classes = |labels: &Labeling| {
         let tries = |c: &LabelClass| c.other_positions && tries_other_places(points, lines, c);
-        labels.classes.iter().chain([&labels.default]).map(|c| (c.placement, tries(c), c.repeat.is_some())).collect::<Vec<_>>()
+        // -1 below, 1 above, 0 on the line (-0.0 too).
+        let side = |c: &LabelClass| {
+            if lines && c.placement.along_line() { i8::from(c.line_offset > 0.0) - i8::from(c.line_offset < 0.0) } else { 0 }
+        };
+        labels.classes.iter().chain([&labels.default]).map(|c| (c.placement, tries(c), c.repeat.is_some(), side(c))).collect::<Vec<_>>()
     };
     classes(&l.labels).into_iter().zip(classes(b)).all(|(x, y)| x == y || !(x.1 || y.1))
 }
@@ -723,8 +960,10 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
     }
     // Its features, all of them: a copy of a layer read in place holds those of its whole source.
     let whole = if s.map().layer(id).ok_or("no such layer")?.is_streamed() {
-        let (ds, unread) = super::whole::take_or_read(s, id)?;
+        let (mut ds, unread) = super::whole::take_or_read(s, id)?;
         let mut copy = s.map().layer(id).ok_or("no such layer")?.clone();
+        // Shown on the map as the live layer is, for moved labels' places (Dataset::shown_in).
+        ds.shown_in = copy.dataset.shown_in;
         copy.dataset = ds;
         copy.source = None;
         Some((copy, unread))
@@ -776,36 +1015,105 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         GeometryType::Point,
         out_fields,
     );
+    // Made in the labelled layer's own coordinates when it holds them in a projected system, as
+    // the analysis tools work in it (rustgis_analysis::works_in): a label point found there, as a
+    // map in that system draws it (#2032 C2e-5). Else made in longitude/latitude, then held as the
+    // labelled layer is (Dataset::hold_as).
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let own = rustgis_analysis::works_in(system.0);
     let mut moved = Vec::new();
-    for (row, ft) in l.dataset.features.iter().enumerate() {
+    let to = l.dataset.lonlat_conversion().map_err(|e| format!("{}: {e}", l.name))?;
+    // A moved label's place, kept in longitude/latitude, in the layer's own system.
+    let to_own = if own { Some(rustgis_data::raster::Crs::LonLat.to(system.0).map_err(|e| format!("{}: {e}", l.name))?) } else { None };
+    // A moved label is drawn where the map puts its place, by the direct operation into the
+    // map's system when there is one (Dataset::shown_through): its annotation is put at the
+    // layer's coordinates the map draws there, given in longitude/latitude through WGS 84 as
+    // hold_as reads them back.
+    let shown = match l.dataset.shown_through() {
+        Some(_) => Some(l.dataset.shown_from_lonlat().map_err(|e| format!("{}: {e}", l.name))?),
+        None => None,
+    };
+    // Those the map's way doesn't reach are put through WGS 84, and said; in the layer's own
+    // system, those WGS 84 can't put there either are left at their feature's label point, and
+    // said.
+    let astray = std::cell::Cell::new(0usize);
+    let unplaced = std::cell::Cell::new(0usize);
+    // Features left without annotation, a place of theirs having none in longitude/latitude.
+    let mut unplaced_features = 0usize;
+    // `None` for one left at its feature's label point, which isn't moved there any more.
+    let put_at = |[x, y]: [f64; 2]| -> Option<Coord> {
+        let c = Coord::new(x, y);
+        let by_map = shown.as_ref().map(|back| back.point(c).filter(|c| c.is_finite()));
+        let Some(to_own) = &to_own else {
+            return Some(match by_map {
+                None => c,
+                Some(own) => own.and_then(|own| to.point(own)).filter(|l| l.is_finite()).unwrap_or_else(|| {
+                    astray.set(astray.get() + 1);
+                    c
+                }),
+            });
+        };
+        match by_map {
+            Some(Some(own)) => Some(own),
+            by_map => match to_own.point(c).filter(|c| c.is_finite()) {
+                Some(own) => {
+                    astray.set(astray.get() + usize::from(by_map.is_some()));
+                    Some(own)
+                }
+                None => {
+                    unplaced.set(unplaced.get() + 1);
+                    None
+                }
+            },
+        }
+    };
+    // A class's label text for a row, and whether it was cut: `None` when it gives none (no
+    // expression or field, an expression with no value, a null field), so no label is made.
+    let text_of = |i: usize, row: usize| -> Option<(String, bool)> {
+        match by_text(i).and_then(|e| e.text_cut(&l.dataset, row)) {
+            Some(Some((t, was_cut))) => Some((t, was_cut)),
+            Some(None) => None,
+            None => {
+                let fi = fields.get(i).copied().flatten()?;
+                let v = l.dataset.value(row, fi);
+                (!v.is_null()).then(|| (v.to_string(), false))
+            }
+        }
+    };
+    for (row, ft) in l.dataset.features.rows().enumerate() {
         if rows.get(row) != Some(&true) {
             continue;
         }
-        let Some(at) = ft.geometry.as_ref().and_then(Geometry::label_point) else { continue };
+        // In the system the annotation layer is made in (above).
+        let Some(g) = ft.geometry() else { continue };
+        // One with a place that can't be given in longitude/latitude, which the map doesn't
+        // draw either, becomes no annotation, and is said.
+        let g = if own {
+            std::borrow::Cow::Borrowed(g)
+        } else if let Some(g) = rustgis_data::Dataset::converted_to_lonlat(&to, g) {
+            g
+        } else {
+            // Counted only when it has a label to convert: a visible class giving it text.
+            unplaced_features += usize::from(matcher.classes_of(&l.dataset, row).any(|(i, c)| c.visible && text_of(i, row).is_some()));
+            continue;
+        };
+        let Some(at) = g.label_point() else { continue };
         for (i, class) in matcher.classes_of(&l.dataset, row).filter(|(_, c)| c.visible) {
-            let text = match by_text(i).and_then(|e| e.text_cut(&l.dataset, row)) {
-                Some(Some((t, was_cut))) => {
-                    cut += usize::from(was_cut);
-                    t
-                }
-                Some(None) => continue,
-                None => {
-                    let Some(fi) = fields.get(i).copied().flatten() else { continue };
-                    let v = l.dataset.value(row, fi);
-                    if v.is_null() {
-                        continue;
-                    }
-                    v.to_string()
-                }
-            };
+            let Some((text, was_cut)) = text_of(i, row) else { continue };
+            cut += usize::from(was_cut);
             let mut attrs = vec![Attr::Text(text)];
             if classes {
                 attrs.push(Attr::Text(class.name.clone()));
             }
             // A label moved by hand becomes an annotation where it was put, and stays moved there
             // (its class's offset leaves it).
-            let put = class.moved_to(ft.id);
-            let at = put.map_or(at, |[x, y]| Coord::new(x, y));
+            // One that can't be placed in the layer's own system stays at its label point, and
+            // isn't moved in the annotation's labels either.
+            let moved_to = class.moved_to(ft.id());
+            let (put, at) = match moved_to.map(|put| (put, put_at(put))) {
+                Some((put, Some(placed))) => (Some(put), placed),
+                Some((_, None)) | None => (None, at),
+            };
             let e = exprs.get(i).and_then(Option::as_ref);
             let number = |v: Option<f32>| v.map_or(Attr::Null, |v| Attr::Float(f64::from(v)));
             if by_size {
@@ -816,11 +1124,11 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
                 attrs.push(c.map_or(Attr::Null, |c| Attr::Text(format!("{},{},{},{}", c.r(), c.g(), c.b(), c.a()))));
             }
             if by_angle {
-                let turns = class.by.angle.is_some() && !along(class, ft.geometry.as_ref());
+                let turns = class.by.angle.is_some() && !along(class, ft.geometry());
                 attrs.push(number(e.filter(|_| turns).and_then(|e| e.angle(&l.dataset, row))));
             }
             ds.push(Some(Geometry::Point(at)), attrs);
-            let flat = put.is_none() && along(class, ft.geometry.as_ref());
+            let flat = moved_to.is_none() && along(class, ft.geometry());
             flattened += usize::from(flat);
             repeated += usize::from(flat && class.repeat.is_some());
             if let (Some(put), Some(new)) = (put, ds.features.last()) {
@@ -829,9 +1137,20 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         }
     }
     if ds.features.is_empty() {
+        if unplaced_features > 0 {
+            return Err(format!(
+                "the layer has no labels to convert: {unplaced_features} feature(s) have a place that can't be given in longitude/latitude"
+            ));
+        }
         return Err("the layer has no labels to convert".into());
     }
     let n = ds.features.len();
+    let unplaced_features_note = (unplaced_features > 0).then(|| {
+        NoticeText::format(
+            "{name}: {n} feature(s) of {layer} have a place that can't be given in longitude/latitude, so their labels aren't converted",
+            [("name", ds.name.clone().into()), ("n", unplaced_features.to_string().into()), ("layer", l.name.clone().into())],
+        )
+    });
     let flattened_note = (flattened > 0).then(|| {
         NoticeText::format(
             "{name}: {n} label(s) along lines made upright points at their lines' middle vertex, no longer laid along the line",
@@ -842,6 +1161,18 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         NoticeText::format(
             "{name}: {n} label(s) whose class repeats along lines converted once each",
             [("name", ds.name.clone().into()), ("n", repeated.to_string().into())],
+        )
+    });
+    let astray_note = (astray.get() > 0).then(|| {
+        NoticeText::format(
+            "{name}: {n} moved label(s) the map's own conversion doesn't reach put through WGS 84, which may be some decimetres from where they were drawn",
+            [("name", ds.name.clone().into()), ("n", astray.get().to_string().into())],
+        )
+    });
+    let unplaced_note = (unplaced.get() > 0).then(|| {
+        NoticeText::format(
+            "{name}: {n} moved label(s) that can't be placed in {system} became annotation at their feature's label point",
+            [("name", ds.name.clone().into()), ("n", unplaced.get().to_string().into()), ("system", system.0.label().into())],
         )
     });
     let cut_note = (cut > 0).then(|| {
@@ -882,6 +1213,12 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         labels.classes.get_mut(class).unwrap_or(&mut labels.default).move_label(id, Some(at));
     }
     let (min_scale, max_scale) = (l.min_scale, l.max_scale);
+    // Before the labelled layer changes, so a cancel leaves it as it was.
+    if own {
+        (ds.held_in, ds.crs) = system;
+    } else {
+        super::workflows::hold_as(s, &mut ds, system)?;
+    }
     if let Some(src) = s.map_mut().layer_mut(id) {
         src.labels.enabled = false;
     }
@@ -894,11 +1231,15 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
         a.min_scale = min_scale;
         a.max_scale = max_scale;
     }
+    // Text cut, and labels of features it can't place, are lost from the annotation.
     if let Some(note) = cut_note {
-        s.notify(note, false);
+        s.say(rustgis_data::loss::Note::loss(rustgis_data::loss::LossCode::ChangedCut, note));
     }
-    for note in [flattened_note, repeated_note].into_iter().flatten() {
+    for note in [flattened_note, repeated_note, astray_note, unplaced_note].into_iter().flatten() {
         s.notify_text(note, false);
+    }
+    if let Some(note) = unplaced_features_note {
+        s.notify_loss(rustgis_data::loss::LossCode::DroppedFeature, note);
     }
     if let Some((_, unread)) = &whole {
         unread.say(s);

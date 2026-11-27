@@ -16,8 +16,15 @@ pub(super) struct CurveSpec {
     pub chars: Vec<String>,
     pub advances: Vec<f32>,
     pub gap: f32,
+    /// The class's own spacing, tried at a place where a stretched `gap` (#2262) can't follow
+    /// the line; `None` when `gap` is already its own.
+    pub own_gap: Option<f32>,
+    /// The text's size: with the letter spacing, how far the line is smoothed either side of the
+    /// text when its course is read ([`line_labels::Line::curved`]).
+    pub size: f32,
     pub overrun: f32,
-    /// How far off the line, in screen points ([`line_labels::off_line`]).
+    /// How far off the line, in screen points ([`line_labels::off_line`]): place `i` on the
+    /// other side when `i` is odd ([`line_labels::side_off`]).
     pub off: f32,
 }
 
@@ -36,6 +43,15 @@ impl std::fmt::Debug for Curves {
 }
 
 impl Curves {
+    /// About how many bytes its positions, changes and spec take, for a budget: a spec, or the
+    /// line in it, shared by several candidates counts in each.
+    pub fn bytes(&self) -> usize {
+        let spec = &self.spec;
+        let chars = spec.chars.iter().map(|c| size_of::<String>() + c.len()).sum::<usize>();
+        let spec = size_of::<CurveSpec>() + chars + spec.advances.len() * size_of::<f32>() + spec.line.bytes();
+        self.positions.len() * size_of::<f32>() + self.changes.len() * size_of::<Change>() + spec
+    }
+
     pub fn new(spec: Arc<CurveSpec>, positions: Vec<f32>, locked: Option<usize>) -> Self {
         Self { spec, positions, locked, changes: Vec::new() }
     }
@@ -85,7 +101,7 @@ impl Curves {
                 self.spec.line.parallel(width, self.spec.overrun, Some(*d)).map(|(_, _, a)| a).or_else(|| self.spec.line.direction(*d));
             // Off the line as its curve would be.
             let (x, y) = angle.map_or((x, y), |a| {
-                let (x, y, _) = line_labels::parallel_off((x, y, a), self.spec.off);
+                let (x, y, _) = line_labels::parallel_off((x, y, a), line_labels::side_off(self.spec.off, i));
                 (x, y)
             });
             let mut preview = LabelPlace { x, y, angle, glyphs: Vec::new() };
@@ -101,13 +117,16 @@ impl Curves {
             return None;
         }
         let at = *self.positions.get(i)?;
+        let off = line_labels::side_off(self.spec.off, i);
         #[cfg(test)]
         LAYOUTS.with(|n| n.set(n.get() + 1));
-        let ((x, y), turns) = self
-            .spec
-            .line
-            .curved(&self.spec.advances, self.spec.gap, self.spec.overrun, Some(at))
-            .and_then(|c| line_labels::curved_off(c, self.spec.off))?;
+        let curve = |gap| {
+            self.spec
+                .line
+                .curved(&self.spec.advances, gap, self.spec.size, self.spec.overrun, Some(at))
+                .and_then(|c| line_labels::curved_off(c, off))
+        };
+        let ((x, y), turns) = curve(self.spec.gap).or_else(|| self.spec.own_gap.and_then(curve))?;
         // Reuse the preceding rejected place's vector and String capacities. The accepted
         // middle preview retains its own glyphs; later failed attempts can share this pool.
         let mut glyphs = std::mem::take(&mut template.glyphs);

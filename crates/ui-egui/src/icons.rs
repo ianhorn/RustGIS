@@ -224,6 +224,31 @@ fn maneuver(p: &P, kind: &str) {
     }
 }
 
+/// A key filled with `fill` and outlined with `ink`, on a disc of `backdrop` that keeps it clear of
+/// the icon it sits on: a command's sign-in, kept (green) or missing (red, and struck through, so
+/// the state doesn't rest on colour alone).
+pub fn key_badge(painter: &Painter, r: Rect, fill: Color32, ink: Color32, backdrop: Color32, missing: bool) {
+    let p = P { p: painter, r, ink, acc: fill };
+    p.circle(12.0, 12.0, 12.0, Some(backdrop), None);
+    // The bow, then the shaft and its two teeth: the outline first, the fill over it.
+    let shaft = [(9.5, 9.5), (19.5, 19.5)];
+    let teeth = [[(16.0, 16.0), (18.5, 13.5)], [(19.5, 19.5), (21.5, 17.5)]];
+    for (w, c) in [(4.6, ink), (2.4, fill)] {
+        p.line(&shaft, w, c);
+        for t in &teeth {
+            p.line(t, w, c);
+        }
+    }
+    p.circle(8.0, 8.0, 5.0, Some(fill), Some((1.4, ink)));
+    p.circle(7.0, 7.0, 1.6, Some(backdrop), None);
+    if missing {
+        // Across the key, on a gap of the backdrop that keeps it readable over the fill.
+        let slash = [(4.0, 20.0), (20.0, 4.0)];
+        p.line(&slash, 5.0, backdrop);
+        p.line(&slash, 2.2, ink);
+    }
+}
+
 /// Paints icon `name` into `r`. `ink` draws outlines, `accent` the colour parts.
 pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color32) {
     let p = P { p: painter, r, ink, acc: accent };
@@ -853,6 +878,25 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.line(&[(12.0, 8.0), (12.0, 15.0)], 1.8, p.acc);
             p.line(&[(9.2, 12.4), (12.0, 15.2), (14.8, 12.4)], 1.8, p.acc);
         }
+        "replace" | "replace_all" => {
+            // The word and what takes its place: the old one as a bare letter, the new one in a box of the
+            // accent, as the other icons draw a thing (a box, its outline), and the action in green, as Export and Add
+            // draw theirs. The arrow alone for Replace (this match), with an asterisk for Replace All.
+            // Regular weight, not the semibold the other icons' letters take: it is the plain word.
+            painter.text(p.pt(6.0, 5.5), egui::Align2::CENTER_CENTER, "a", egui::FontId::proportional(14.0 * p.s()), ink);
+            if name == "replace_all" {
+                // An asterisk in the free corner: every match, as a code editor's pattern marks it.
+                for deg in [90.0_f32, 30.0, 150.0] {
+                    let (s, c) = deg.to_radians().sin_cos();
+                    p.line(&[(19.0 - 3.4 * c, 6.0 - 3.4 * s), (19.0 + 3.4 * c, 6.0 + 3.4 * s)], 1.7, green);
+                }
+            }
+            p.rect(9.5, 11.5, 14.0, 11.0, Some(accent), Some((1.3, ink)), 1.5);
+            p.text(16.5, 17.0, "b", 10.0, Color32::WHITE);
+            // From the old word down and over to the new one.
+            p.line(&[(6.0, 10.0), (6.0, 17.0), (7.2, 17.0)], 1.7, green);
+            p.fill(&[(6.8, 15.0), (9.3, 17.0), (6.8, 19.0)], green);
+        }
         "up" => p.line(&[(6.0, 15.0), (12.0, 9.0), (18.0, 15.0)], 1.8, ink),
         "down" => p.line(&[(6.0, 9.0), (12.0, 15.0), (18.0, 9.0)], 1.8, ink),
         "logo" => {
@@ -1118,6 +1162,25 @@ pub fn paint(painter: &Painter, r: Rect, name: &str, ink: Color32, accent: Color
             p.line(&[(8.0, 16.0), (7.0, 20.0), (9.0, 22.0)], 1.3, ink);
         }
         "no_fill" => p.rect(3.0, 4.0, 18.0, 16.0, None, Some((1.6, ink)), 0.0),
+        "restore_fill" => {
+            // No Fill's outline filled again, and Undo's arrow over its corner: the fill put back.
+            p.rect(3.0, 8.0, 14.0, 13.0, Some(p.tint(150)), Some((1.6, ink)), 0.0);
+            paint(painter, Rect::from_min_size(p.pt(10.0, 0.0), r.size() * 0.6), "undo", ink, accent);
+        }
+        "reload" => {
+            // Two arrows chasing round a circle: read again from the source.
+            p.arc(12.0, 12.0, 7.5, 200.0, 340.0, 1.8, ink);
+            p.arc(12.0, 12.0, 7.5, 20.0, 160.0, 1.8, ink);
+            let head = |a: f32, turn: f32| {
+                let (c, s) = (a.to_radians().cos(), a.to_radians().sin());
+                let (x, y) = (12.0 + 7.5 * c, 12.0 + 7.5 * s);
+                // Pointing along the circle, the way it turns.
+                let (tx, ty) = (-s * turn, c * turn);
+                p.fill(&[(x + tx * 3.5, y + ty * 3.5), (x + c * 2.6, y + s * 2.6), (x - c * 2.6, y - s * 2.6)], accent);
+            };
+            head(340.0, 1.0);
+            head(160.0, 1.0);
+        }
         "g_rect" => {
             p.rect(3.0, 6.0, 18.0, 12.0, Some(p.tint(70)), Some((1.4, ink)), 0.5);
         }
@@ -1324,6 +1387,8 @@ pub const ALL: &[&str] = &[
     "new",
     "undo",
     "redo",
+    "reload",
+    "restore_fill",
     "delete",
     "create",
     "edit",
@@ -1352,6 +1417,8 @@ pub const ALL: &[&str] = &[
     "run",
     "up",
     "down",
+    "replace",
+    "replace_all",
     "logo",
     "point_layer",
     "line_layer",

@@ -16,7 +16,7 @@ use wasm_bindgen::prelude::*;
 // runner (~25 MB) is too large to ship with the app, so the pinned version and HTTPS are the
 // safeguards: the same trust as installing the npm package.
 #[wasm_bindgen(inline_js = r#"
-const BASE = "https://cdn.jsdelivr.net/npm/geolibre-wasm@1.8.0";
+const BASE = "https://cdn.jsdelivr.net/npm/geolibre-wasm@1.8.3";
 let loaded = null;
 let ready = null;
 async function tools(still = () => true) {
@@ -42,7 +42,10 @@ async function tools(still = () => true) {
 // visits. The runner itself loads only when a tool runs.
 // The suffix changes when RustGIS reads the list differently.
 const MANIFESTS = `${BASE}/manifests.json?v=1`;
+// A pull request preview shares its origin, and so its caches, with unreviewed previews: it lists
+// the tools every visit instead of trusting a list another preview could have put there.
 async function manifestCache() {
+  if (document.querySelector('meta[name="rustgis-preview"]')) return null;
   try { return await caches.open("rustgis-geolibre"); } catch (_) { return null; }
 }
 export async function geolibre_manifests() {

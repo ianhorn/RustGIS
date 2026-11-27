@@ -99,14 +99,16 @@ fn record_connection(s: &mut Session, layer: u32, request: &Value, anonymous: bo
 }
 
 fn plan(s: &mut Session, p: &Value) -> CmdResult {
-    let mut out = if p.get("sourceOnly").and_then(Value::as_bool) == Some(true) { request(s, p)? } else { listing(s, p)? };
+    let mut out = if p.get("sourceOnly").and_then(Value::as_bool) == Some(true) { request(s, p)? } else { listing(s, p)?.0 };
     if !s.policy_user() {
         crate::sources::redact_url_fields(&mut out);
     }
     Ok(out)
 }
 
-fn listing(s: &mut Session, p: &Value) -> CmdResult {
+/// The service's collections to import, and for each whether the document listing it was read
+/// from the internet (its features are then fetched only from there).
+fn listing(s: &mut Session, p: &Value) -> Result<(Value, Vec<bool>), String> {
     let q = request(s, p)?;
     let mut found = capabilities(s, &q)?;
     super::notify_withheld(s, found.service.withheld_addresses);
@@ -167,6 +169,7 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
         offered = pos.and_then(|i| offered.into_iter().nth(i)).into_iter().collect();
     }
     let (selected, sources): (Vec<_>, Vec<_>) = offered.into_iter().unzip();
+    let public = sources.iter().map(|source| source.public).collect();
     if found.next.is_none() && child.is_some() && selected.is_empty() {
         return Err("the collection is no longer advertised by this service".into());
     }
@@ -186,21 +189,21 @@ fn listing(s: &mut Session, p: &Value) -> CmdResult {
     } else if let Some(connection) = q.get("connection").filter(|v| !v.is_null()) {
         out["request"]["connection"] = connection.clone();
     }
-    Ok(out)
+    Ok((out, public))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-fn download(s: &mut Session, name: &str, url: &str, max: usize) -> Result<Vec<u8>, String> {
-    super::download_features(s, name, url, max)
+fn download(s: &mut Session, name: &str, url: &str, max: usize, public: bool) -> Result<Vec<u8>, String> {
+    super::download_features(s, name, url, max, public)
 }
 
 #[cfg(target_arch = "wasm32")]
-fn download(_: &mut Session, _: &str, _: &str, _: usize) -> Result<Vec<u8>, String> {
+fn download(_: &mut Session, _: &str, _: &str, _: usize, _: bool) -> Result<Vec<u8>, String> {
     Err("the browser must supply downloaded feature responses".into())
 }
 
 fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset, bool)>), String> {
-    let listing = listing(s, p)?;
+    let (listing, public) = listing(s, p)?;
     if listing.get("next").is_some() {
         return Err("complete service discovery before importing or refreshing".into());
     }
@@ -211,7 +214,9 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
     }
     let mut bytes_read = 0usize;
     let mut reads = Vec::new();
-    for layer in layers {
+    // `listing` returns one reach per layer it lists (`service_json` writes one entry per layer),
+    // so the two never differ in length.
+    for (layer, public) in layers.iter().zip(public) {
         let name = ps(layer, "title").unwrap_or("Collection");
         let url = layer.get("offer").and_then(|o| ps(o, "url")).ok_or("missing features address")?;
         let bytes = match responses {
@@ -226,7 +231,7 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
                 }
                 text.as_bytes().to_vec()
             }
-            None => download(s, name, url, MAX_GROUP_BYTES.saturating_sub(bytes_read))?,
+            None => download(s, name, url, MAX_GROUP_BYTES.saturating_sub(bytes_read), public)?,
         };
         bytes_read = bytes_read.saturating_add(bytes.len());
         if bytes_read > MAX_GROUP_BYTES {
@@ -234,7 +239,7 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
         }
         // The collection's bounds, from the listing: none read leaves the axes as they come.
         let bounds = super::bounds_of(layer.get("bbox")).ok().flatten();
-        let bytes = super::features_answer(s, name, bytes, bounds);
+        let bytes = super::features_answer(s, name, url, bytes, bounds);
         let text = std::str::from_utf8(&bytes).map_err(|e| format!("{name}: {e}"))?;
         let (mut dataset, report) = rustgis_data::io::read_geojson(text, name).map_err(|e| format!("{name}: {e}"))?;
         if dataset.features.is_empty() && !feature_collection(text) {
@@ -243,7 +248,7 @@ fn read(s: &mut Session, p: &Value) -> Result<(Value, Vec<(ServiceChild, Dataset
         // Empty collections remain visible as children and can acquire geometry on refresh.
         dataset.source = Some(url.to_string());
         for message in report.messages {
-            s.notify(message, false);
+            s.say(message);
         }
         reads.push((
             ServiceChild {
@@ -344,6 +349,7 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
     // whose classes no longer read, drawn with a single symbol.
     let mut notes = Vec::new();
     let mut singled = Vec::new();
+    let mut size_cleared = Vec::new();
     let mut area_notes = Vec::new();
     let mut moved = 0;
     for ((mut child, mut dataset, anonymous), existing) in reads.into_iter().zip(matches) {
@@ -372,6 +378,14 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
                 if invalid_renderer {
                     singled.push(layer.name.clone());
                 }
+            }
+            // A size mapping by a field the service dropped, or that no longer reads as numbers,
+            // sizes nothing: cleared, as deleting its field clears it.
+            let numeric =
+                |field: &str| layer.dataset.field_index(field).and_then(|i| layer.dataset.fields.get(i)).is_some_and(|f| f.ty.is_numeric());
+            if layer.size_by.as_ref().is_some_and(|by| !numeric(&by.field)) {
+                layer.size_by = None;
+                size_cleared.push(layer.name.clone());
             }
             // (Labels by a text expression that still reads need no field.)
             let reads = |t: &Option<String>, ds: &rustgis_data::Dataset| {
@@ -455,6 +469,16 @@ fn refresh(s: &mut Session, p: &Value) -> CmdResult {
                 "layers whose classes read fields the refreshed service no longer has, or no longer read as numbers, or whose class expression no longer reads, are drawn with a single symbol ({}: {})",
                 singled.len(),
                 singled.join(", ")
+            ),
+            false,
+        );
+    }
+    if !size_cleared.is_empty() {
+        s.notify(
+            format!(
+                "layers whose markers were sized by a field the refreshed service no longer has, or that no longer reads as numbers, keep their class sizes ({}: {})",
+                size_cleared.len(),
+                size_cleared.join(", ")
             ),
             false,
         );

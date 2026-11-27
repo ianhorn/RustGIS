@@ -1283,7 +1283,8 @@ impl StyleView {
 pub enum Source {
     Vector {
         tiles: Vec<String>,
-        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        /// Runtime provenance of the tile templates: `None` for a template given directly;
+        /// templates from a TileJSON keep that document's origin, even when the user picked it.
         from: Option<crate::address::Origin>,
         url: Option<String>,
         min_zoom: u8,
@@ -1292,7 +1293,8 @@ pub enum Source {
     },
     Raster {
         tiles: Vec<String>,
-        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        /// Runtime provenance of the tile templates: `None` for a template given directly;
+        /// templates from a TileJSON keep that document's origin, even when the user picked it.
         from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
@@ -1303,7 +1305,8 @@ pub enum Source {
     /// Elevation tiles, for `hillshade` and `color-relief` layers.
     RasterDem {
         tiles: Vec<String>,
-        /// Runtime provenance of the tile templates; `None` for a user-selected template.
+        /// Runtime provenance of the tile templates: `None` for a template given directly;
+        /// templates from a TileJSON keep that document's origin, even when the user picked it.
         from: Option<crate::address::Origin>,
         url: Option<String>,
         tile_size: u32,
@@ -1860,6 +1863,12 @@ impl StyleLayer {
         let grid = (0..=((MAX_STYLE_ZOOM - lo) * ZOOM_GRID) as u32).map(|i| lo + i as f32 / ZOOM_GRID);
         let named = named.into_iter().filter(|z| z.is_finite()).map(|z| z as f32);
         [lo, MAX_STYLE_ZOOM].into_iter().chain(grid).chain(named).filter(shown).any(|z| expr.elevation_ramp(z).is_none())
+    }
+
+    /// Whether `raster-resampling` is `nearest` (default `linear`): a raster layer's tile pictures
+    /// drawn at a size other than their own keep each pixel a block rather than blending them.
+    pub fn raster_resampling_nearest(&self, zoom: f32) -> bool {
+        self.pval("raster-resampling", &FeatureCtx::zoom_only(zoom)).as_str() == Some("nearest")
     }
 
     /// `color-relief-opacity` (default 1).

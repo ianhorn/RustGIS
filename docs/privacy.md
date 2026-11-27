@@ -130,6 +130,11 @@ still identify private data, so review copied diagnostics before sharing them.
   once on the desktop (they are kept in the cache folder) and once a session in the web app.
   Until you choose one, a system whose time zone or language is mainland China's downloads
   China's view the same way.
+- **Settings › Datum Grids › Download Datum Grids** (off unless you turn it on) downloads the
+  datum grids a coordinate system you use needs from PROJ's grid server (`cdn.proj.org`): the
+  request names the grid (such as `us_noaa_conus.tif`), which tells the server roughly which
+  region's data you work with. On the desktop a grid is kept in RustGIS's app data folder
+  (`datum-grids`) and not downloaded again; the web app downloads it once a session.
 - Web data, remote rasters, cloud storage, database connections and online catalogs contact
   their configured servers. Searches may send keywords, coordinates, an area of interest,
   dates or filters; authenticated connections also send the credentials or tokens required by
@@ -176,8 +181,11 @@ you ask. It does not upload your project. On Windows, **Download and Install** t
 the release's installer and its `SHA256SUMS` from GitHub's release downloads, only when you
 choose it. The web app checks its own site for service-worker
 updates when it loads and returns to view, and fetches app icons from `assets.rustgis.app`.
-It downloads language fonts from that asset server when needed. The web GeoLibre tools
-download their runner from jsDelivr when needed; the tool list is cached between visits.
+The desktop, phone and web apps automatically download fallback fonts from `assets.rustgis.app`
+when text needs glyphs that the current fonts lack; native apps keep them in the font cache
+for offline restarts. These requests download font files, not the text or project. The web
+GeoLibre tools download their runner from jsDelivr when needed; the tool list is cached between
+visits.
 
 ## Website analytics
 
@@ -195,5 +203,5 @@ words of a site search.
 
 You can block analytics with a content blocker or your browser's tracking protection; the sites
 work normally without them. Analytics run only on the sites we host: the measurement ID is added
-when those sites are deployed, so the desktop app, the command line and any copy you build
-yourself never load them.
+when those sites are deployed, so the desktop app, the command line, the Android and iOS apps
+and any copy you build yourself never load them.

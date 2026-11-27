@@ -9,9 +9,11 @@
 //!     --cmd 'gp.run={"tool":"buffer","params":{"input":"Cities","distance":100}}' \
 //!     --cmd 'share.exportMap={"path":"out.png"}' [--save out.rgis]
 //! rustgis-cli run … --use-saved-secrets            # use what the desktop app saved in the system keychain
+//! rustgis-cli run … --strict [--allow dropped.ring]   # exit 3 when a command loses data (see the guide's loss codes)
 //! rustgis-cli run … --threads 4                    # the most threads one piece of work uses (default: the cores, up to 16)
 //! rustgis-cli ask [--sample | --project p.rgis | --data f.geojson …] "Which cities have over 10 million people?" \
 //!     [--provider anthropic|openai|chatgpt|gemini|openrouter|ollama|custom|requesty|trustedrouter|opper] [--model M] [--base-url URL] [--yes] [--save out.rgis] [--trace log.txt]
+//! rustgis-cli ask --sample "Style the countries like this map" --image reference.png   # pictures go with the request (up to 4)
 //! rustgis-cli ask --models [--provider P]                # list the provider's models
 //! rustgis-cli ask --accounts | --account CLIENT_ID       # list or select a saved registration
 //! rustgis-cli ask --remove-account CLIENT_ID             # sign out and forget a saved registration
@@ -41,13 +43,14 @@ macro_rules! out {
 }
 
 use rustgis_assistant::{Config, provider};
+use rustgis_engine::data::loss::{LossCode, LossKind};
 use rustgis_engine::data::secrets::SecretStore;
 use rustgis_engine::{Project, Session};
 use serde_json::{Map, Value, json};
 
 fn usage() -> ExitCode {
     eprintln!(
-        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
+        "usage:\n  rustgis-cli commands | tools\n  rustgis-cli plugins [install <file|folder> | uninstall <id> | enable <id> | disable <id> | browse | get <id> | prepare <id>] [--registry URL]\n  rustgis-cli skills [add <SKILL.md|folder|.zip> | remove <name> | enable <name> | disable <name>]\n  rustgis-cli info <data>\n  rustgis-cli logo <out.png|out.ico|out.bmp> [--size N] [--canvas WxH --at X,Y (.bmp only)]\n  rustgis-cli render <data|project> <out.png> [--basemap NAME] [--tiles URL] [--width N] [--height N] [--dpi N] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli run [--sample] [--project P] [--data F]… --cmd 'id={{json}}'… [--save P] [--strict [--allow KIND|CODE]…] [--worldview auto|default|CODE] [--worldview-detail simplified|original]\n  rustgis-cli ask [--sample] [--project P] [--data F]… \"request\" [--image PICTURE]… [--provider P] [--model M] [--base-url URL] [--yes] [--save P]\n  rustgis-cli ask --models [--provider P]\n  rustgis-cli ask --login [--another-account] [--account CLIENT_ID] | --logout\n  rustgis-cli ask --accounts | --account CLIENT_ID | --remove-account CLIENT_ID\n  common options: --use-saved-secrets (use the connections, passwords, keys, ChatGPT sign-in and Earthdata Login token the RustGIS app saved; reads the system keychain), --threads N (the most threads one piece of work uses, 1-1024; default: the cores, up to 16)\n  rustgis-cli mcp [--sample] [--project P] [--data F]… [--yes] [--attach [PORT] [--token-file FILE] [--timeout SECONDS (5-600)]]\n  rustgis-cli mcp-register [--client claude] [--name NAME] [--port PORT]"
     );
     ExitCode::from(2)
 }
@@ -110,6 +113,99 @@ fn prepare_env(id: &str) -> Result<String, String> {
     Ok(python.display().to_string())
 }
 
+/// The exit status of a run `--strict` stopped because a command lost data it doesn't allow.
+const LOSS_EXIT: u8 = 3;
+
+/// `run --strict`: the run stops after the first command that reports a loss of a kind or code
+/// no `--allow` accepts, before the commands after it and the final save.
+struct Strict {
+    allow: Vec<String>,
+    /// Whether a loss stopped the run, so it exits with [`LOSS_EXIT`].
+    stopped: std::cell::Cell<bool>,
+}
+
+impl Strict {
+    /// Reads `--strict` and each `--allow <kind or code>`: `None` without `--strict`.
+    fn from_args(cmd: &str, args: &[String]) -> Result<Option<Strict>, String> {
+        if args.iter().any(|a| a.starts_with("--strict=")) {
+            return Err("--strict takes no value; accept losses with --allow".into());
+        }
+        let strict = args.iter().any(|a| a == "--strict");
+        let mut allow = Vec::new();
+        // `--allow X`, or `--allow=X` as `--threads=N` is read.
+        for (i, a) in args.iter().enumerate() {
+            let v = match a.strip_prefix("--allow=") {
+                Some(v) => Some(v),
+                None if a == "--allow" => args.get(i + 1).map(String::as_str).filter(|v| !v.starts_with("--")),
+                None => continue,
+            };
+            let Some(v) = v.filter(|v| !v.is_empty()) else {
+                return Err("--allow needs a loss kind or code, such as dropped or dropped.ring".into());
+            };
+            if LossKind::from_id(v).is_none() && LossCode::from_id(v).is_none() {
+                let kinds: Vec<&str> = LossKind::ALL.iter().map(|k| k.id()).collect();
+                return Err(format!("--allow {v}: not a loss kind ({}) or code (listed in the command line guide)", kinds.join(", ")));
+            }
+            allow.push(v.to_string());
+        }
+        if (strict || !allow.is_empty()) && cmd != "run" {
+            return Err("--strict and --allow apply to run".into());
+        }
+        if !strict {
+            return if allow.is_empty() { Ok(None) } else { Err("--allow needs --strict".into()) };
+        }
+        Ok(Some(Strict { allow, stopped: std::cell::Cell::new(false) }))
+    }
+
+    /// Whether an `--allow` names this code or its kind (`dropped` allows `dropped.ring`).
+    fn allows(&self, code: LossCode) -> bool {
+        let spec = code.spec();
+        self.allow.iter().any(|a| a == spec.id || a == spec.kind.id())
+    }
+
+    /// Stops the run when `id` reported a loss this run doesn't allow: `before` is
+    /// [`Session::losses_given`] from before it ran, so no loss escapes however much it said.
+    fn check(&self, s: &Session, before: &[(LossCode, u64)], id: &str) -> Result<(), String> {
+        let lost: Vec<(LossCode, u64)> = s
+            .losses_given()
+            .iter()
+            .filter(|(code, _)| !self.allows(*code))
+            .filter_map(|&(code, n)| {
+                let was = before.iter().find(|(c, _)| *c == code).map_or(0, |(_, n)| *n);
+                (n > was).then_some((code, n - was))
+            })
+            .collect();
+        if lost.is_empty() {
+            return Ok(());
+        }
+        self.stopped.set(true);
+        let mut said = format!("--strict: stopped after {id}, which reported a loss no --allow accepts:");
+        for (code, n) in lost {
+            let spec = code.spec();
+            // A counted notice says how many it lost in its text; this counts the notices.
+            let notices = if n == 1 { "1 notice".to_string() } else { format!("{n} notices") };
+            said.push_str(&format!("\n  {} ({notices}): {}", spec.id, spec.action));
+        }
+        Err(said)
+    }
+}
+
+/// [`run`], then [`Strict::check`] when the run is strict: after a failure too, as a failed
+/// command still reports the losses that outlive its rollback (a counted omission).
+fn run_strict(s: &mut Session, strict: Option<&Strict>, id: &str, p: Value) -> Result<Value, String> {
+    let before = strict.map(|_| s.losses_given().to_vec());
+    let out = run(s, id, p);
+    if let (Some(strict), Some(before)) = (strict, before)
+        && let Err(said) = strict.check(s, &before, id)
+    {
+        return Err(match out {
+            Err(e) => format!("{e}\n{said}"),
+            Ok(_) => said,
+        });
+    }
+    out
+}
+
 fn is_project(path: &str) -> bool {
     rustgis_engine::project::opens_as_project(path)
 }
@@ -118,28 +214,29 @@ fn num(args: &[String], name: &str) -> Option<f64> {
     opt(args, name).and_then(|v| v.parse::<f64>().ok()).filter(|v| v.is_finite())
 }
 
-fn load(s: &mut Session, path: &str) -> Result<(), String> {
+/// Opens a project, or adds any other file as a layer; `strict` only from `run`.
+fn load(s: &mut Session, strict: Option<&Strict>, path: &str) -> Result<(), String> {
     if is_project(path) {
-        run(s, "project.open", json!({"path": path}))?;
+        run_strict(s, strict, "project.open", json!({"path": path}))?;
     } else {
-        run(s, "layer.addData", json!({"path": path}))?;
+        run_strict(s, strict, "layer.addData", json!({"path": path}))?;
     }
     Ok(())
 }
 
 /// Opens `--sample`, `--project` and every `--data`.
-fn open_inputs(s: &mut Session, args: &[String]) -> Result<(), String> {
+fn open_inputs(s: &mut Session, strict: Option<&Strict>, args: &[String]) -> Result<(), String> {
     if args.iter().any(|a| a == "--sample") {
-        run(s, "project.sample", Value::Null)?;
+        run_strict(s, strict, "project.sample", Value::Null)?;
     }
     if let Some(p) = opt(args, "--project") {
-        load(s, p)?;
+        load(s, strict, p)?;
     }
     for (i, a) in args.iter().enumerate() {
         if a == "--data"
             && let Some(p) = args.get(i + 1)
         {
-            load(s, p)?;
+            load(s, strict, p)?;
         }
     }
     Ok(())
@@ -262,6 +359,7 @@ fn ask_request(args: &[String]) -> Option<String> {
         "--data",
         "--save",
         "--trace",
+        "--image",
         "--plugin",
         "--registry",
         "--worldview",
@@ -275,6 +373,27 @@ fn ask_request(args: &[String]) -> Option<String> {
         .skip(1)
         .find(|(i, a)| !a.starts_with("--") && !args.get(i - 1).is_some_and(|p| takes_value.contains(&p.as_str())))
         .map(|(_, a)| a.clone())
+}
+
+/// The pictures `--image` attaches to the request, each read and made ready to send
+/// ([`rustgis_assistant::attach::prepare`]). One that can't be is an error, so the request isn't
+/// sent without it.
+fn ask_pictures(args: &[String]) -> Result<Vec<rustgis_assistant::attach::Picture>, String> {
+    use rustgis_assistant::attach::{MAX_PER_MESSAGE, prepare, read};
+    // Refused before any is read: a request takes at most four.
+    let given = args.iter().filter(|a| *a == "--image").count();
+    if given > MAX_PER_MESSAGE {
+        return Err(format!("--image: a request takes at most {MAX_PER_MESSAGE} pictures, {given} given"));
+    }
+    let mut pictures = Vec::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--image" {
+            continue;
+        }
+        let path = args.get(i + 1).filter(|p| !p.starts_with("--")).ok_or("--image needs a picture file")?;
+        pictures.push(prepare(path, &read(path)?).map_err(|e| e.to_string())?);
+    }
+    Ok(pictures)
 }
 
 /// `ask "<request>"`: one conversation turn with the AI assistant, which acts on the project.
@@ -432,6 +551,7 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
         };
         return Err(format!("{provider}: {why} ({hint})"));
     }
+    let pictures = ask_pictures(args)?;
     eprintln!("[{} · {}]", cfg.provider, cfg.model);
     let yes = args.iter().any(|a| a == "--yes");
     let mut a = Agent::new(cfg, s);
@@ -471,7 +591,7 @@ fn ask(s: &mut Session, args: &[String], saved: Option<&Saved>, env: &Environmen
     };
     // `--yes` allows file and network access; actions reserved to the user (plugins, scripts,
     // tasks, models, replacing the project) are never run from here.
-    agent::run_blocking(&mut a, &prompt, s, send, |what, why, access| {
+    agent::run_blocking_with(&mut a, &prompt, pictures, s, send, |what, why, access| {
         let allow = yes && access;
         if !allow {
             let hint = if access { "; pass --yes to allow" } else { "" };
@@ -706,8 +826,26 @@ fn main() -> ExitCode {
 
 /// The command line: loads the plugins, then runs the subcommand the arguments name.
 fn cli() -> ExitCode {
+    // Datum grids: RustGIS's own folder, then those PROJ uses on this computer (#2032 A4).
+    rustgis_engine::data::raster::crs::use_grid_folders();
+    // A RUSTGIS_MEMORY_BYTES left set would change every memory limit; say so on each run.
+    if rustgis_engine::data::memory::source() == "override"
+        && let Some(m) = rustgis_engine::data::memory::physical()
+    {
+        eprintln!(
+            "rustgis-cli: memory limits follow RUSTGIS_MEMORY_BYTES ({:.1} GiB), not this computer's memory",
+            m as f64 / (1u64 << 30) as f64
+        );
+    }
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first().map(|s| s.as_str()) else { return usage() };
+    let strict = match Strict::from_args(cmd, &args) {
+        Ok(strict) => strict,
+        Err(e) => {
+            eprintln!("rustgis-cli: {e}");
+            return ExitCode::from(2);
+        }
+    };
     if !args.iter().any(|a| a == "--no-plugins") {
         for e in rustgis_engine::cmd::plugins::load_installed() {
             eprintln!("rustgis-cli: warning: {e}");
@@ -835,7 +973,7 @@ fn cli() -> ExitCode {
         }
         "info" => {
             let path = args.get(1).ok_or("info needs a file")?;
-            load(&mut s, path)?;
+            load(&mut s, None, path)?;
             print(&run(&mut s, "info.project", Value::Null)?);
             Ok(())
         }
@@ -882,7 +1020,7 @@ fn cli() -> ExitCode {
         }
         "render" => {
             let (Some(input), Some(out)) = (args.get(1), args.get(2)) else { return Err("render needs <input> <out.png>".into()) };
-            load(&mut s, input)?;
+            load(&mut s, None, input)?;
             if let Some(b) = opt(&args, "--basemap") {
                 run(&mut s, "map.basemap", json!({"name": b}))?;
             }
@@ -901,7 +1039,7 @@ fn cli() -> ExitCode {
             Ok(())
         }
         "ask" => {
-            open_inputs(&mut s, &args)?;
+            open_inputs(&mut s, None, &args)?;
             // What the assistant did is saved even when it couldn't finish.
             let asked = ask(&mut s, &args, saved.as_ref(), &Environment::process());
             if let Some(p) = opt(&args, "--save")
@@ -913,7 +1051,7 @@ fn cli() -> ExitCode {
         }
         "mcp" => {
             if !args.iter().any(|a| a == "--attach") {
-                open_inputs(&mut s, &args)?;
+                open_inputs(&mut s, None, &args)?;
             }
             mcp(&mut s, &args)
         }
@@ -924,7 +1062,8 @@ fn cli() -> ExitCode {
             // calling it may have a timeout, and keeps the caps.
             s.long_runs = Some(progress);
             s.stoppable = std::io::stdin().is_terminal() && std::io::stderr().is_terminal();
-            open_inputs(&mut s, &args)?;
+            let strict = strict.as_ref();
+            open_inputs(&mut s, strict, &args)?;
             for (i, a) in args.iter().enumerate() {
                 if a == "--cmd"
                     && let Some(c) = args.get(i + 1)
@@ -933,14 +1072,14 @@ fn cli() -> ExitCode {
                         Some((id, json)) => (id, serde_json::from_str(json).map_err(|e| format!("{id}: bad JSON: {e}"))?),
                         None => (c.as_str(), Value::Null),
                     };
-                    let out = run(&mut s, id, p)?;
+                    let out = run_strict(&mut s, strict, id, p)?;
                     if !out.is_null() {
                         print(&out);
                     }
                 }
             }
             if let Some(p) = opt(&args, "--save") {
-                run(&mut s, "project.saveAs", json!({"path": p}))?;
+                run_strict(&mut s, strict, "project.saveAs", json!({"path": p}))?;
             }
             Ok(())
         }
@@ -950,7 +1089,7 @@ fn cli() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("rustgis-cli: {e}");
-            ExitCode::FAILURE
+            if strict.is_some_and(|strict| strict.stopped.get()) { ExitCode::from(LOSS_EXIT) } else { ExitCode::FAILURE }
         }
     }
 }
@@ -958,6 +1097,37 @@ fn cli() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ask_takes_up_to_four_pictures_and_says_what_it_refuses() {
+        // A 1 × 1 PNG.
+        const PNG: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52, 0x00, 0x00, 0x00, 0x01, 0x00,
+            0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4, 0x89, 0x00, 0x00, 0x00, 0x0A, 0x49, 0x44, 0x41, 0x54, 0x78,
+            0x9C, 0x63, 0x00, 0x01, 0x00, 0x00, 0x05, 0x00, 0x01, 0x0D, 0x0A, 0x2D, 0xB4, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45, 0x4E, 0x44,
+            0xAE, 0x42, 0x60, 0x82,
+        ];
+        let dir = std::env::temp_dir().join(format!("rustgis-cli-image-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let png = dir.join("map.png");
+        std::fs::write(&png, PNG).unwrap();
+        let png = png.display().to_string();
+        let ask = |images: &[&str]| {
+            let mut args = vec!["ask".to_string(), "Style it like this".into()];
+            for i in images {
+                args.extend(["--image".to_string(), i.to_string()]);
+            }
+            ask_pictures(&args)
+        };
+        let pictures = ask(&[&png]).unwrap();
+        assert_eq!((pictures[0].name.as_str(), pictures[0].width, pictures[0].height), ("map.png", 1, 1));
+        assert_eq!(ask_request(&["ask".into(), "--image".into(), png.clone(), "Style it".into()]).as_deref(), Some("Style it"));
+        // A fifth is refused before any is read; so is a file that isn't there.
+        let five = ask(&[&png, &png, &png, &png, "missing.png"]).unwrap_err();
+        assert!(five.contains("at most 4 pictures, 5 given"), "{five}");
+        assert!(ask(&["missing.png"]).unwrap_err().starts_with("missing.png: "));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use rustgis_engine::data::secrets::{MemorySecrets, Secret, SecretError};
     use std::sync::{Arc, Mutex};
 

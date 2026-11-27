@@ -38,6 +38,8 @@ pub const AUTO: &str = "auto";
 pub enum Script {
     /// Latin, Cyrillic, Greek or Georgian: covered by the interface fonts.
     Alphabetic,
+    /// Latin letters outside the bundled font's coverage.
+    LatinExtended,
     Cjk(CjkFont),
     /// Arabic script (Persian): a face with Arabic and Latin letters, drawn ahead of the
     /// interface font.
@@ -68,6 +70,7 @@ pub struct LangInfo {
     pub script: Script,
     source: &'static str,
     catalog: OnceLock<Catalog>,
+    letters: OnceLock<Vec<char>>,
     /// Catalog values in display form, for a language laid out back to front.
     visual: OnceLock<Catalog>,
 }
@@ -81,6 +84,7 @@ macro_rules! lang {
             script: $script,
             source: include_str!($file),
             catalog: OnceLock::new(),
+            letters: OnceLock::new(),
             visual: OnceLock::new(),
         }
     };
@@ -95,6 +99,7 @@ pub static LANGUAGES: [LangInfo; 22] = [
         script: Script::Alphabetic,
         source: "",
         catalog: OnceLock::new(),
+        letters: OnceLock::new(),
         visual: OnceLock::new(),
     },
     lang!("de", "Deutsch", "German", Script::Alphabetic, "de.tsv"),
@@ -106,9 +111,9 @@ pub static LANGUAGES: [LangInfo; 22] = [
     lang!("pt", "Português", "Portuguese", Script::Alphabetic, "pt.tsv"),
     lang!("ru", "Русский", "Russian", Script::Alphabetic, "ru.tsv"),
     lang!("tr", "Türkçe", "Turkish", Script::Alphabetic, "tr.tsv"),
-    lang!("az", "Azərbaycanca", "Azerbaijani", Script::Alphabetic, "az.tsv"),
+    lang!("az", "Azərbaycanca", "Azerbaijani", Script::LatinExtended, "az.tsv"),
     lang!("id", "Bahasa Indonesia", "Indonesian", Script::Alphabetic, "id.tsv"),
-    lang!("vi", "Tiếng Việt", "Vietnamese", Script::Alphabetic, "vi.tsv"),
+    lang!("vi", "Tiếng Việt", "Vietnamese", Script::LatinExtended, "vi.tsv"),
     lang!("fa", "فارسی", "Persian (Farsi)", Script::Arabic, "fa.tsv"),
     lang!("zh", "简体中文", "Chinese (Simplified)", Script::Cjk(CjkFont::SimplifiedChinese), "zh.tsv"),
     // Taiwan's wording (GIS terms after the National Academy for Educational Research's
@@ -264,6 +269,36 @@ impl Lang {
     pub fn all() -> impl Iterator<Item = Lang> {
         LANGUAGES.iter().map(Lang)
     }
+    /// Catalog letters and combining accents, plus punctuation and numerals in its Arabic,
+    /// Bengali, Lao or CJK script, sorted and deduplicated. Spaces and format controls need no glyphs.
+    /// Checked against the active UI fonts before switching languages; script names alone do
+    /// not describe coverage (Vietnamese and Azerbaijani also need extra Latin letters).
+    pub(crate) fn letters(self) -> &'static [char] {
+        self.0.letters.get_or_init(|| {
+            use rustgis_engine::render::fonts::ScriptFont;
+            let mut letters: Vec<char> = self.0.catalog().values().flat_map(|entries| entries.values()).flat_map(|text| text.chars())
+                .chain(self.name().chars())
+                .filter(|c| !c.is_whitespace() && !c.is_control() && *c != '\u{feff}')
+                .filter(|c| c.is_alphabetic() || matches!(*c,
+                    '\u{0300}'..='\u{036f}' | '\u{1ab0}'..='\u{1aff}' | '\u{1dc0}'..='\u{1dff}' | '\u{20d0}'..='\u{20ff}' | '\u{fe20}'..='\u{fe2f}'
+                    // Supported scripts have combining marks outside the common mark blocks.
+                    | '\u{064b}'..='\u{065f}' | '\u{0670}'
+                    | '\u{0981}'..='\u{0983}' | '\u{09bc}' | '\u{09be}'..='\u{09c4}' | '\u{09c7}'..='\u{09c8}'
+                    | '\u{09cb}'..='\u{09cd}' | '\u{09d7}' | '\u{09e2}'..='\u{09e3}' | '\u{09fe}'
+                    | '\u{0eb1}' | '\u{0eb4}'..='\u{0ebc}' | '\u{0ec8}'..='\u{0ece}'
+                ) || matches!((self.script(), ScriptFont::of(*c)),
+                    (Script::Arabic, Some(ScriptFont::Arabic))
+                    | (Script::Bengali, Some(ScriptFont::Bengali))
+                    | (Script::Lao, Some(ScriptFont::Lao))
+                    | (Script::Cjk(_), Some(ScriptFont::Cjk(_)))
+                ))
+                .collect();
+            letters.sort_unstable();
+            letters.dedup();
+            letters
+        })
+    }
+
     /// Number of translated strings.
     pub fn len(self) -> usize {
         self.0.catalog().values().map(HashMap::len).sum()
@@ -403,9 +438,11 @@ thread_local! {
     /// The same, in logical order, for messages whose placeholders are filled
     /// ([`fmt`]) or whose segments are joined ([`location`]) before they are shown.
     static PLUGIN_RAW_STRINGS: std::cell::RefCell<std::collections::HashSet<&'static str>> = Default::default();
-    /// Plugin lookups this frame and the ones before, misses included: (plugin revision, language,
-    /// logical and display results). `tr` runs for every label every frame.
-    static PLUGIN_CACHE_MAP: std::cell::RefCell<(u64, &'static str, std::collections::HashMap<String, Option<(&'static str, &'static str)>>)> =
+    /// Plugin lookups this frame and the ones before, misses included: (plugin and GeoLibre
+    /// translation revisions, language, logical and display results). `tr` runs for every label
+    /// every frame.
+    #[allow(clippy::type_complexity)]
+    static PLUGIN_CACHE_MAP: std::cell::RefCell<((u64, u64), &'static str, std::collections::HashMap<String, Option<(&'static str, &'static str)>>)> =
         Default::default();
 }
 
@@ -420,9 +457,10 @@ fn leak_once(seen: &mut std::collections::HashSet<&'static str>, s: String) -> &
     kept
 }
 
-/// `s` translated by a loaded plugin's `i18n`, in logical order and in display form.
+/// `s` translated by a loaded plugin's `i18n`, else by the GeoLibre tool translations kept for
+/// `lang` (#2224), in logical order and in display form.
 fn plugin_tr_pair(lang: Lang, s: &str) -> Option<(&'static str, &'static str)> {
-    let revision = rustgis_engine::plugins::revision();
+    let revision = (rustgis_engine::plugins::revision(), rustgis_engine::cmd::gp::geolibre_language_revision());
     PLUGIN_CACHE_MAP.with_borrow_mut(|(rev, code, map)| {
         if *rev != revision || *code != lang.code() || map.len() > PLUGIN_CACHE {
             *rev = revision;
@@ -432,7 +470,9 @@ fn plugin_tr_pair(lang: Lang, s: &str) -> Option<(&'static str, &'static str)> {
         if let Some(hit) = map.get(s) {
             return *hit;
         }
-        let found = rustgis_engine::plugins::translate(lang.code(), s).map(|t| {
+        let translated =
+            rustgis_engine::plugins::translate(lang.code(), s).or_else(|| rustgis_engine::cmd::gp::geolibre_translate(lang.code(), s));
+        let found = translated.map(|t| {
             let shown = rtl::visual(&t);
             let raw = PLUGIN_RAW_STRINGS.with_borrow_mut(|seen| leak_once(seen, t));
             let vis = PLUGIN_STRINGS.with_borrow_mut(|seen| leak_once(seen, shown));
@@ -456,9 +496,13 @@ fn plugin_tr_raw(lang: Lang, s: &str) -> Option<&'static str> {
 /// A location such as `Map › Navigate`, translated segment by segment and shown in
 /// display form as one line.
 pub fn location(loc: &str) -> String {
+    rtl::visual(&location_raw(loc))
+}
+
+/// A translated location in logical order, as typed into Command Search.
+pub(crate) fn location_raw(loc: &str) -> String {
     let lang = current();
-    let loc = loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ");
-    rtl::visual(&loc)
+    loc.split(" › ").map(|s| tr_raw(lang, s)).collect::<Vec<_>>().join(" › ")
 }
 
 /// Translates `template`, fills its `{name}` placeholders in one pass (values are never
@@ -471,11 +515,50 @@ pub fn fmt(template: &str, args: &[(&str, &str)]) -> String {
     rtl::visual(&fmt_raw(template, args))
 }
 
+/// An AI Assistant note (a transcript line, a picture refused), translated and filled in as
+/// [`fmt`] does.
+pub fn note(n: &rustgis_assistant::provider::Note) -> String {
+    rtl::visual(&note_raw(n))
+}
+
+/// [`note`] in logical order, for a value going into another message ([`fmt`] puts the whole
+/// in display form once).
+pub fn note_raw(n: &rustgis_assistant::provider::Note) -> String {
+    let args: Vec<(&str, &str)> = n.args.iter().map(|(k, v)| (*k, v.as_str())).collect();
+    fmt_raw(n.template, &args)
+}
+
+/// `logical`, a message made in logical order (of parts from [`fmt_raw`] and [`t_raw`]), in
+/// display form, as [`fmt`] gives its message: for a message put together from parts, which
+/// is put in display form once, as a whole.
+pub(crate) fn display(logical: &str) -> String {
+    rtl::visual(logical)
+}
+
 /// [`fmt`] in logical order, without the display form: for a message shown with
 /// [`paragraph`], which fits a right-to-left message to its rows and puts each row in
 /// display form itself.
 pub fn fmt_raw(template: &str, args: &[(&str, &str)]) -> String {
     fill_placeholders(tr_raw(current(), template), args)
+}
+
+/// Translates a whole-file size refusal, keeping the file name and limit as literal arguments.
+pub(crate) fn file_size_error(error: &str, format: impl FnOnce(&str, &[(&str, &str)]) -> String) -> Option<String> {
+    use rustgis_engine::data::io::FileSizeAdvice;
+    let (name, limit, advice) = rustgis_engine::data::io::file_size_error_args(error)?;
+    let args = &[("name", name), ("limit", limit)];
+    let template = match advice {
+        FileSizeAdvice::Split => {
+            "{name} is too large to open (limit {limit} MiB). Split the data into smaller files and import each one separately."
+        }
+        FileSizeAdvice::Vector => {
+            "{name} is too large to open (limit {limit} MiB). Split it into smaller files, or convert vector data to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+        FileSizeAdvice::Shapefile => {
+            "{name} is too large to open (limit {limit} MiB). Split the whole Shapefile, or convert it to FlatGeobuf or GeoPackage and open it on the desktop."
+        }
+    };
+    Some(format(template, args))
 }
 
 /// Translates a template in its context, then fills placeholders before RTL display conversion.

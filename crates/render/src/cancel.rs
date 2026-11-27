@@ -6,7 +6,8 @@
 //! back as `None`, without its tiles, labels or effects worked out.
 //! With none installed (an export, the CLI, the browser) frames always finish. The flag is the
 //! thread's own: threads the renderer starts for a part of the frame (a raster's rows) don't look
-//! at it, and finish their part. A long step without a look (projecting or thinning a layer's
+//! at it, and finish their part, except those drawing a layer's bands, which are handed it
+//! ([`current`]) and look every [`crate::bands`] `LOOK_EVERY` things drawn. A long step without a look (projecting or thinning a layer's
 //! geometry for the first time, a raster, a single feature's path) runs to its end.
 
 use std::cell::RefCell;
@@ -40,6 +41,11 @@ impl Drop for Installed {
     }
 }
 
+/// The flag installed on this thread, to hand to threads drawing part of its frame.
+pub(crate) fn current() -> Option<Arc<AtomicBool>> {
+    FLAG.try_with(|f| f.borrow().clone()).ok().flatten()
+}
+
 /// Whether the frame being drawn on this thread was asked to stop.
 pub(crate) fn requested() -> bool {
     // Never during the thread's teardown: no frame is drawn that late.
@@ -52,6 +58,7 @@ thread_local! {
     pub(crate) static DRAWN: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;

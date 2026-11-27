@@ -144,6 +144,11 @@ pub fn has_token() -> bool {
     lock(token_store()).is_some()
 }
 
+/// Whether the token kept has expired, as its JWT says (it is forgotten when next used).
+pub fn token_expired() -> bool {
+    lock(token_store()).as_deref().is_some_and(|t| expired(t, now_secs()))
+}
+
 /// When the token kept expires (Unix seconds), as its JWT `exp` claim says, if it says.
 pub fn token_expiry() -> Option<i64> {
     lock(token_store()).as_deref().and_then(jwt_expiry)
@@ -797,6 +802,7 @@ pub fn recent(days: i64) -> (String, String) {
     (date_of(now - days * 86_400), date_of(now))
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -871,6 +877,7 @@ mod tests {
         set_token(Some(LASTING)).unwrap();
         assert!(has_token());
         assert_eq!(token_expiry(), Some(4_000_000_000));
+        assert!(!token_expired());
         assert_eq!(authorization(DATA).as_deref(), Some(format!("Bearer {LASTING}").as_str()));
         assert_eq!(authorization("https://urs.earthdata.nasa.gov/a"), None);
         assert_eq!(authorization("https://d1.cloudfront.net/a.tif"), None);
@@ -882,6 +889,10 @@ mod tests {
         // Not a JWT: kept, with no expiry.
         set_token(Some("abc")).unwrap();
         assert_eq!(token_expiry(), None);
+        assert!(!token_expired());
+        // An expired token is kept until it is next used; the ribbon's key shows it isn't usable.
+        set_token(Some(EXPIRED)).unwrap();
+        assert!(has_token() && token_expired());
         set_token(Some("  ")).unwrap();
         assert!(!has_token());
     }

@@ -19,9 +19,11 @@ use crate::layout::{MAX_PIXELS, PageInfo, expand, page_geometry, record_element,
 /// Writes `layout` as an SVG document, pictures drawn at `dpi`, and the elements (id and name)
 /// drawn as pictures because their vectors would pass the budget. Refuses a source changed during drawing.
 pub fn layout_svg(layout: &Layout, maps: &mut [Map], dpi: f64, info: &PageInfo) -> Result<(String, Vec<(u32, String)>), String> {
+    let _budget = crate::layout::legend_budget();
     let revisions = crate::layout::archive_revisions(layout, maps);
     let mut source_error = None;
     let result = layout_svg_inner(layout, maps, dpi, info, &mut source_error);
+    crate::layout::finish_legends()?;
     revisions.finish_revision(
         crate::layout::archive_revisions(layout, maps),
         result,
@@ -59,7 +61,9 @@ fn layout_svg_inner(
     if !defs.text.is_empty() {
         let _ = write!(s, "<defs>\n{}</defs>\n", defs.text);
     }
-    let _ = writeln!(s, r##"<rect width="{}" height="{}" fill="#ffffff"/>"##, num(pw), num(ph));
+    // The page's colour (#2855), white unless given; its channels alone, opaque as the PNG's.
+    let paper = layout.paper.map_or_else(|| "#ffffff".to_string(), |c| format!("#{:02x}{:02x}{:02x}", c.r(), c.g(), c.b()));
+    let _ = writeln!(s, r##"<rect width="{}" height="{}" fill="{paper}"/>"##, num(pw), num(ph));
     body.insert_str(0, &s);
     body.push_str("</svg>\n");
     Some((body, pictured))
@@ -77,6 +81,7 @@ fn elements(
     source_error: &mut Option<String>,
 ) -> Option<String> {
     let ppp = page_geometry(layout, dpi).2 / PT_PER_MM;
+    let env = crate::layout::series_env(layout, maps);
     let mut s = String::new();
     // The elements drawn as pictures (past the budget): their places, filled in at the end at
     // the resolution they share.
@@ -85,9 +90,27 @@ fn elements(
     let mut written = 0usize;
     for e in layout.elements.iter().filter(|e| e.visible) {
         let _ = writeln!(s, r#"<g id="element-{}" inkscape:label="{}" inkscape:groupmode="layer">"#, e.id, esc(&e.name));
+        // Its background first, as a shape of its own (#2257): the content drawn as a picture
+        // below leaves it out (`draw_page` draws backgrounds only on the whole page).
+        background(&mut s, e);
         let (x, y, w, h) = (e.x, e.y, e.w, e.h);
         match &e.kind {
-            ElementKind::Text { text: t, size, color, bold, italic, align, letter_spacing, font, font_name, rotation } => {
+            ElementKind::Text {
+                text: t,
+                size,
+                color,
+                bold,
+                italic,
+                align,
+                letter_spacing,
+                font,
+                font_name,
+                rotation,
+                wrap,
+                valign,
+                line_spacing,
+                case,
+            } => {
                 let first = layout.first_frame().and_then(|id| layout.element(id)).and_then(|f| match &f.kind {
                     ElementKind::MapFrame { map, center, scale, bearing, pitch, .. } => {
                         let m = maps.iter().find(|m| m.name.eq_ignore_ascii_case(map))?;
@@ -95,10 +118,18 @@ fn elements(
                     }
                     _ => None,
                 });
-                let text = expand(t, layout, info, first);
-                // As the page draws it: the size in points, lines 1.25 apart, the first baseline
-                // 0.6 of the size below the top, lines past the frame left out.
+                let style = crate::layout::text_style(*bold, *italic, *font, font_name.as_deref(), *align, *letter_spacing)
+                    .with_block(*valign, *line_spacing);
+                // Its tokens filled in, then its case, then, wrapped, the lines the page breaks it
+                // into (#2346), each its own line ([`crate::layout::drawn_text`]).
+                let text = crate::layout::drawn_text(expand(t, layout, info, first), *case, *wrap, w, *size, style);
+                // As the page draws it: the size in points, the block at the top, middle or bottom
+                // of the box (from the top when taller than it), lines 1.25 em times the line
+                // spacing apart, the first baseline 0.6 of the size below the block's top, lines
+                // past the frame left out.
                 let em = size.clamp(2.0, 400.0) * 1.33 / PT_PER_MM;
+                let ls = f64::from(style.line_spacing);
+                let top = y + crate::layout::text_shift(style.valign, h, em, &text, ls);
                 let (anchor, tx) = match align {
                     TextAlign::Left => ("start", x),
                     TextAlign::Center => ("middle", x + w / 2.0),
@@ -108,7 +139,7 @@ fn elements(
                     .lines()
                     .take(200)
                     .enumerate()
-                    .map(|(i, l)| (y + em * (0.6 + 1.25 * i as f64), l))
+                    .map(|(i, l)| (top + em * (0.6 + 1.25 * ls * i as f64), l))
                     .take_while(|(ly, _)| *ly <= y + h + em)
                     .collect();
                 // A named family first (#762), quoted as CSS has it (its own backslashes and
@@ -122,7 +153,7 @@ fn elements(
                     s,
                     r#"<text x="{}" y="{}" font-family="{}" font-size="{}" font-weight="{}" font-style="{}" text-anchor="{anchor}" letter-spacing="{}"{} xml:space="preserve""#,
                     num(tx),
-                    num(lines.first().map_or(y + em * 0.6, |l| l.0)),
+                    num(lines.first().map_or(top + em * 0.6, |l| l.0)),
                     esc(&family),
                     num(em),
                     if *bold { "bold" } else { "normal" },
@@ -180,7 +211,8 @@ fn elements(
                 // bounds; past the budget (its own, or the page's with the elements before it), a
                 // picture of it at the pictures' resolution.
                 let mut frames = Vec::new();
-                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, info, &mut frames, source_error)? {
+                if let Some((drawing, [ix, iy, ..], k)) = record_element(layout, e.id, maps, dpi, (info, &env), &mut frames, source_error)?
+                {
                     let total = written.saturating_add(drawing.cost());
                     if !drawing.overflowed() && total <= crate::vector::max_cost() {
                         written = total;
@@ -205,7 +237,7 @@ fn elements(
     let picture_dpi = picture_dpi(layout, dpi, |e| as_pictures.contains(&e.id));
     for id in as_pictures {
         let mut image_tag = String::new();
-        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, info, source_error)? {
+        if let Some((image, [ix, iy, iw, ih])) = render_element(layout, id, maps, picture_dpi, (info, &env), source_error)? {
             let png = image.encode_png().ok()?;
             let _ = writeln!(
                 image_tag,
@@ -306,6 +338,28 @@ fn stroke(color: rustgis_map::Rgba, width: f64, dash: Option<&rustgis_map::symbo
     } else {
         r#" stroke="none""#.into()
     }
+}
+
+/// An element's background (#2257) as a `<rect>`: its box grown by the padding, its corners
+/// rounded as the page rounds them (at most half the shorter side), turned with a turned text.
+fn background(s: &mut String, e: &rustgis_map::layout::Element) {
+    let Some(b) = e.background else { return };
+    let (x, y, w, h) = e.background_box();
+    let _ = write!(
+        s,
+        r#"<rect x="{}" y="{}" width="{}" height="{}" rx="{}"{}{}"#,
+        num(x),
+        num(y),
+        num(w),
+        num(h),
+        num(b.radius.min(w.min(h) / 2.0).max(0.0)),
+        paint("fill", b.fill),
+        stroke(b.outline, b.width, None)
+    );
+    if e.rotation() != 0.0 {
+        let _ = write!(s, r#" transform="rotate({} {} {})""#, num(e.rotation()), num(e.x + e.w / 2.0), num(e.y + e.h / 2.0));
+    }
+    s.push_str("/>\n");
 }
 
 /// ` fill="#rrggbb"` (or stroke), with its opacity when it isn't opaque.
@@ -436,6 +490,8 @@ mod tests {
                 exclude: vec![],
                 columns: 1,
                 labels: Default::default(),
+                color: None,
+                text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             },
         );
         assert_eq!(picture_dpi(&layout, 600.0, |e| !written_as_svg(e)), 600.0);
@@ -476,6 +532,8 @@ mod tests {
                 exclude: vec![],
                 columns: 1,
                 labels: Default::default(),
+                color: None,
+                text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             },
         );
         let info = PageInfo::default();
@@ -490,13 +548,14 @@ mod tests {
         assert!(key.contains(r#"aria-label="Map legend""#) && key.contains("<use xlink:href=\"#glyph"));
         assert!(svg.contains("<defs>") && svg.find("<defs>") < svg.find("<g id=\"element-"));
         // A surround drawn as a picture (past the budget) keeps its page context and transparency.
-        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
+        let (pm, _) = render_element(&layout, legend, &mut maps, 72.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         assert!(pm.pixels().iter().any(|p| p.alpha() == 0), "no opaque page behind the legend");
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the title still uses the frame context");
         let (mut base, mut maps, _) = page();
         let mut expected = crate::layout::render(&base, &mut maps, 72.0, &info).unwrap();
         assert!(pm.width() < expected.width() / 2 && pm.height() < expected.height() / 2, "only the surround's bounds are allocated");
-        let (image, [x, y, ..]) = render_element(&layout, legend, &mut maps, 72.0, &info, &mut None).unwrap().unwrap();
+        let (image, [x, y, ..]) =
+            render_element(&layout, legend, &mut maps, 72.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         let k = PT_PER_MM * 72.0 / 96.0;
         expected.draw_pixmap(
             (x * k).round() as i32,
@@ -531,7 +590,7 @@ mod tests {
         let (mut layout, mut maps, _) = page();
         let id = layout.add("Picture", (-5.3, 70.2, 20.7, 20.0), ElementKind::Picture { image: String::new() });
         let info = PageInfo::default();
-        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().unwrap();
+        let (pm, bounds) = render_element(&layout, id, &mut maps, 36.0, (&info, &Default::default()), &mut None).unwrap().unwrap();
         let [x, y, w, h] = bounds;
         let k = PT_PER_MM * 36.0 / 96.0;
         assert_eq!(x, 0.0);
@@ -542,7 +601,7 @@ mod tests {
         // Placed at its pixel bounds, as its picture would be.
         assert!(svg.contains(&format!(r#"<g transform="translate({} {}) scale("#, num(x), num(y))), "{svg}");
         layout.element_mut(id).unwrap().x = 110.0;
-        assert!(render_element(&layout, id, &mut maps, 36.0, &info, &mut None).unwrap().is_none());
+        assert!(render_element(&layout, id, &mut maps, 36.0, (&info, &Default::default()), &mut None).unwrap().is_none());
         assert!(layout_svg(&layout, &mut maps, 36.0, &info).is_ok(), "an off-page image is harmless");
     }
 
@@ -598,5 +657,203 @@ mod tests {
         assert_eq!(esc("valid\u{fffe}\u{ffff}\t🙂"), "valid\t🙂");
         assert_eq!(paint("fill", rustgis_map::Rgba::new(255, 0, 16, 128)), r##" fill="#ff0010" fill-opacity="0.502""##);
         assert_eq!(stroke(rustgis_map::Rgba::rgb(0, 0, 0), 0.0, None), r#" stroke="none""#);
+    }
+
+    /// A wrapped text (#2346) is written in the lines the page draws it in, one `<tspan>` each,
+    /// placed as the page places them; unwrapped, it is written on its own line breaks.
+    #[test]
+    fn a_wrapped_text_is_written_in_its_drawn_lines() {
+        use rustgis_map::layout::{ElementKind, TextAlign};
+        let note = "Population counts from the 2020 census; boundaries simplified for print";
+        let svg = |wrap: bool| {
+            let mut layout = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text(note, 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { wrap: w, .. } = &mut kind {
+                *w = wrap;
+            }
+            layout.add("Note", (10.0, 10.0, 40.0, 60.0), kind);
+            layout_svg(&layout, &mut [], 96.0, &PageInfo::default()).unwrap().0
+        };
+        let plain = svg(false);
+        assert!(!plain.contains("<tspan") && plain.contains(note), "one line: {plain}");
+        let style = crate::layout::TextStyle {
+            face: crate::text::Face::default(),
+            align: TextAlign::Left,
+            spacing: 0.0,
+            valign: rustgis_map::layout::TextVAlign::Top,
+            line_spacing: 1.0,
+        };
+        let lines = crate::layout::wrapped(note, 40.0, 12.0, style);
+        let wrapped = svg(true);
+        assert!(lines.lines().count() > 3, "{lines}");
+        assert_eq!(wrapped.matches("<tspan").count(), lines.lines().count(), "{wrapped}");
+        for line in lines.lines() {
+            assert!(wrapped.contains(&format!(">{}</tspan>", esc(line))), "{line}: {wrapped}");
+        }
+    }
+
+    /// A text's block in SVG sits, is spaced and is cased as the page draws it, turned about the
+    /// same centre, its cased words escaped; a block taller than its box keeps its first lines, as
+    /// on the page; and a setting that is not a value writes the plain text, nothing not a number.
+    #[test]
+    fn a_text_block_is_written_where_the_page_draws_it() {
+        use rustgis_map::layout::{TextCase, TextVAlign};
+        let turned = |text: &str, h: f64, v: TextVAlign, ls: f64, c: TextCase, turn: f64| {
+            let mut l = Layout::new("SVG", 100.0, 80.0);
+            let mut kind = ElementKind::text(text, 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { valign, line_spacing, case, rotation, .. } = &mut kind {
+                (*valign, *line_spacing, *case, *rotation) = (v, ls, c, turn);
+            }
+            l.add("Text", (30.0, 10.0, 30.0, h), kind);
+            layout_svg(&l, &mut [], 72.0, &PageInfo::default()).unwrap().0
+        };
+        let page = |text: &str, h: f64, v: TextVAlign, ls: f64, c: TextCase| turned(text, h, v, ls, c, 0.0);
+        let spans = |svg: &str| -> Vec<(f64, String)> {
+            svg.split("<tspan ")
+                .skip(1)
+                .filter_map(|t| {
+                    let y = t.split("y=\"").nth(1)?.split('"').next()?.parse().ok()?;
+                    Some((y, t.split('>').nth(1)?.split('<').next()?.to_string()))
+                })
+                .collect()
+        };
+        let got = spans(&page("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::Upper));
+        assert_eq!(got.iter().map(|s| s.1.as_str()).collect::<Vec<_>>(), ["ONE", "TWO", "THREE"]);
+        let em = 10.0 * 1.33 / PT_PER_MM;
+        assert!(((got[1].0 - got[0].0) - em * 1.25 * 1.5).abs() < 0.01, "{got:?}");
+        assert!((got[2].0 - (70.0 - em * 1.25 + em * 0.6)).abs() < 0.01, "the last on the bottom: {got:?}");
+        let tall = "one\ntwo\nthree\nfour\nfive";
+        let from_top = spans(&page(tall, 9.0, TextVAlign::Top, 1.0, TextCase::None));
+        assert!(!from_top.is_empty(), "two lines fit");
+        assert_eq!(spans(&page(tall, 9.0, TextVAlign::Bottom, 1.0, TextCase::None)), from_top, "taller than its box: from the top");
+        // Middle: half the free height above the block, the first line 0.6 em below its top.
+        let middle = spans(&page("one\ntwo\nthree", 60.0, TextVAlign::Middle, 1.5, TextCase::None));
+        let block = em * 1.25 * (1.0 + 2.0 * 1.5);
+        assert!((middle[0].0 - (10.0 + (60.0 - block) / 2.0 + em * 0.6)).abs() < 0.01, "{middle:?}");
+        // Turned, the block moves down its box as upright, the turn about the box's centre.
+        let bottom = page("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::None);
+        let turned_top = turned("one\ntwo\nthree", 60.0, TextVAlign::Top, 1.5, TextCase::None, 90.0);
+        let turned_bottom = turned("one\ntwo\nthree", 60.0, TextVAlign::Bottom, 1.5, TextCase::None, 90.0);
+        for svg in [&turned_top, &turned_bottom] {
+            assert!(svg.contains(r#"transform="rotate(90 45 40)""#), "{svg}");
+        }
+        assert_eq!(spans(&turned_bottom), spans(&bottom), "the same lines as upright");
+        let (top_first, bottom_first) = (spans(&turned_top)[0].0, spans(&turned_bottom)[0].0);
+        assert!((bottom_first - top_first - (60.0 - block)).abs() < 0.01, "down by the free height: {top_first} {bottom_first}");
+        // Its cased words are escaped as any text's.
+        let amp = page("a & b < c", 60.0, TextVAlign::Top, 1.0, TextCase::Upper);
+        assert!(amp.contains(">A &amp; B &lt; C</text>"), "{amp}");
+        // Not a value: the plain text, with nothing not a number written.
+        let plain = page("one\ntwo\nthree", 60.0, TextVAlign::Top, 1.0, TextCase::None);
+        for odd in [
+            page("one\ntwo\nthree", 60.0, TextVAlign::Invalid, f64::NAN, TextCase::Invalid),
+            page("one\ntwo\nthree", 60.0, TextVAlign::Top, f64::INFINITY, TextCase::None),
+        ] {
+            assert_eq!(odd, plain);
+            assert!(!odd.contains("NaN") && !odd.contains("inf"), "{odd}");
+        }
+    }
+
+    /// The vector PDF records the block as the page draws it: a block's PDF differs from the plain
+    /// text's, an upper-case text's is the same as one typed in capitals, and the plain one is still
+    /// main's (`plain_texts_export_as_before`).
+    #[test]
+    fn a_text_block_reaches_the_pdf() {
+        use rustgis_map::layout::{TextCase, TextVAlign};
+        let pdf_of = |text: &str, v: TextVAlign, ls: f64, c: TextCase| {
+            let mut l = Layout::new("PDF", 100.0, 80.0);
+            let mut kind = ElementKind::text(text, 10.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { valign, line_spacing, case, .. } = &mut kind {
+                (*valign, *line_spacing, *case) = (v, ls, c);
+            }
+            l.add("Text", (30.0, 10.0, 30.0, 60.0), kind);
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut [], 150.0, &PageInfo::default()).unwrap();
+            crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Block")
+        };
+        let pdf = |v: TextVAlign, ls: f64, c: TextCase| pdf_of("one\ntwo\nthree", v, ls, c);
+        let plain = pdf(TextVAlign::Top, 1.0, TextCase::None);
+        let block = pdf(TextVAlign::Bottom, 1.5, TextCase::Upper);
+        assert!(plain.starts_with(b"%PDF") && block.starts_with(b"%PDF"), "both write");
+        assert_ne!(plain, block, "the block's case, shift and spacing reach the PDF");
+        // Each setting alone changes what is recorded.
+        for (v, ls, c) in
+            [(TextVAlign::Bottom, 1.0, TextCase::None), (TextVAlign::Top, 1.5, TextCase::None), (TextVAlign::Top, 1.0, TextCase::Upper)]
+        {
+            assert_ne!(pdf(v, ls, c), plain, "{v:?} {ls} {c:?}");
+        }
+        let typed = pdf_of("ONE\nTWO\nTHREE", TextVAlign::Top, 1.0, TextCase::None);
+        assert!(pdf(TextVAlign::Top, 1.0, TextCase::Upper) == typed, "upper case records the capitals as typed");
+    }
+
+    /// An element's background (#2257) is a `<rect>` of its own under the element, its box grown
+    /// by the padding, turned with a turned text; an element with none has none.
+    #[test]
+    fn a_background_is_its_own_rect_under_the_element() {
+        use rustgis_map::layout::{Background, ElementKind};
+        let svg = |turn: f64, background: Option<Background>| {
+            let mut layout = Layout::new("L", 100.0, 100.0);
+            let mut kind = ElementKind::text("Fonte", 12.0, rustgis_map::Rgba::rgb(0, 0, 0), false);
+            if let ElementKind::Text { rotation, .. } = &mut kind {
+                *rotation = turn;
+            }
+            let id = layout.add("T", (40.0, 40.0, 20.0, 10.0), kind);
+            layout.element_mut(id).unwrap().background = background;
+            layout_svg(&layout, &mut [], 96.0, &PageInfo::default()).unwrap().0
+        };
+        // The page's own paper is a rect too: the background is one more, and none by default.
+        let plain = svg(0.0, None).matches("<rect").count();
+        let b = Background {
+            outline: rustgis_map::Rgba::rgb(0, 0, 0),
+            width: 1.0,
+            radius: 2.0,
+            padding: 1.5,
+            ..Background::filled(rustgis_map::Rgba::new(255, 255, 255, 204))
+        };
+        let s = svg(0.0, Some(b));
+        let rect = r##"<rect x="38.5" y="38.5" width="23" height="13" rx="2" fill="#ffffff" fill-opacity="0.8""##;
+        assert_eq!(s.matches("<rect").count(), plain + 1, "{s}");
+        assert!(s.find(rect).is_some_and(|at| at < s.find("<text").unwrap_or(0)), "under the text: {s}");
+        let turned = svg(90.0, Some(b));
+        assert!(turned.contains(r#"stroke-width="0.265" transform="rotate(90 50 45)"/>"#), "turned about the box's centre: {turned}");
+    }
+
+    /// 64-bit FNV-1a over a byte slice.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn fnv(b: &[u8]) -> u64 {
+        b.iter().fold(0xcbf2_9ce4_8422_2325, |h, b| (h ^ u64::from(*b)).wrapping_mul(0x0100_0000_01b3))
+    }
+
+    /// How [`plain_texts_export_as_before`]'s pages were written as SVG and as a vector PDF before
+    /// texts had a block alignment, line spacing or case; in the built-in face.
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_SVG: u64 = 0xf2dd_eccc_ab7b_44bc;
+    #[cfg(not(target_arch = "wasm32"))]
+    const PINNED_TEXT_PDF: u64 = 0xf770_433e_0662_5b2e;
+
+    /// The SVG and the vector PDF of a text with none of the block settings are byte for byte main's:
+    /// in a process of its own, told to use the built-in face before any text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn plain_texts_export_as_before() {
+        if std::env::var_os("RUSTGIS_TEXT_EXPORT_PIN_CHILD").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "svg::tests::plain_texts_export_as_before", "--nocapture"])
+                .env("RUSTGIS_TEXT_EXPORT_PIN_CHILD", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        let info = PageInfo { page: 2, pages: 3, page_name: String::new() };
+        let (mut svg, mut pdf) = (Vec::new(), Vec::new());
+        for l in crate::layout::plain_text_pages() {
+            svg.extend(layout_svg(&l, &mut [], 72.0, &info).unwrap().0.into_bytes());
+            let (drawing, _) = crate::layout::render_drawing(&l, &mut [], 150.0, &info).unwrap();
+            pdf.extend(crate::pdf::write(&[crate::pdf::Page::drawing(drawing, l.width, l.height)], "Plain"));
+        }
+        let (s, p) = (fnv(&svg), fnv(&pdf));
+        assert_eq!((s, p), (PINNED_TEXT_SVG, PINNED_TEXT_PDF), "{s:#x} {p:#x}");
     }
 }

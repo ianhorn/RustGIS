@@ -26,8 +26,9 @@ const MAX_TILES: usize = 4 << 20;
 /// How many tiles all the levels hold together (their offsets and lengths are kept, 16 bytes a
 /// tile): about 128 MB at most.
 const MAX_TOTAL_TILES: usize = 8 << 20;
-/// The largest tile, in samples.
-const MAX_TILE_SAMPLES: usize = 4 << 20;
+/// The largest tile, in bytes once read: each value as the `f32` it is kept as, a 64-bit one as
+/// the 8 bytes it is decoded to before that.
+pub(crate) const MAX_TILE_BYTES: usize = 32 << 20;
 /// The most bytes held from a file's header (its IFDs and their tag arrays).
 pub const MAX_HEADER: u64 = 32 << 20;
 
@@ -241,7 +242,9 @@ pub struct Layout {
     /// What the header holds but isn't read: a colour table or GDAL metadata that doesn't decode,
     /// a colour table too short for its pixels. One line each, for a window to say (AGENTS.md,
     /// Never silent); drawing in place shows the file grey without them, as before.
-    pub lost: Vec<String>,
+    pub lost: crate::loss::Notes,
+    /// Who holds the rights to the picture (its Copyright tag), as [`super::Raster::copyright`].
+    pub copyright: Option<String>,
 }
 
 impl Layout {
@@ -294,7 +297,7 @@ fn err(e: impl std::fmt::Display) -> DataError {
 
 fn limits() -> Limits {
     let mut l = Limits::default();
-    l.decoding_buffer_size = MAX_TILE_SAMPLES * 8;
+    l.decoding_buffer_size = MAX_TILE_BYTES;
     l.intermediate_buffer_size = 64 << 20;
     l.ifd_value_size = 16 << 20;
     l
@@ -305,7 +308,13 @@ pub fn is_tiff(bytes: &[u8]) -> bool {
     matches!(bytes.get(..4), Some([b'I', b'I', 42 | 43, 0] | [b'M', b'M', 0, 42 | 43]))
 }
 
-/// The layout of a tiled GeoTIFF, from the bytes read so far.
+/// The bytes a tile of `tw × th` pixels and `per_chunk` bands takes once read (see
+/// [`MAX_TILE_BYTES`]).
+fn tile_bytes(tw: u32, th: u32, per_chunk: usize, bits: u16) -> u64 {
+    let width = if bits > 32 { 8 } else { 4 };
+    u64::from(tw).saturating_mul(u64::from(th)).saturating_mul(per_chunk as u64).saturating_mul(width)
+}
+
 /// Takes a level's `n` tiles from what all the levels may hold together.
 fn take_tiles(allowance: &mut usize, n: usize) -> Result<()> {
     if n > MAX_TILES || n > *allowance {
@@ -315,6 +324,7 @@ fn take_tiles(allowance: &mut usize, n: usize) -> Result<()> {
     Ok(())
 }
 
+/// The layout of a tiled GeoTIFF, from the bytes read so far.
 pub fn layout(bytes: &Sparse) -> Result<Parse> {
     let r = bytes.reader();
     let watch = r.clone();
@@ -384,7 +394,26 @@ fn read_layout(r: Sparse) -> Result<Parse> {
         Err(e) => Ok(Err(e.to_string())),
     };
     // Another body's system is said, as when the file is read whole.
-    let mut lost: Vec<String> = super::planetary::note_of(geo.0).into_iter().collect();
+    let mut lost: crate::loss::Notes = super::planetary::note_of(geo.0).into_iter().collect();
+    // A datum assumed, and the file's copyright, as when it is read whole.
+    if geo.3 {
+        lost.push(crate::loss::Note::loss(crate::loss::LossCode::AssumedCrs, super::geotiff::NO_EPSG_GEOGRAPHIC));
+    }
+    // Its bytes asked for when not read yet, as the other tags' are.
+    let copyright = match tag(&mut dec, Tag::Copyright)? {
+        Ok(None) => None,
+        Ok(Some(v)) => match v.into_string() {
+            Ok(c) => Some(c.trim().to_string()),
+            Err(e) => {
+                lost.push(format!("its Copyright tag: it isn't ASCII text ({e}), so it is left out"));
+                None
+            }
+        },
+        Err(e) => {
+            lost.push(format!("its Copyright tag: it can't be read ({e}), so it is left out"));
+            None
+        }
+    };
     let palette = match color {
         ColorHint::Gray if palette_image => match tag(&mut dec, Tag::ColorMap)? {
             Ok(None) => {
@@ -433,8 +462,10 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     let mut index = 0usize;
     let mut allowance = MAX_TOTAL_TILES;
     // Overviews left out for a sample count other than the full image's (its tag's, which a
-    // JPEG YCbCr image's decoded bands may differ from), and how many.
+    // JPEG YCbCr image's decoded bands may differ from), or another alpha role for the sample past
+    // the colour ones (an RGBA overview of an RGBI image would show its NIR as alpha), and how many.
     let full_samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
+    let full_alpha = super::geotiff::extra_alpha(&mut dec);
     let mut mismatched: Vec<String> = Vec::new();
     let mut mismatched_count = 0usize;
     // Images no smaller than the full image in both width and height (not overviews), and how many.
@@ -475,6 +506,7 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             // passed over too. All are said, and skipped before a tile size is checked or their
             // tiles count against the budget.
             let samples = dec.find_tag_unsigned::<u16>(Tag::SamplesPerPixel).ok().flatten().unwrap_or(1);
+            let alpha = super::geotiff::extra_alpha(&mut dec);
             let passed = match levels.first().map(|l| (l.width, l.height)) {
                 // The full image itself.
                 None => false,
@@ -485,10 +517,17 @@ fn read_layout(r: Sparse) -> Result<Parse> {
                     }
                     true
                 }
-                Some(_) if samples != full_samples => {
+                Some(_) if samples != full_samples || alpha != full_alpha => {
                     mismatched_count += 1;
                     if mismatched.len() < 5 {
-                        mismatched.push(format!("image {index} ({samples})"));
+                        let role = if alpha == full_alpha {
+                            ""
+                        } else if alpha {
+                            ", with alpha"
+                        } else {
+                            ", without alpha"
+                        };
+                        mismatched.push(format!("image {index} ({samples}{role})"));
                     }
                     true
                 }
@@ -515,8 +554,25 @@ fn read_layout(r: Sparse) -> Result<Parse> {
                 index += 1;
                 continue;
             }
-            if tw == 0 || th == 0 || (tw as usize).saturating_mul(th as usize).saturating_mul(per_chunk) > MAX_TILE_SAMPLES {
+            if tw == 0 || th == 0 {
                 return Err(err(format!("tiles of {tw} × {th} pixels")));
+            }
+            let level_bits =
+                dec.find_tag_unsigned_vec::<u16>(Tag::BitsPerSample).ok().flatten().and_then(|v| v.first().copied()).unwrap_or(bits);
+            let bytes = tile_bytes(tw, th, per_chunk, level_bits);
+            if bytes > MAX_TILE_BYTES as u64 {
+                let (mib, max) = (bytes.div_ceil(1 << 20), MAX_TILE_BYTES >> 20);
+                // Bands stored apart help only when one band's tile then fits.
+                let apart = per_chunk > 1 && tile_bytes(tw, th, 1, level_bits) <= MAX_TILE_BYTES as u64;
+                let of_bands = if per_chunk > 1 { format!(" of {per_chunk} interleaved bands") } else { String::new() };
+                let fix = if apart {
+                    "smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
+                } else {
+                    "smaller tiles (GDAL's BLOCKSIZE creation option)"
+                };
+                return Err(err(format!(
+                    "tiles of {tw} × {th} pixels{of_bands} take {mib} MiB each once read, more than the {max} MiB one tile may take: write the file with {fix}"
+                )));
             }
             // Every band plane's tiles, when the bands are stored apart.
             let n = (w.div_ceil(tw) as usize).saturating_mul(h.div_ceil(th) as usize).saturating_mul(planes);
@@ -531,7 +587,12 @@ fn read_layout(r: Sparse) -> Result<Parse> {
             counts.truncate(n);
             levels.push(Level { ifd: index, width: w, height: h, tile_width: tw, tile_height: th, offsets, counts });
         }
-        if levels.len() >= MAX_LEVELS || !dec.more_images() {
+        if !dec.more_images() {
+            break;
+        }
+        // Sorted below, so a file storing its overviews smallest first loses its finest: said.
+        if levels.len() >= MAX_LEVELS {
+            lost.push(format!("the scan for overviews stopped at {MAX_LEVELS} levels: later images aren't read"));
             break;
         }
         dec.next_image().map_err(err)?;
@@ -552,7 +613,8 @@ fn read_layout(r: Sparse) -> Result<Parse> {
     if mismatched_count > 0 {
         let more = if mismatched_count > mismatched.len() { ", …" } else { "" };
         lost.push(format!(
-            "{mismatched_count} overview(s) with samples per pixel other than the full image's {full_samples} are left out: {}{more}",
+            "{mismatched_count} overview(s) with samples per pixel or an alpha sample other than the full image's ({full_samples}{}) are left out: {}{more}",
+            if full_alpha { ", with alpha" } else { "" },
             mismatched.join(", ")
         ));
     }
@@ -582,6 +644,7 @@ fn read_layout(r: Sparse) -> Result<Parse> {
         palette,
         described,
         lost,
+        copyright,
     })))
 }
 
@@ -709,9 +772,9 @@ pub fn example(size: u32, tile: u32) -> Vec<u8> {
 pub struct Example {
     /// Pixels a side (at most 4096).
     pub size: u32,
-    /// Pixels a tile side (16 to 1024).
+    /// Pixels a tile side (16 to 4096).
     pub tile: u32,
-    /// Bands (1 to 16): band `b` of pixel (x, y) is `(x + y + 10 b) % 256` (`% 100 − 50` in
+    /// Bands (1 to 64): band `b` of pixel (x, y) is `(x + y + 10 b) % 256` (`% 100 − 50` in
     /// signed bytes).
     pub bands: u16,
     /// Bands stored apart (planar configuration 2).
@@ -735,6 +798,8 @@ pub struct Example {
     pub wide: bool,
     /// 64-bit float samples of the byte value, but 1e39 (past `f32`'s range) for 255.
     pub huge: bool,
+    /// The overviews' samples tagged 64-bit floats (their tags only: the tiles stay bytes).
+    pub huge_overviews: bool,
     /// With `classes`: the full image grey (PhotometricInterpretation 1) with the colour table
     /// anyway, which isn't a palette; its overviews stay palette images.
     pub stray: bool,
@@ -748,6 +813,11 @@ pub struct Example {
     /// Without `classes`: band `b`'s wavelength, 400 + 100 b nanometres, in GDAL's metadata
     /// (its only item there).
     pub wavelengths: bool,
+    /// Overviews half the size before them rounded down (500 of 1001), as terrio 0.8 writes
+    /// them; GDAL rounds up (501).
+    pub rounded_down: bool,
+    /// Geographic without an EPSG code (no GeographicTypeGeoKey): read as WGS 84, said.
+    pub no_epsg: bool,
 }
 
 impl Default for Example {
@@ -765,11 +835,14 @@ impl Default for Example {
             lossy: false,
             wide: false,
             huge: false,
+            huge_overviews: false,
             stray: false,
             no_table: false,
             sparse: false,
             no_overviews: false,
             wavelengths: false,
+            rounded_down: false,
+            no_epsg: false,
         }
     }
 }
@@ -777,13 +850,14 @@ impl Default for Example {
 /// A small cloud-optimised GeoTIFF as [`Example`] says, laid out as [`example`] lays it out.
 #[doc(hidden)]
 pub fn example_with(e: &Example) -> Vec<u8> {
-    let (size, tile) = (e.size.clamp(1, 4096), e.tile.clamp(16, 1024));
-    let nb = u32::from(e.bands.clamp(1, 16));
+    let (size, tile) = (e.size.clamp(1, 4096), e.tile.clamp(16, 4096));
+    let nb = u32::from(e.bands.clamp(1, 64));
     let planes = if e.planar { nb } else { 1 };
     let per_chunk = nb / planes;
     let mut sizes = vec![size];
     while !e.no_overviews && *sizes.last().unwrap_or(&tile) > tile {
-        sizes.push(sizes.last().unwrap_or(&tile).div_ceil(2));
+        let last = *sizes.last().unwrap_or(&tile);
+        sizes.push(if e.rounded_down { last / 2 } else { last.div_ceil(2) });
     }
     let value = |x: u32, y: u32, b: u32| -> u8 {
         if e.int8 {
@@ -850,6 +924,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
     let mut ifds: Vec<Vec<(u16, V)>> = Vec::new();
     for (i, &s) in sizes.iter().enumerate() {
         let n = (s.div_ceil(tile) * s.div_ceil(tile) * planes) as usize;
+        let tagged_huge = e.huge || (e.huge_overviews && i > 0);
         let mut t = vec![
             (254u16, V::L(vec![if i == 0 { 0 } else { 1 }])),
             (256, V::L(vec![s])),
@@ -857,7 +932,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
             (
                 258,
                 V::S(vec![
-                    if e.huge {
+                    if tagged_huge {
                         64
                     } else if e.wide {
                         32
@@ -889,7 +964,7 @@ pub fn example_with(e: &Example) -> Vec<u8> {
         if e.int8 || e.wide {
             t.push((339, V::S(vec![2; nb as usize])));
         }
-        if e.huge {
+        if tagged_huge {
             t.push((339, V::S(vec![3; nb as usize])));
         }
         if i == 0 {
@@ -900,7 +975,11 @@ pub fn example_with(e: &Example) -> Vec<u8> {
                 t.push((33550, V::D(vec![px, px, 0.0])));
                 t.push((33922, V::D(vec![0.0, 0.0, 0.0, 10.0, 46.0, 0.0])));
             }
-            t.push((34735, V::S(vec![1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326])));
+            if e.no_epsg {
+                t.push((34735, V::S(vec![1, 1, 0, 1, 1024, 0, 1, 2])));
+            } else {
+                t.push((34735, V::S(vec![1, 1, 0, 2, 1024, 0, 1, 2, 2048, 0, 1, 4326])));
+            }
             if e.classes {
                 let xml = if e.lossy {
                     r#"<GDALMetadata><Item name="CLASS_3">Forest Formation</Item><Item name="CLASS_70000">Far</Item></GDALMetadata>"#
@@ -1003,6 +1082,53 @@ pub fn example_with(e: &Example) -> Vec<u8> {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    /// ESA CCI Biomass's 1 km map (#2496): 18 bands interleaved in 512-pixel tiles, 4.7 million values
+    /// a tile, open; a tile past the limit says what it takes, the limit and what to do.
+    #[test]
+    fn many_interleaved_bands_open_and_too_large_tiles_say_why() {
+        let file = example_with(&Example { size: 512, tile: 512, bands: 18, no_overviews: true, ..Example::default() });
+        let (s, l) = layout_of(&file);
+        assert_eq!((l.bands, l.chunk_bands(), l.planar), (18, 18, false));
+        assert!(l.lost.is_empty(), "{:?}", l.lost);
+        let lv = &l.levels[0];
+        let (at, n) = (lv.offsets[0] as usize, lv.counts[0] as usize);
+        let bands = decode_tile(&s, &l, 0, 0, file[at..at + n].to_vec()).unwrap();
+        assert_eq!(bands.len(), 18);
+        // Band 17 of pixel (2, 3): (2 + 3 + 170) % 256.
+        assert_eq!(bands[17][3 * 512 + 2], 175.0);
+        let big = example_with(&Example { size: 1024, tile: 1024, bands: 9, no_overviews: true, ..Example::default() });
+        let e = layout(&Sparse::default().with(0, big)).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "GeoTIFF: tiles of 1024 × 1024 pixels of 9 interleaved bands take 36 MiB each once read, more than the 32 MiB one tile may take: write the file with smaller tiles or its bands stored apart (GDAL's BLOCKSIZE or INTERLEAVE=BAND creation options)"
+        );
+        // One band's tile is too large alone: storing the bands apart wouldn't help.
+        let huge = example_with(&Example { size: 4096, tile: 4096, bands: 2, no_overviews: true, ..Example::default() });
+        let e = layout(&Sparse::default().with(0, huge)).unwrap_err().to_string();
+        assert_eq!(
+            e,
+            "GeoTIFF: tiles of 4096 × 4096 pixels of 2 interleaved bands take 128 MiB each once read, more than the 32 MiB one tile may take: write the file with smaller tiles (GDAL's BLOCKSIZE creation option)"
+        );
+    }
+
+    /// Each level's tiles count at its own bit depth: a 64-bit overview of a byte image is refused.
+    #[test]
+    fn an_overview_counts_its_own_bit_depth() {
+        let base = Example { size: 1024, tile: 512, bands: 18, ..Example::default() };
+        let (_, l) = layout_of(&example_with(&base));
+        assert_eq!(l.levels.len(), 2);
+        let e = layout(&Sparse::default().with(0, example_with(&Example { huge_overviews: true, ..base }))).unwrap_err().to_string();
+        assert!(e.contains("tiles of 512 × 512 pixels of 18 interleaved bands take 36 MiB each once read"), "{e}");
+    }
+
+    /// A tile's bytes once read: values as `f32`, 64-bit ones as 8 bytes; a hostile header saturates.
+    #[test]
+    fn tile_bytes_count_values_as_read() {
+        assert_eq!(tile_bytes(512, 512, 18, 16), 18 << 20);
+        assert_eq!(tile_bytes(512, 512, 32, 8), MAX_TILE_BYTES as u64, "at the limit, which passes");
+        assert!(tile_bytes(512, 512, 17, 64) > MAX_TILE_BYTES as u64, "64-bit values count 8 bytes");
+        assert_eq!(tile_bytes(u32::MAX, u32::MAX, usize::MAX, 64), u64::MAX);
+    }
 
     #[test]
     fn tile_budget_across_levels() {
@@ -1011,6 +1137,52 @@ pub(crate) mod tests {
         assert!(take_tiles(&mut allowance, MAX_TILES).is_ok() && take_tiles(&mut allowance, MAX_TILES).is_ok());
         // All the levels together past the budget: refused.
         assert!(take_tiles(&mut allowance, 1).is_err());
+    }
+
+    /// What reading the file whole says of its header, reading it in place says too: a datum
+    /// assumed for a geographic file without an EPSG code; a clean file says nothing and has no
+    /// copyright, and one written with a copyright keeps it.
+    #[test]
+    fn a_layout_says_an_assumed_datum_and_keeps_the_copyright() {
+        let layout_of = |file: Vec<u8>| match layout(&Sparse::default().with(0, file)) {
+            Ok(Parse::Done(l)) => l,
+            _ => panic!("not a COG"),
+        };
+        let clean = layout_of(example(64, 32));
+        assert!(clean.lost.is_empty() && clean.copyright.is_none(), "{:?}", clean.lost);
+        let assumed = layout_of(example_with(&Example { size: 64, tile: 32, no_epsg: true, ..Example::default() }));
+        assert_eq!(
+            assumed.lost.iter().map(|n| (n.text.as_str(), n.loss)).collect::<Vec<_>>(),
+            [(super::super::geotiff::NO_EPSG_GEOGRAPHIC, Some(crate::loss::LossCode::AssumedCrs))]
+        );
+        let mut r = crate::raster::Raster::new(
+            "credited",
+            64,
+            64,
+            vec![vec![1.0; 64 * 64]],
+            crate::raster::GeoTransform { origin_x: 10.0, origin_y: 46.0, pixel_width: 0.01, pixel_height: -0.01 },
+            crate::raster::Crs::LonLat,
+            None,
+            crate::raster::ColorHint::Gray,
+            "UInt8",
+        )
+        .unwrap();
+        r.copyright = Some("Example Survey".into());
+        let file = super::super::cogwrite::write(&r, 0).unwrap();
+        let credited = layout_of(file.clone());
+        assert_eq!(credited.copyright.as_deref(), Some("Example Survey"));
+        // Everything but the tag's own bytes held: the layout asks for them rather than say the
+        // copyright is lost, and reads it once they are in.
+        let at = file.windows(14).position(|w| w == b"Example Survey").unwrap();
+        let held = Sparse::default().with(0, file[..at].to_vec()).with((at + 14) as u64, file[at + 14..].to_vec());
+        match layout(&held).unwrap() {
+            Parse::Need(a, b) => assert!(a <= at as u64 && b > at as u64, "asks for {a}..{b}, the tag at {at}"),
+            _ => panic!("the copyright's bytes weren't asked for"),
+        }
+        match layout(&held.with(at as u64, file[at..at + 14].to_vec())).unwrap() {
+            Parse::Done(l) => assert_eq!((l.copyright.as_deref(), l.lost.len()), (Some("Example Survey"), 0)),
+            _ => panic!("not read once its bytes are in"),
+        }
     }
 
     #[test]
@@ -1207,7 +1379,7 @@ pub(crate) mod tests {
         let entry = (0..n).map(|k| 10 + k * 12).find(|&e| bad[e..e + 2] == [0x80, 0xA4]).unwrap();
         bad[entry + 8..entry + 12].copy_from_slice(&(len + 1000).to_le_bytes());
         let Parse::Done(l) = layout(&Sparse::default().with_len(u64::from(len)).with(0, bad)).unwrap() else { panic!("not read") };
-        let said: Vec<&String> = l.lost.iter().chain(l.described.iter().flat_map(|d| d.lost.iter())).collect();
+        let said: Vec<&str> = l.lost.texts().chain(l.described.iter().flat_map(|d| d.lost.texts())).collect();
         assert!(said.iter().any(|x| x.contains("band and class names and wavelengths are left out")), "{said:?}");
     }
 

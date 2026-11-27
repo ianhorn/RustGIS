@@ -539,7 +539,8 @@ fn a_table_with_missing_files_is_said() {
     assert_eq!(read.unread[0].1, "its file a00000003.gdbtablx is missing");
 }
 
-/// A feature whose coordinates its coordinate system can't place keeps its row, and is said.
+/// A feature whose coordinates its coordinate system can't place is kept as the file holds it, and
+/// said (#2032 C2f-4b).
 #[test]
 fn coordinates_that_cant_be_converted_are_said() {
     const LAEA: &str = r#"PROJCS["ETRS89 / LAEA Europe",GEOGCS["ETRS89",DATUM["European_Terrestrial_Reference_System_1989",SPHEROID["GRS 1980",6378137,298.257222101]],PRIMEM["Greenwich",0],UNIT["degree",0.0174532925199433]],PROJECTION["Lambert_Azimuthal_Equal_Area"],PARAMETER["latitude_of_center",52],PARAMETER["longitude_of_center",10],PARAMETER["false_easting",4321000],PARAMETER["false_northing",3210000],UNIT["metre",1],AUTHORITY["EPSG","3035"]]"#;
@@ -554,8 +555,12 @@ fn coordinates_that_cant_be_converted_are_said() {
     let (ds, report) = &layers[0];
     let rows: Vec<&crate::Feature> = ds.features.iter().collect();
     assert_eq!(rows.len(), 2);
-    assert!(rows[0].geometry.is_some() && rows[1].geometry.is_none(), "{:?}", rows[1].geometry);
-    assert!(report.messages.iter().any(|m| m.starts_with("1 features have coordinates outside")), "{report:?}");
+    assert!(rows[0].geometry.is_some() && rows[1].geometry.is_some(), "{:?}", rows[1].geometry);
+    assert!(!ds.crs_incomplete);
+    assert!(
+        report.messages.iter().any(|m| m.starts_with("one feature has a place that can't be given in longitude/latitude")),
+        "{report:?}"
+    );
 }
 
 #[test]
@@ -621,7 +626,7 @@ fn hostile_bytes_never_panic() {
 /// fields, and a TIN, which GDAL stores as a multipatch (a triangle fan).
 #[test]
 fn reads_what_gdal_writes_when_gdal_is_installed() {
-    if !crate::source::gdal::available() {
+    if !crate::source::gdal::test_runs().unwrap() {
         return;
     }
     let dir = std::env::temp_dir().join(format!("rustgis-filegdb-{}", std::process::id()));
@@ -642,7 +647,7 @@ fn reads_what_gdal_writes_when_gdal_is_installed() {
     .unwrap();
     let (gdb_s, points_s, tins_s) = (gdb.display().to_string(), points.display().to_string(), tins.display().to_string());
     run(&["-f", "OpenFileGDB", "-a_srs", "EPSG:4326", "-nlt", "POINT", "-nln", "places", "-oo", "AUTODETECT_TYPE=YES", &gdb_s, &points_s]);
-    run(&["-f", "OpenFileGDB", "-update", "-a_srs", "EPSG:2056", "-nlt", "TINZ", "-nln", "blocks", &gdb_s, &tins_s]);
+    run(&["-f", "OpenFileGDB", "-update", "-a_srs", "EPSG:2056", "-nlt", "GEOMETRYCOLLECTIONZ", "-nln", "blocks", &gdb_s, &tins_s]);
     assert!(is_geodatabase(&gdb));
     assert_eq!(layers(&gdb).unwrap(), ["places", "blocks"]);
     let read = read_dir(&gdb, None).unwrap().layers;
@@ -680,23 +685,28 @@ fn reads_what_gdal_writes_when_gdal_is_installed() {
 #[test]
 fn planetary_systems_are_said_or_refused() {
     let gcs = r#"GEOGCS["GCS_Mars_2015_-_Sphere_Ocentric",DATUM["D_Mars_2015_-_Sphere",SPHEROID["Mars_2015_-_Sphere",3396190.0,0.0]],PRIMEM["Reference_Meridian",0.0],UNIT["Degree",0.0174532925199433]]"#;
-    let bonne = |gcs: &str| {
+    // A method no one knows (Bonne is read, as PROJ 9.8.1 reads it, on any body).
+    let unread = |gcs: &str| {
         format!(
-            r#"PROJCS["Bonne",{gcs},PROJECTION["Bonne"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
+            r#"PROJCS["Unheard_Of",{gcs},PROJECTION["Unheard_Of"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
         )
     };
     let body = |m: &String| m.contains("belongs to another body than the Earth");
     let mut report = ReadReport::default();
     let (crs, t) = esri_crs(None, Some(gcs), &mut report).unwrap();
     assert!(crs.is_some_and(Crs::is_planetary) && t.is_some());
-    assert_eq!(report.messages.iter().filter(|m| body(m)).count(), 1, "{:?}", report.messages);
-    let e = esri_crs(None, Some(&bonne(gcs)), &mut ReadReport::default()).err().unwrap().to_string();
-    assert!(e.contains("belongs to another body than the Earth") && e.contains("Bonne"), "{e}");
+    assert_eq!(report.messages.iter().filter(|m| body(&m.text)).count(), 1, "{:?}", report.messages);
+    let e = esri_crs(None, Some(&unread(gcs)), &mut ReadReport::default()).err().unwrap().to_string();
+    assert!(e.contains("belongs to another body than the Earth") && e.contains("Unheard_Of"), "{e}");
     let earth = r#"GEOGCS["GCS_WGS_1984",DATUM["D_WGS_1984",SPHEROID["WGS_1984",6378137.0,298.257223563]],PRIMEM["Greenwich",0.0],UNIT["Degree",0.0174532925199433]]"#;
     let mut report = ReadReport::default();
-    let (crs, t) = esri_crs(None, Some(&bonne(earth)), &mut report).unwrap();
+    let (crs, t) = esri_crs(None, Some(&unread(earth)), &mut report).unwrap();
     assert!(crs.is_none() && t.is_none());
-    assert!(report.messages.iter().any(|m| m.contains("Bonne")) && !report.messages.iter().any(body), "{:?}", report.messages);
+    assert!(
+        report.messages.iter().any(|m| m.contains("Unheard_Of")) && !report.messages.iter().any(|m| body(&m.text)),
+        "{:?}",
+        report.messages
+    );
 }
 
 /// #1677: an EPSG code is used as a `.prj`'s own `AUTHORITY` is: when the WKT gives no shift to WGS
@@ -705,7 +715,7 @@ fn planetary_systems_are_said_or_refused() {
 /// body's WKT.
 #[test]
 fn a_code_gives_way_to_its_wkts_shift_or_body() {
-    let bng = crate::raster::wkt::to_wkt(Crs::Epsg(27700)).unwrap();
+    let bng = crate::raster::wkt::tests::bng_wkt1();
     let own = "TOWGS84[446.448,-125.157,542.06,0.15,0.247,0.842,-20.489]";
     let other = bng.replace(own, "TOWGS84[375,-111,431,0,0,0,0]");
     assert_ne!(other, bng);
@@ -819,12 +829,13 @@ fn a_code_gives_way_to_its_wkts_shift_or_body() {
         let mut report = ReadReport::default();
         let (crs, _) = esri_crs(Some(code), Some(mars), &mut report).unwrap();
         assert!(crs.is_some_and(Crs::is_planetary), "{code}: {crs:?}");
-        assert_eq!(report.messages.iter().filter(|m| body(m)).count(), 1, "{code}: {:?}", report.messages);
-        let bonne = format!(
-            r#"PROJCS["Bonne",{mars},PROJECTION["Bonne"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
+        assert_eq!(report.messages.iter().filter(|m| body(&m.text)).count(), 1, "{code}: {:?}", report.messages);
+        // A method no one knows (Bonne is read, as PROJ 9.8.1 reads it).
+        let unread = format!(
+            r#"PROJCS["Unheard_Of",{mars},PROJECTION["Unheard_Of"],PARAMETER["Central_Meridian",0.0],PARAMETER["Standard_Parallel_1",30.0],UNIT["Meter",1.0]]"#
         );
-        let e = esri_crs(Some(code), Some(&bonne), &mut ReadReport::default()).err().unwrap().to_string();
-        assert!(e.contains("belongs to another body than the Earth") && e.contains("Bonne"), "{code}: {e}");
+        let e = esri_crs(Some(code), Some(&unread), &mut ReadReport::default()).err().unwrap().to_string();
+        assert!(e.contains("belongs to another body than the Earth") && e.contains("Unheard_Of"), "{code}: {e}");
     }
 }
 
@@ -893,6 +904,7 @@ fn placement_cases_are_placed() {
         let layers = read_files(&files).unwrap();
         let (ds, report) = &layers[0];
         assert!(report.messages.is_empty(), "{what}: {:?}", report.messages);
+        let ds = ds.in_lonlat().unwrap().into_owned();
         let Some(Geometry::Polygon(p)) = &ds.features[0].geometry else { panic!("{what}: {:?}", ds.features[0].geometry) };
         // The corner at the point (stored to the millimetre) is within a centimetre of it.
         let off = p[0][0].iter().map(|c| metres_apart(*c, lonlat)).fold(f64::INFINITY, f64::min);
@@ -940,6 +952,7 @@ fn filegdb_temporal_fields_keep_days_offsets_and_null_notices() {
         assert_eq!(notices.len(), usize::from(rounded), "{serial}: {report:?}");
         if rounded {
             assert!(notices[0].contains("1 serial date") && notices[0].contains("moment"));
+            assert_eq!(notices[0].loss, Some(crate::loss::LossCode::ChangedRounded));
         }
     }
 }

@@ -27,8 +27,8 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
 
 - **Ribbon**: tabs of commands grouped by task. The **Project** button opens the backstage
   (Start, New, Open, Save, Save As and About).
-- **Quick Access Toolbar** (top left): New, Open, Save, Undo and Redo, plus any commands you add
-  under **Settings › Customize › Quick Access**.
+- **Quick Access Toolbar** (top left): New, Open, Save, Undo, Redo and
+  [Undo History](editing.md), plus any commands you add under **Settings › Customize › Quick Access**.
 - **Layers pane** (left): the map's layers in drawing order, with their legends. A new layer goes
   on top, whatever its kind (a feature, raster or web layer, an analysis result). Tick a layer to
   show or hide it; drag it up or down to change the drawing order; right-click it to zoom to it,
@@ -99,10 +99,10 @@ This guide walks through RustGIS by task. Each page covers one part of the app:
   and closes it when it is. **Pane Sets** keep the tabs open.
 - **Status bar**: the scale (type one, or pick from the list), the zoom level, bearing and pitch
   (click them to face north and look straight down again), the pointer's coordinates (click them
-  to step through decimal degrees, DMS, UTM and MGRS; see [Coordinate readouts](maps.md#coordinate-readouts)),
-  the coordinate system (click it to change the
-  projection), the selection count (with a button to clear it), the latest notice (click to open
-  **Diagnostics**), a **Diagnostics** button, the last draw time, the frame rate and a **GPU**/**CPU**
+  to step through map coordinates (the map's own system, the default), decimal degrees, DMS, UTM, MGRS and layer coordinates (the active layer's projected system); see [Coordinate readouts](maps.md#coordinate-readouts)),
+  the coordinate system (click its button to
+  change the projection), the selection count (with a button to clear it), the latest notice (click
+  to open **Messages**), a **Messages** button, the last draw time, the frame rate and a **GPU**/**CPU**
   renderer switch. While agents control the desktop app, it also shows the MCP relay or file bridge.
 
 **Command Search** (++ctrl+k++, or the box at the top right) finds commands and geoprocessing
@@ -162,7 +162,7 @@ Review copied diagnostics for private layer names or file paths before sharing t
 | **Style** | For the layer selected in Layers. A feature layer: Visibility Range, Effects, Drawing, Drawing Effects, Extrusion for polygons (with Faces and Light and Shadow once on) and Layer. A raster layer: Visibility Range, Effects, Compare, Raster Effects, Rendering, Enhancement and Layer. Both: Styles |
 | **Labeling** | For the feature layer selected in Layers: Labels (Label, Properties), Label Class (Class, Field), Text Symbol (Size, Color, Bold, Halo), Label Placement and Label Range. Whatever is selected: Map Labeling (Lock, Pause, View Unplaced, Convert) |
 | **Edit** | Manage Edits (Edit, Save, Undo, Redo, Status, Save to PostGIS and Discard PostGIS Edits on the desktop while a [PostGIS layer is loaded for editing](data.md#editing-postgis-tables), Settings, Templates, Topology), Snapping, Features (Create, Delete, Edit Vertices, Modify), Tools, Elevation, Corrections, Graphics, Graphics and Text, Clipboard |
-| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor), Tools (the tool gallery), Selection, Notebook |
+| **Analyze** | Geoprocessing (History, Tools, Model Builder, Script, SQL, Environments), Tasks (the Tasks pane; Task: Record Task, New Task From History, Import Task, run a task), AI (AI Assistant), Portal (Feature Analysis, Raster Analysis), Workflows, Raster (Raster Functions, Function Editor, Process), Tools (the tool gallery), Selection, Notebook |
 | **View** | Display (Graticule, GPU Rendering), View (Globe, Projection, Global; Local on the desktop), Effects, Scene, Windows, Navigation, Link, Workspace, Animation, Time (Time Slider), Profile (Profile; Time Series on the desktop) |
 | **Publish** | While a layout is open, its groups first (Page, Map Frames, Map Surrounds, Shapes, Text, Export); then Report, Presentation, Output (Export Map, Export Features, Print Map, Capture To Clipboard, Report, Presentation, Export To 3D), Package, Share As, Layout, Save As, Thumbnail |
 | **Plugins** | Plugins (Plugin Manager, Install From File, Browse Plugins), Extensions (the [Extensions](#extensions) window), plus a group for each enabled [plugin](../plugins.md) with commands or tools; a plugin with its own tab adds that tab instead |
@@ -178,17 +178,21 @@ Extensions are optional parts of RustGIS that you turn on or off. Unlike a
 [plugin](../plugins.md), an extension ships with RustGIS: there is nothing to download or install.
 **Plugins › Extensions** opens the Extensions window, which lists each extension with a switch,
 what it adds and where it shows. An extension with a tab of its own adds that tab after Help
-(before plugins' own tabs) while it is on; one without a tab adds a group to the Plugins tab.
+(before plugins' own tabs) while it is on; one without a tab adds its buttons to RustGIS's own
+tabs, or a group to the Plugins tab.
 
 | Extension | Default | Adds |
 | --- | --- | --- |
-| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools, and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run) |
+| **Imagery** (`imagery`) | Off | The Imagery tab: Ortho Mapping, Reality Mapping, Alignment (Georeference), Image Analysis, Image Classification (with Deep Learning Tools), Imagery Sharing, Mensuration and Imagery Tools (Indices, Pixel Editor), and their commands (`imagery.*`, `dl.*`, and the `raster.*` commands those groups run). Process (clip and resample a raster), Mosaic Rasters, Project Raster and Polygons to Raster aren't part of it and always run |
+| **AI Assistant** (`assistant`) | On | The [AI Assistant](assistant.md) pane, with its buttons in Analyze › AI and View › Windows (`ui.pane.assistant`). The [MCP server](../mcp.md) (`rustgis-cli mcp`, and the desktop app's MCP Relay) and `rustgis-cli ask` aren't part of it and run either way |
 
-While an extension is off, its tab, its buttons, its Workflows pane sections and its commands in
-Command Search and the AI Assistant's command search are hidden. Its commands are refused with a
-message naming the extension, whoever runs them: a script, a model, the command line, Python or
-the assistant. Hiding the extension's tab in Settings › Customize › Ribbon only hides the tab; the
-commands still run.
+While an extension is off, its tab, its pane, its buttons, its Workflows pane sections and its
+commands in Command Search, the Keyboard Shortcuts editor, the Quick Access Toolbar and the AI
+Assistant's command search are hidden. Its commands are refused with a message naming the
+extension, whoever runs them: a shortcut, a script, a model, the command line, Python or the
+assistant. Shortcuts and Quick Access buttons you gave them are kept and come back with it.
+Hiding the extension's tab in Settings › Customize › Ribbon only hides the tab; the commands still
+run.
 
 The desktop and web apps start each extension at its default and remember your choices (the
 `extensions` setting). A setting saved by a newer RustGIS that names extensions this version
@@ -465,7 +469,9 @@ should putting one back fail too, the message names the temporary file that hold
 Shapefile, so it can be renamed back by hand. Sidecars RustGIS doesn't write, such as `.shp.xml`
 metadata, are left alone. The spatial indexes that would no longer match (`.qix`, `.sbn`, `.sbx`)
 are removed where they can be; one that can't be (held open by another program) is left, and
-should be deleted before that program uses the file.
+should be deleted before that program uses the file. Once the new parts have landed, the hidden
+copies of the old ones are removed too; a copy that can't be removed is left beside the
+Shapefile, and the publish names it so it can be deleted.
 
 This rollback needs RustGIS to keep running. Replacing several Shapefile parts is not atomic:
 a process crash or power loss between renames can leave a mixed or incomplete set. Keep an
@@ -488,12 +494,16 @@ For `.geojson`, publish also checks that the source is unchanged, that it still 
 at the last sync, and that both the original and the edited layer survive a read/write. It keeps
 the document's kind (FeatureCollection, Feature or bare geometry), a collection's name, and
 feature ids. Ordinary integer coordinate text stays integer text when the value is unchanged.
-Whitespace and member order may change.
+Whitespace and member order may change. A legacy `crs` member is kept, and the layer is written
+back in the system it names (Swiss LV95 coordinates stay LV95); a layer whose coordinate system
+was defined again since is refused.
 
-Publish refuses a rewrite that would change foreign members, a legacy `crs` member, Z values,
+Publish refuses a rewrite that would change foreign members, Z values,
 a geometry the reader simplifies, nested properties it reads as text, duplicate object keys,
-or number text the writer would spell differently (such as `1.00` or `1E3`). The message says
-why; the original file stays unchanged. A file with feature ids requires the same internal row
+number text the writer would spell differently (such as `1.00`, `1E3`, or a decimal below
+0.00001 such as `0.000004`, which it writes `4e-6`), a property that mixes numbers and text
+(read as a text column, its numbers would be written as text), or a file that doesn't read whole
+(a feature the reader skips). The message says why; the original file stays unchanged. A file with feature ids requires the same internal row
 ids in the same order: adding, deleting or reordering rows is refused when their external ids
 couldn't be preserved, and the same holds for a layer without fields whose features mix absent,
 null and object `properties`. Absent or null `properties` are kept only in a layer without fields:

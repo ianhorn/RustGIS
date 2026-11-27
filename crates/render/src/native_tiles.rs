@@ -165,8 +165,10 @@ pub(crate) fn draw(pm: &mut Pixmap, n: &Native, t: &TileLayer, view: &View, flat
     let (Some(a), Some(b)) = (to_native(cam.to_map(w / 2.0, h / 2.0, w, h)), to_native(cam.to_map(w / 2.0 + 1.0, h / 2.0, w, h))) else {
         return (false, None);
     };
-    // The system's units per pixel of the map's pixmap.
-    let per_px = (b.x - a.x).hypot(b.y - a.y) / k;
+    // The system's units per pixel its tiles are fetched for: the map's pixmap's on a HiDPI
+    // display when sharp tiles are on, up to twice a logical pixel's detail; else a logical
+    // pixel's (#2390).
+    let per_px = (b.x - a.x).hypot(b.y - a.y) / f64::from(rustgis_tiles::template::detail(k as f32));
     if !(lo.0 < hi.0 && lo.1 < hi.1 && per_px.is_finite() && per_px > 0.0) {
         return (false, None);
     }
@@ -187,6 +189,7 @@ pub(crate) fn draw(pm: &mut Pixmap, n: &Native, t: &TileLayer, view: &View, flat
         Some(((x * k) as f32, (y * k) as f32))
     };
     let opacity = t.opacity.clamp(0.0, 1.0);
+    let quality = sampling(t);
     let (mut pending, mut error) = (false, None);
     for p in pictures {
         // A WMTS tile past the service's coverage is routine; a WMS picture (any area asked) isn't.
@@ -194,7 +197,7 @@ pub(crate) fn draw(pm: &mut Pixmap, n: &Native, t: &TileLayer, view: &View, flat
         match state {
             State::Ready(payload) => {
                 if let Payload::Image(img) = &*payload {
-                    paint(pm, img, p.area, p.area, opacity, &place);
+                    paint(pm, img, p.area, p.area, opacity, quality, &place);
                 }
             }
             State::Pending => {
@@ -207,7 +210,7 @@ pub(crate) fn draw(pm: &mut Pixmap, n: &Native, t: &TileLayer, view: &View, flat
                 if let Some((payload, at)) = stand_in
                     && let Payload::Image(img) = &*payload
                 {
-                    paint(pm, img, at, p.area, opacity, &place);
+                    paint(pm, img, at, p.area, opacity, quality, &place);
                 }
             }
             // A WMTS tile the service doesn't have (past its coverage) is left clear, as the warped
@@ -290,9 +293,19 @@ pub(crate) fn paint(
     area: [f64; 4],
     clip: [f64; 4],
     opacity: f32,
+    quality: FilterQuality,
     place: &dyn Fn(Coord) -> Option<(f32, f32)>,
 ) {
-    paint_blended(pm, img, area, clip, opacity, tiny_skia::BlendMode::SourceOver, place);
+    paint_blended(pm, img, area, clip, opacity, tiny_skia::BlendMode::SourceOver, quality, place);
+}
+
+/// How a tile layer's pictures are sampled where they're drawn at another size: blended, or
+/// each pixel a block (#2804).
+pub(crate) fn sampling(t: &rustgis_map::TileLayer) -> FilterQuality {
+    match t.resampling {
+        rustgis_map::raster::Resampling::Nearest => FilterQuality::Nearest,
+        rustgis_map::raster::Resampling::Bilinear => FilterQuality::Bilinear,
+    }
 }
 
 /// [`paint`], combined with what is beneath by `blend`.
@@ -303,6 +316,7 @@ pub(crate) fn paint_blended(
     clip: [f64; 4],
     opacity: f32,
     blend: tiny_skia::BlendMode,
+    quality: FilterQuality,
     place: &dyn Fn(Coord) -> Option<(f32, f32)>,
 ) {
     let corner = |x: f64, y: f64| place(Coord::new(x, y));
@@ -320,7 +334,7 @@ pub(crate) fn paint_blended(
     }
     path.close();
     let Some(path) = path.finish() else { return };
-    let shader = Pattern::new(img.as_ref(), SpreadMode::Pad, FilterQuality::Bilinear, opacity, transform);
+    let shader = Pattern::new(img.as_ref(), SpreadMode::Pad, quality, opacity, transform);
     // Without anti-aliasing, neighbouring pictures meet without a seam.
     let paint = Paint { shader, anti_alias: false, blend_mode: blend, ..Paint::default() };
     pm.fill_path(&path, &paint, FillRule::Winding, Transform::identity(), None);

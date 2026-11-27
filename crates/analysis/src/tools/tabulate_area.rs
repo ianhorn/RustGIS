@@ -1,5 +1,6 @@
 //! Class-by-zone tables on the same cell-centre masks as Zonal Statistics.
 use super::*;
+use rustgis_data::loss::{LossCode, LossMessage};
 use rustgis_data::{Measure, raster::Raster};
 
 /// Counts or measures every class in each zone. One zone's mask is built as one step without
@@ -52,9 +53,10 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
     }
     let index: HashMap<u32, usize> = classes.iter().enumerate().map(|(i, &v)| (class_key(v), i)).collect();
     let areas = CellAreas::new(r, count);
-    // The largest grouped geometry's copies in lon/lat and on the grid, the largest raster
-    // mask and its trimmed copy, plus each zone's dense class totals. Conservatively include
-    // the shared row cache in each worker's estimate so it stays within the scratch allowance.
+    // The largest grouped geometry's copies (taken as four, in any system) and on the grid, the
+    // largest raster mask and its trimmed copy, plus each zone's dense class totals.
+    // Conservatively include the shared row cache in each worker's estimate so it stays within
+    // the scratch allowance.
     let geometry_bytes = groups
         .iter()
         .map(|group| {
@@ -74,8 +76,12 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         .saturating_add(areas.cache_bytes)
         .saturating_add(geometry_bytes);
     let threads = threads.unwrap_or_else(|| crate::parallel::threads_for_scratch(groups.len(), PARALLEL_FEATURES, scratch));
+    // The zones are in the run's system: their own projected one, converted to the raster's
+    // (none of it when that is the raster's too), else longitude/latitude.
+    let own = (inp.work_crs() != Crs::LonLat).then(|| crate::tools::ToGrid::new(inp.work_crs(), r.crs)).transpose()?;
+    let to = own.as_ref().map_or(crate::rasterops::ToWorld::LonLat(r.transformer()), crate::rasterops::ToWorld::Own);
     let totals =
-        crate::parallel::try_map_on(&groups, threads, || (), |_, _, group| summarize(r, *band, zones, &group.rows, &index, &areas))?;
+        crate::parallel::try_map_on(&groups, threads, || (), |_, _, group| summarize(r, to, *band, zones, &group.rows, &index, &areas))?;
     let zone_field = keys.first().and_then(|&i| zones.fields.get(i)).cloned().unwrap_or_else(|| Field::new("zone_id", FieldType::Text));
     let mut out = Dataset::new(out_name(p, format!("{}_TabulateArea", zones.name)), GeometryType::None, vec![zone_field]);
     for &class in &classes {
@@ -83,11 +89,12 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         let name = unique_field(&out, &format!("class_{class}"));
         out.fields.push(Field::new(name, if count { FieldType::Integer } else { FieldType::Double }));
     }
-    let (mut nodata, mut invalid, mut parts, mut empty) = (0u64, 0usize, 0usize, 0usize);
+    let (mut nodata, mut invalid, mut unreadable, mut parts, mut empty) = (0u64, 0usize, 0usize, 0usize, 0usize);
     for (group, total) in groups.into_iter().zip(totals) {
         crate::control::check()?;
         nodata += total.nodata;
         invalid += total.invalid;
+        unreadable += total.unreadable;
         parts += total.parts;
         empty += usize::from(total.values.iter().all(|v| *v == 0.0));
         let mut attrs = group.key;
@@ -106,15 +113,25 @@ pub(super) fn run_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Resu
         messages.push(format!("{nodata} NoData or non-finite cell(s) inside zones were excluded (counted once per zone)"));
     }
     if invalid > 0 {
-        messages.push(format!("{invalid} zone feature(s) had missing or invalid polygon geometry and were excluded"));
+        messages.push(format!("{invalid} zone feature(s) had no polygon with an area and were excluded"));
+    }
+    let mut losses = Vec::new();
+    if unreadable > 0 {
+        losses.push(LossMessage {
+            code: LossCode::DroppedGeometry,
+            text: format!("{unreadable} zone feature(s) had invalid polygon geometry and were excluded"),
+        });
     }
     if parts > 0 {
-        messages.push(format!("{parts} polygon part(s) could not be projected onto the raster grid; valid parts were retained"));
+        losses.push(LossMessage {
+            code: LossCode::DroppedGeometry,
+            text: format!("{parts} polygon part(s) could not be projected onto the raster grid; valid parts were retained"),
+        });
     }
     if empty > 0 {
         messages.push(format!("{empty} zone(s) contained no valid raster cell centres; their class values are zero"));
     }
-    Ok(ToolResult { output: Output::Table(out), messages })
+    Ok(ToolResult { losses, output: Output::Table(out), messages })
 }
 
 /// All finite valid band values, sorted numerically. The wide table has Pivot Table's column
@@ -153,35 +170,41 @@ struct Totals {
     values: Vec<f64>,
     nodata: u64,
     invalid: usize,
+    /// Zone features whose polygon couldn't be read.
+    unreadable: usize,
     parts: usize,
 }
 
 /// Masks a whole group together: a cell in overlapping features or parts of the same zone
-/// counts once. Dataset geometry is stored in WGS 84 regardless of its source CRS metadata.
+/// counts once. The zones' places reach the raster's system by `to`.
 fn summarize(
     r: &Raster,
+    to: crate::rasterops::ToWorld<'_>,
     band: usize,
     zones: &Dataset,
     rows: &[usize],
     classes: &HashMap<u32, usize>,
     areas: &CellAreas<'_>,
 ) -> Result<Totals, String> {
-    let mut total = Totals { values: vec![0.0; classes.len()], nodata: 0, invalid: 0, parts: 0 };
+    let mut total = Totals { values: vec![0.0; classes.len()], nodata: 0, invalid: 0, unreadable: 0, parts: 0 };
     let mut polygons = Vec::new();
     for &row in rows {
         crate::control::check()?;
         let shape = zones.features.get(row).and_then(|f| f.geometry.as_ref());
         let valid = match shape {
-            Some(Geometry::Polygon(p)) => crate::rasterops::transform_feature_polygons_to_lonlat(p, None).ok(),
+            Some(Geometry::Polygon(p)) => crate::rasterops::validated_polygon_parts(p).ok(),
             _ => None,
         };
-        match valid {
-            Some(p) => polygons.extend(p),
-            None => total.invalid += 1,
+        // A polygon that can't be read is lost to its zone; a feature with no polygon, or none
+        // with an area, has no area to lose.
+        match (valid, shape) {
+            (Some(p), _) => polygons.extend(p),
+            (None, Some(Geometry::Polygon(p))) if crate::rasterops::has_a_ring(p) => total.unreadable += 1,
+            (None, _) => total.invalid += 1,
         }
     }
     let mut failures = Vec::new();
-    let mask = crate::rasterops::polygon_mask_with_failures(r, &polygons, &mut failures)?;
+    let mask = crate::rasterops::polygon_mask_on(to, &r.transform, (r.width, r.height), &polygons, &mut failures)?;
     total.parts = failures.len();
     crate::control::check()?;
     let Some((cols, rows, mask)) = mask else { return Ok(total) };

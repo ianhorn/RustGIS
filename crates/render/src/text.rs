@@ -119,6 +119,7 @@ fn family_font(fam: &crate::families::Family, face: Face) -> Option<(&'static Fo
 }
 
 /// The label font's regular face.
+#[cfg(test)]
 pub(crate) fn label_font() -> Option<&'static FontRef<'static>> {
     font(false)
 }
@@ -158,33 +159,43 @@ fn em(f: &FontRef, px: f32) -> PxScale {
 
 /// Characters that never need a glyph: spaces, controls, zero-width joiners, variation selectors,
 /// soft hyphens.
-fn invisible(c: char) -> bool {
+pub(crate) fn invisible(c: char) -> bool {
     c.is_whitespace()
         || c.is_control()
         || matches!(c, '\u{AD}' | '\u{200B}'..='\u{200F}' | '\u{2060}'..='\u{2064}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}' | '\u{E0100}'..='\u{E01EF}')
 }
 
-/// A CJK face for `region`, parsed once: an installed one, else the one the web app downloaded
-/// (`None` until it has). An installed face is looked for once; a downloaded one once it's there.
-fn cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
+/// Parses an installed regional face once, independently of downloaded coverage.
+fn installed_cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
     static FACES: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    // A test can run in a process of its own with no installed face, as in the browser, so the
+    // downloaded faces are tested alike whatever fonts the machine has.
+    let none_installed = cfg!(test) && std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_some();
+    if none_installed {
+        None
+    } else {
+        FACES.get(cjk_slot(region))?.get_or_init(|| crate::fonts::cjk_font(region).and_then(parse_cjk)).as_ref()
+    }
+}
+
+/// The CJK face the web app downloaded for `region`, parsed once it's there.
+fn downloaded_cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
     static DOWNLOADED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
-    let slot = match region {
+    let downloaded = crate::fonts::downloaded_cjk_font(region)?;
+    DOWNLOADED.get(cjk_slot(region))?.get_or_init(|| parse_cjk(downloaded)).as_ref()
+}
+
+fn cjk_slot(region: CjkRegion) -> usize {
+    match region {
         CjkRegion::SimplifiedChinese => 0,
         CjkRegion::Japanese => 1,
         CjkRegion::Korean => 2,
         CjkRegion::TraditionalChinese => 3,
-    };
-    let parse = |(b, i): &'static (Vec<u8>, u32)| FontRef::try_from_slice_and_index(b, *i).ok();
-    // A test can run in a process of its own with no installed face, as in the browser, so the
-    // downloaded faces are tested alike whatever fonts the machine has.
-    let none_installed = cfg!(test) && std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_some();
-    let installed =
-        if none_installed { None } else { FACES.get(slot)?.get_or_init(|| crate::fonts::cjk_font(region).and_then(parse)).as_ref() };
-    installed.or_else(|| {
-        let downloaded = crate::fonts::downloaded_cjk_font(region)?;
-        DOWNLOADED.get(slot)?.get_or_init(|| parse(downloaded)).as_ref()
-    })
+    }
+}
+
+fn parse_cjk((bytes, index): &'static (Vec<u8>, u32)) -> Option<FontRef<'static>> {
+    FontRef::try_from_slice_and_index(bytes, *index).ok()
 }
 
 /// The CJK faces to try for `c`, the region whose glyph style suits it first: Hangul looks for a
@@ -193,18 +204,74 @@ fn cjk(region: CjkRegion) -> Option<&'static FontRef<'static>> {
 /// has, so what draws each character there doesn't change, and in the browser it is the face a
 /// Traditional Chinese interface downloads.
 fn cjk_order(c: char) -> [CjkRegion; 4] {
+    use crate::fonts::CjkScript;
     use CjkRegion::{Japanese as Jp, Korean as Kr, SimplifiedChinese as Sc, TraditionalChinese as Tc};
-    match c {
-        '\u{1100}'..='\u{11FF}' | '\u{3130}'..='\u{318F}' | '\u{A960}'..='\u{A97F}' | '\u{AC00}'..='\u{D7FF}' => [Kr, Sc, Jp, Tc],
-        '\u{3040}'..='\u{30FF}' | '\u{31F0}'..='\u{31FF}' | '\u{FF66}'..='\u{FF9F}' => [Jp, Sc, Kr, Tc],
+    match CjkScript::of(c) {
+        Some(CjkScript::Hangul) => [Kr, Sc, Jp, Tc],
+        Some(CjkScript::Kana) => [Jp, Sc, Kr, Tc],
         _ => [Sc, Jp, Kr, Tc],
     }
 }
 
+/// Parses the requested script source lazily, sharing its bytes. Check for a late download
+/// before touching its parsed slot, so an early miss is not cached forever.
+fn script_face(script: crate::fonts::ScriptFont, downloaded: bool) -> Option<&'static FontRef<'static>> {
+    use crate::fonts::ScriptFont;
+    let slot = match script {
+        ScriptFont::Latin => 0,
+        ScriptFont::Arabic => 1,
+        ScriptFont::Bengali => 2,
+        ScriptFont::Lao => 3,
+        ScriptFont::Cjk(_) => return None,
+    };
+    static DOWNLOADED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    static INSTALLED: [OnceLock<Option<FontRef<'static>>>; 4] = [OnceLock::new(), OnceLock::new(), OnceLock::new(), OnceLock::new()];
+    let parse = |data: &'static (Vec<u8>, u32)| FontRef::try_from_slice_and_index(&data.0, data.1).ok();
+    if downloaded {
+        let data = crate::fonts::downloaded_script_font(script)?;
+        return DOWNLOADED.get(slot)?.get_or_init(|| parse(data)).as_ref();
+    }
+    if cfg!(test) && std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_some() {
+        return None;
+    }
+    INSTALLED.get(slot)?.get_or_init(|| crate::fonts::script_font(script).and_then(parse)).as_ref()
+}
+
+/// The bundled Hack face supplies the same last-resort Georgian and symbol coverage as the UI.
+fn bundled_fallback() -> Option<&'static FontRef<'static>> {
+    static HACK: OnceLock<Option<FontRef<'static>>> = OnceLock::new();
+    HACK.get_or_init(|| FontRef::try_from_slice(epaint_default_fonts::HACK_REGULAR).ok()).as_ref()
+}
+
+/// The shared label fallback used by character markers as well as text and exported glyph runs.
+pub(crate) fn marker_fallback(c: char) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    let face = font(false)?;
+    let found = glyph(c, face, None);
+    if found.is_none() && !invisible(c) {
+        crate::fonts::note_missing_script(c);
+    }
+    found
+}
+
 /// The face and glyph that draw `c`: `f` when it has the glyph, else `sans` (the label font a
-/// serif text falls back to: an arrow or a script the serif lacks), else the first installed CJK
-/// font that does. `None` when nothing covers it, so no missing-glyph box is drawn.
+/// serif text falls back to), then the downloaded and installed non-CJK script faces, bundled
+/// Hack and regional CJK faces. `None` when nothing covers it, so no missing-glyph box is drawn.
+///
+/// Every character the label font and `sans` lack but kana and Hangul (ideographs above all) tries
+/// the downloaded face the web app prefers first ([`crate::fonts::prefer_downloaded_cjk`]), so
+/// ideographs take its interface's regional forms.
 fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'static>>) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    glyph_with_script_faces(c, f, sans, script_face)
+}
+
+/// Uses the same glyph selection with downloaded and installed script sources supplied lazily.
+fn glyph_with_script_faces(
+    c: char,
+    f: &'static FontRef<'static>,
+    sans: Option<&'static FontRef<'static>>,
+    script_face_from: impl Fn(crate::fonts::ScriptFont, bool) -> Option<&'static FontRef<'static>>,
+) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    use crate::fonts::CjkScript;
     let id = f.glyph_id(c);
     if id.0 != 0 || invisible(c) {
         return (id.0 != 0).then_some((f, id));
@@ -215,7 +282,34 @@ fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'s
             return Some((s, id));
         }
     }
-    cjk_order(c).into_iter().filter_map(cjk).find_map(|f| {
+    if let Some(script) = crate::fonts::ScriptFont::of(c).filter(|s| !matches!(s, crate::fonts::ScriptFont::Cjk(_))) {
+        for downloaded in [true, false] {
+            if let Some(face) = script_face_from(script, downloaded) {
+                let id = face.glyph_id(c);
+                if id.0 != 0 {
+                    return Some((face, id));
+                }
+            }
+        }
+    }
+    if let Some(face) = bundled_fallback() {
+        let id = face.glyph_id(c);
+        if id.0 != 0 {
+            return Some((face, id));
+        }
+    }
+    let not_kana_or_hangul = !matches!(CjkScript::of(c), Some(CjkScript::Kana | CjkScript::Hangul));
+    let preferred = not_kana_or_hangul.then(crate::fonts::preferred_downloaded_cjk).flatten().and_then(downloaded_cjk);
+    cjk_glyph(c, preferred, |region| [installed_cjk(region), downloaded_cjk(region)])
+}
+
+/// Chooses a regional CJK glyph, retaining the preferred downloaded face for Han text.
+fn cjk_glyph(
+    c: char,
+    preferred: Option<&'static FontRef<'static>>,
+    candidates: impl Fn(CjkRegion) -> [Option<&'static FontRef<'static>>; 2],
+) -> Option<(&'static FontRef<'static>, GlyphId)> {
+    preferred.into_iter().chain(cjk_order(c).into_iter().flat_map(|region| candidates(region).into_iter().flatten())).find_map(|f| {
         let id = f.glyph_id(c);
         (id.0 != 0).then_some((f, id))
     })
@@ -224,8 +318,25 @@ fn glyph(c: char, f: &'static FontRef<'static>, sans: Option<&'static FontRef<'s
 /// Whether the label fonts (`bold` or regular, with the installed CJK fallbacks) have a glyph for
 /// every character of `text`, invisible characters aside.
 pub fn covers(text: &str, bold: bool) -> bool {
+    check_coverage(text, bold, true)
+}
+
+/// Probes the current font stack without recording another missing-font request. Useful when
+/// rechecking a report from the previous frame after a font may have arrived.
+pub fn covers_quietly(text: &str, bold: bool) -> bool {
+    check_coverage(text, bold, false)
+}
+
+/// Tile/text output records missing scripts; status rechecks use the same selection silently.
+fn check_coverage(text: &str, bold: bool, note: bool) -> bool {
     let Some(f) = font(bold) else { return true };
-    text.chars().all(|c| invisible(c) || glyph(c, f, None).is_some())
+    text.chars().all(|c| {
+        let covered = invisible(c) || glyph(c, f, None).is_some();
+        if !covered && note {
+            crate::fonts::note_missing_script(c);
+        }
+        covered
+    })
 }
 
 /// Lays out `text` at `px` pixels in `face` (with `sans` for the characters it lacks, as
@@ -236,12 +347,21 @@ fn shape(
     px: f32,
     face: &'static FontRef<'static>,
     sans: Option<&'static FontRef<'static>>,
-) -> (Vec<(&'static FontRef<'static>, GlyphId, f32, char)>, f32) {
+) -> (Vec<(&'static FontRef<'static>, GlyphId, f32, char)>, f32, Vec<char>) {
     let mut out = Vec::new();
+    let mut missing = Vec::new();
     let mut x = 0.0;
     let mut prev: Option<(&'static FontRef<'static>, GlyphId)> = None;
     for ch in text.chars().take(500) {
-        let Some((f, id)) = glyph(ch, face, sans) else { continue };
+        let Some((f, id)) = glyph(ch, face, sans) else {
+            // Left out. A CJK character is noted, so the web app downloads a face for it; an
+            // invisible one (the ideographic space) draws nothing and needs none.
+            if !invisible(ch) {
+                crate::fonts::note_missing_script(ch);
+                missing.push(ch);
+            }
+            continue;
+        };
         let sf = f.as_scaled(em(f, px));
         if let Some((pf, pid)) = prev
             && std::ptr::eq(pf, f)
@@ -252,7 +372,7 @@ fn shape(
         x += sf.h_advance(id);
         prev = Some((f, id));
     }
-    (out, x)
+    (out, x, missing)
 }
 
 /// Most lines a label draws: its text comes from files and attributes.
@@ -276,7 +396,7 @@ pub fn measure(text: &str, size: f32, bold: bool) -> f32 {
     // Keyed by the faces handed over at run time too: a width measured before a downloaded CJK
     // face arrived left its characters out.
     static WIDTHS: OnceLock<widths::Cache<(bool, u32)>> = OnceLock::new();
-    let key = (bold, crate::fonts::fonts_added());
+    let key = (bold, crate::fonts::font_generation());
     WIDTHS.get_or_init(widths::Cache::default).measure(text, size, key, || measure_uncached(text, size, bold))
 }
 
@@ -297,7 +417,7 @@ pub fn measure_in(text: &str, size: f32, face: Face) -> f32 {
     // Labels in a named family are measured as often as those in the label font (every feature,
     // every frame), so they share its retention, keyed by the whole face.
     static WIDTHS: OnceLock<widths::Cache<(bool, bool, bool, Option<u16>, u32)>> = OnceLock::new();
-    let key = (face.bold, face.italic, face.serif, face.family, crate::fonts::fonts_added());
+    let key = (face.bold, face.italic, face.serif, face.family, crate::fonts::font_generation());
     WIDTHS.get_or_init(widths::Cache::default).measure(text, size, key, || {
         let Some((f, _)) = face_font(face) else {
             return text.chars().count() as f32 * size * 0.6;
@@ -442,7 +562,7 @@ fn letters_of(line: &str, face: Face) -> usize {
     use std::sync::Mutex;
     static KEPT: OnceLock<Mutex<HashMap<(String, Face, u32), usize>>> = OnceLock::new();
     let kept = KEPT.get_or_init(Mutex::default);
-    let key = (line.to_string(), face, crate::fonts::fonts_added());
+    let key = (line.to_string(), face, crate::fonts::font_generation());
     if let Some(n) = kept.lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
         return *n;
     }
@@ -540,7 +660,8 @@ fn blend(pm: &mut Pixmap, x: i32, y: i32, c: Rgba, cov: f32) {
 fn draw_text(pm: &mut Canvas, text: &str, cx: f32, cy: f32, px_size: f32, color: Rgba, bold: bool, offset: (f32, f32)) {
     let Some(f) = font(bold) else { return };
     let sf = f.as_scaled(em(f, px_size));
-    let (glyphs, width) = shape(text, px_size, f, None);
+    let (glyphs, width, missing) = shape(text, px_size, f, None);
+    crate::approximations::missing_glyphs(missing);
     let x0 = cx - width / 2.0 + offset.0;
     let base = cy + (sf.ascent() + sf.descent()) / 2.0 + offset.1;
     if pm.is_recording() {
@@ -573,7 +694,7 @@ pub(crate) fn styled_bounds(text: &str, px: f32, face: Face, spacing: f32) -> Op
     let (f, slanted) = face_font(face)?;
     let sf = f.as_scaled(em(f, px));
     let base = (sf.ascent() + sf.descent()) / 2.0;
-    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
+    let (glyphs, _, _) = shape(text, px, f, sans_beside(f, face));
     let (mut lo, mut hi) = (f32::INFINITY, f32::NEG_INFINITY);
     let (mut top, mut bottom) = (f32::INFINITY, f32::NEG_INFINITY);
     for (i, (gf, id, x, _)) in glyphs.into_iter().enumerate() {
@@ -601,7 +722,8 @@ pub fn styled_at(pm: &mut Canvas, text: &str, left: f32, cy: f32, px: f32, color
     let Some((f, slanted)) = face_font(face) else { return };
     let sf = f.as_scaled(em(f, px));
     let base = cy + (sf.ascent() + sf.descent()) / 2.0;
-    let (glyphs, _) = shape(text, px, f, sans_beside(f, face));
+    let (glyphs, _, missing) = shape(text, px, f, sans_beside(f, face));
+    crate::approximations::missing_glyphs(missing);
     if pm.is_recording() {
         keep_glyphs(pm, &glyphs, (left, base), px, spacing, color, |gf| leans(face, f, slanted, gf));
         return;
@@ -1323,7 +1445,7 @@ mod coverage_tests {
         assert!(super::measure("Mixed 中英 label", 10.0, false) > super::measure("Mixed  label", 10.0, false) + 10.0);
         // And the fallback glyphs are drawn, not just measured.
         let Some(ch) = "碑林区".chars().find(|&c| {
-            let (Some(label), Some(cjk)) = (super::font(false), super::cjk(CjkRegion::SimplifiedChinese)) else { return false };
+            let (Some(label), Some(cjk)) = (super::font(false), super::installed_cjk(CjkRegion::SimplifiedChinese)) else { return false };
             label.glyph_id(c).0 == 0 && cjk.glyph_id(c).0 != 0
         }) else {
             return;
@@ -1335,6 +1457,42 @@ mod coverage_tests {
         assert!(pm.pixels().iter().any(|p| p.alpha() > 0), "the fallback glyph was not drawn");
     }
 
+    /// Downloaded coverage must supplement an installed face rather than hide its extra letters.
+    #[test]
+    fn downloaded_script_keeps_installed_glyphs_available() {
+        use ab_glyph::FontRef;
+        use std::sync::OnceLock;
+        static PRIMARY: OnceLock<FontRef<'static>> = OnceLock::new();
+        static DOWNLOADED: OnceLock<FontRef<'static>> = OnceLock::new();
+        static INSTALLED: OnceLock<FontRef<'static>> = OnceLock::new();
+        let primary = PRIMARY.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-cff.otf")).unwrap());
+        let downloaded = DOWNLOADED.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-fallback.otf")).unwrap());
+        let installed = INSTALLED.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-latin-catalog.otf")).unwrap());
+        let select = |c| {
+            super::glyph_with_script_faces(c, primary, None, |_, from_download| Some(if from_download { downloaded } else { installed }))
+        };
+        assert!(std::ptr::eq(select('ə').unwrap().0, downloaded), "downloaded glyphs keep priority");
+        let found = select('Ư').expect("the installed script face must remain available after a download");
+        assert!(std::ptr::eq(found.0, installed), "the installed script face must remain available after a download");
+    }
+
+    /// An installed Japanese probe glyph must not hide a downloaded face's other kana.
+    #[test]
+    fn downloaded_cjk_fills_a_partial_installed_face() {
+        use crate::fonts::CjkRegion;
+        use ab_glyph::FontRef;
+        use std::sync::OnceLock;
+        static PARTIAL: OnceLock<FontRef<'static>> = OnceLock::new();
+        static COMPLETE: OnceLock<FontRef<'static>> = OnceLock::new();
+        let partial = PARTIAL.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-fallback.otf")).unwrap());
+        let complete = COMPLETE.get_or_init(|| FontRef::try_from_slice(include_bytes!("../testdata/test-latin-catalog.otf")).unwrap());
+        let select = |c| {
+            super::cjk_glyph(c, None, |region| if region == CjkRegion::Japanese { [Some(partial), Some(complete)] } else { [None, None] })
+        };
+        assert!(std::ptr::eq(select('あ').unwrap().0, partial), "the installed glyph keeps priority");
+        assert!(std::ptr::eq(select('か').expect("the downloaded face supplies the missing kana").0, complete));
+    }
+
     /// Traditional Chinese is the last face tried for every script, so on the desktop a character
     /// another face has (a kanji only the Japanese face has, say) is drawn by that face as before.
     #[test]
@@ -1343,6 +1501,140 @@ mod coverage_tests {
         assert_eq!(super::cjk_order('\u{6F22}'), [Sc, Jp, Kr, Tc]);
         assert_eq!(super::cjk_order('\u{304B}'), [Jp, Sc, Kr, Tc]);
         assert_eq!(super::cjk_order('\u{D55C}'), [Kr, Sc, Jp, Tc]);
+    }
+
+    /// In the browser, CJK text with no face to draw it is noted by script, for the web app to
+    /// download one, and taken once; other text notes nothing. Ideographs then try the downloaded
+    /// face of the interface's region first. Like the test below, it runs in a process of its own
+    /// with no installed CJK face; two copies of egui's icon face stand in for downloaded ones.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn notes_missing_cjk_and_prefers_the_interface_face() {
+        if std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::notes_missing_cjk_and_prefers_the_interface_face", "--nocapture"])
+                .env("RUSTGIS_TEST_NO_INSTALLED_CJK", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
+            return;
+        }
+        use crate::fonts::{CjkRegion, CjkScript, add_downloaded_cjk_font, font_generation, prefer_downloaded_cjk, take_missing_cjk};
+        let _ = take_missing_cjk();
+        super::measure("Taipei 101", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![], "no CJK text, nothing noted");
+        super::measure("Taipei\u{3000}101", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![], "the ideographic space draws nothing and needs no face");
+        super::measure("臺北 たいぺい 타이베이", 10.0, false);
+        assert_eq!(take_missing_cjk(), vec![CjkScript::Han, CjkScript::Kana, CjkScript::Hangul]);
+        assert_eq!(take_missing_cjk(), vec![], "taken once");
+
+        let icons = epaint_default_fonts::EGUI_ICONS;
+        assert!(add_downloaded_cjk_font(CjkRegion::SimplifiedChinese, icons.to_vec()).is_ok());
+        assert!(add_downloaded_cjk_font(CjkRegion::TraditionalChinese, icons.to_vec()).is_ok());
+        let label = super::font(false).unwrap();
+        let drawn_by = |region| {
+            let (face, _) = super::glyph('\u{E618}', label, None).unwrap();
+            std::ptr::eq(face, super::downloaded_cjk(region).unwrap())
+        };
+        assert!(drawn_by(CjkRegion::SimplifiedChinese), "the renderer's own order puts Simplified Chinese first");
+        let generation = font_generation();
+        prefer_downloaded_cjk(Some(CjkRegion::TraditionalChinese));
+        assert!(drawn_by(CjkRegion::TraditionalChinese));
+        assert!(font_generation() > generation, "widths cached before are measured again");
+        prefer_downloaded_cjk(None);
+        assert!(drawn_by(CjkRegion::SimplifiedChinese));
+    }
+
+    /// Uses the real tile filter, marker cache, raster drawing and PDF glyph-run path. It runs
+    /// without host fonts in its own process so a late fallback is load-bearing everywhere.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn late_script_fonts_reach_tiles_markers_raster_and_pdf() {
+        use super::{Canvas, Rgba};
+        if std::env::var_os("RUSTGIS_TEST_NO_INSTALLED_CJK").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "text::coverage_tests::late_script_fonts_reach_tiles_markers_raster_and_pdf", "--nocapture"])
+                .env("RUSTGIS_TEST_NO_INSTALLED_CJK", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        use crate::fonts::{ScriptFont, add_downloaded_script_font, take_missing_scripts};
+        let tile = || rustgis_tiles::Label {
+            text: "অ".into(),
+            x: 20.0,
+            y: 20.0,
+            size: 12.0,
+            color: [0, 0, 0, 255],
+            halo: None,
+            bold: false,
+            italic: false,
+            letter_spacing: 0.0,
+            max_width: 0.0,
+            justify: 0.0,
+            priority: 0.0,
+            anchor: [0.0, 0.0],
+            offset: [0.0, 0.0],
+            angle: None,
+            icon: None,
+            collide: Default::default(),
+        };
+        let _ = take_missing_scripts();
+        let _ = crate::approximations::take();
+        assert!(crate::tiles::tile_label(tile()).is_none());
+        assert!(take_missing_scripts().contains(&ScriptFont::Bengali), "tile filtering must request its missing font");
+        let marker = rustgis_map::Glyph::new('অ', "");
+        assert!(crate::glyphs::shape(marker).is_none(), "cache an initial missing marker");
+        let _ = crate::approximations::take();
+        let before = super::measure("অ", 12.0, false);
+        assert!(crate::approximations::take().is_empty(), "measurement alone is not an output loss");
+        let bytes = include_bytes!("../testdata/test-fallback.otf");
+        for script in [ScriptFont::Latin, ScriptFont::Arabic, ScriptFont::Bengali, ScriptFont::Lao] {
+            assert!(add_downloaded_script_font(script, bytes.to_vec()).is_ok());
+        }
+        assert!(super::measure("অ", 12.0, false) > before, "invalidate widths measured without the font");
+        assert!(crate::tiles::tile_label(tile()).is_some());
+        assert!(crate::glyphs::shape(marker).is_some(), "invalidate the pre-download marker cache");
+        let text = "əঅກی";
+        assert!(super::covers(text, false));
+        for c in text.chars() {
+            let mut canvas = Canvas::new(32, 32).unwrap();
+            super::text_at(&mut canvas, &c.to_string(), 2.0, 16.0, 20.0, Rgba::new(0, 0, 0, 255), false, super::Align::Left, false);
+            assert!(canvas.into_pixmap().pixels().iter().any(|p| p.alpha() != 0), "{c}: no raster ink");
+        }
+        let draw = || {
+            let mut canvas = Canvas::recording(128, 32).unwrap();
+            super::text_at(&mut canvas, text, 2.0, 16.0, 20.0, Rgba::new(0, 0, 0, 255), false, super::Align::Left, false);
+            canvas.into_drawing().unwrap()
+        };
+        let (_, _, items) = draw().finish();
+        let written: String = items
+            .iter()
+            .filter_map(|item| match item {
+                crate::vector::Item::Glyphs(run) => Some(run),
+                _ => None,
+            })
+            .flat_map(|run| run.glyphs.iter().map(|g| g.ch))
+            .collect();
+        assert_eq!(written, text, "vector export must retain the actual Unicode text");
+        let pages = [crate::pdf::Page::drawing(draw(), 64.0, 16.0)];
+        let (pdf, outlined) = crate::pdf::write_with(&pages, "Fallback", crate::pdf::Options::default());
+        assert!(outlined.is_empty(), "{outlined:?}");
+        let maps: String = crate::pdf::tests::objects(&pdf)
+            .iter()
+            .map(|(_, body)| String::from_utf8_lossy(body).into_owned())
+            .filter(|body| body.contains("beginbfchar"))
+            .collect();
+        for c in text.chars() {
+            assert!(maps.contains(&format!("<{:04X}>", u32::from(c))), "{c}: missing PDF Unicode map");
+        }
+        assert!(crate::approximations::take().is_empty(), "covered text must not report a missing-glyph loss");
     }
 
     /// In the browser no CJK font is installed: the face the web app downloads is checked, kept
@@ -1365,18 +1657,18 @@ mod coverage_tests {
             assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"), "the test didn't run in the child process");
             return;
         }
-        use crate::fonts::{CjkRegion, add_downloaded_cjk_font, downloaded_cjk_font, fonts_added};
+        use crate::fonts::{CjkRegion, add_downloaded_cjk_font, downloaded_cjk_font, font_generation};
         use epaint_default_fonts::{EGUI_ICONS, HACK_REGULAR};
         let icon = "\u{E618}";
         assert!(!super::covers(icon, false), "the built-in label font has no icons");
-        let (before, added) = (super::measure(icon, 10.0, false), fonts_added());
+        let (before, added) = (super::measure(icon, 10.0, false), font_generation());
         let letters = super::letters_of("\u{E618}\u{E618}", super::Face::default());
         assert!(add_downloaded_cjk_font(CjkRegion::Japanese, b"not a font".to_vec()).is_err());
         assert!(downloaded_cjk_font(CjkRegion::Japanese).is_none());
         assert_eq!(add_downloaded_cjk_font(CjkRegion::Japanese, EGUI_ICONS.to_vec()), Ok(EGUI_ICONS), "the kept bytes are shared");
-        assert_eq!(fonts_added(), added + 1);
+        assert_eq!(font_generation(), added + 1);
         assert_eq!(add_downloaded_cjk_font(CjkRegion::Japanese, HACK_REGULAR.to_vec()), Err(HACK_REGULAR.to_vec()), "one face a region");
-        assert_eq!(fonts_added(), added + 1);
+        assert_eq!(font_generation(), added + 1);
         assert!(super::covers(icon, false));
         let spaced = super::letters_of("\u{E618}\u{E618}", super::Face::default());
         assert!(spaced > letters, "a letter count shaped before the face arrived was kept: {letters} then {spaced}");
@@ -1424,7 +1716,7 @@ mod coverage_tests {
         // A character the serif lacks and the sans has: drawn from the sans.
         let sans = italic;
         let c = ('\u{100}'..='\u{2FFF}').find(|&c| regular.glyph_id(c).0 == 0 && sans.glyph_id(c).0 != 0).expect("a character Hack lacks");
-        let (glyphs, _) = shape(&format!("a{c}"), 24.0, regular, Some(sans));
+        let (glyphs, _, _) = shape(&format!("a{c}"), 24.0, regular, Some(sans));
         assert!(glyphs.len() == 2 && std::ptr::eq(glyphs[1].0, sans), "{c:?} left out");
         // In a real italic, a glyph from another face leans; the italic's own don't.
         let it = Face { italic: true, serif: true, ..Face::default() };
@@ -1487,7 +1779,7 @@ mod coverage_tests {
         let sans = font(false).unwrap();
         let lacking = ('\u{2190}'..='\u{2BFF}').find(|&c| serif.0.glyph_id(c).0 == 0 && sans.glyph_id(c).0 != 0);
         if let Some(c) = lacking {
-            let (glyphs, _) = super::shape(&c.to_string(), 24.0, &serif.0, super::sans_beside(&serif.0, Face::default()));
+            let (glyphs, _, _) = super::shape(&c.to_string(), 24.0, &serif.0, super::sans_beside(&serif.0, Face::default()));
             assert!(glyphs.len() == 1 && std::ptr::eq(glyphs[0].0, sans), "{c:?} left out");
         }
     }

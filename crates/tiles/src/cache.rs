@@ -158,6 +158,13 @@ type ImageDecoder = Box<dyn Fn(Vec<u8>, Decoded) + Send + Sync>;
 const BUDGET: usize = if cfg!(target_arch = "wasm32") { 160 << 20 } else { 384 << 20 };
 /// A failed address is tried again after this long.
 pub const RETRY: Duration = Duration::from_secs(60);
+/// How long a read of more than 1 MiB (a big tile of a slow server, #2570) may take in all, where
+/// a map tile has 30 seconds. The longest any caller waits for one: a COG window's first batch of
+/// four bands or more waits 420 seconds (the engine's `batch_wait`: `WINDOW_WAIT` and `BAND_WAIT`;
+/// an engine test holds the two together). The others give up at or before that: two minutes for a
+/// header, one band, a raster in place or a remote file, five minutes for a Tessera read, and a
+/// map's tile layer has nobody waiting. Keep it no less than the longest wait, no more.
+pub const LONG_READ: Duration = Duration::from_secs(420);
 /// The largest tile or document fetched.
 pub const MAX_BYTES: usize = 16 << 20;
 /// The error a fetcher gives a request it dropped unfetched (the view moved on): the address is
@@ -250,7 +257,9 @@ static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
 static SIGNED_OUT: AtomicU64 = AtomicU64::new(0);
 
 /// Source revisions are locked before any retained cache. Publication and reload share this
-/// lock; callbacks and I/O must always run after releasing it.
+/// lock. [`if_archive_current`] runs its `f` while holding it (`land`, `keep` and
+/// `remember_info` run there), so such a callback must not do I/O or call back into code that
+/// takes this lock; any other I/O runs after releasing it.
 fn archive_epochs() -> &'static Mutex<HashMap<String, u64>> {
     static E: std::sync::LazyLock<Mutex<HashMap<String, u64>>> = std::sync::LazyLock::new(Mutex::default);
     &E
@@ -465,6 +474,8 @@ struct PublicOnly {
     /// Once capacity is reached, active public restrictions are never evicted; unknown URLs fail
     /// closed to [`crate::address::Reach::Public`] unless explicitly user-named via [`allow_named`].
     saturated: bool,
+    /// Whether [`take_public_only_full`] has said that capacity was reached.
+    said_full: bool,
 }
 
 fn public_only() -> &'static Mutex<PublicOnly> {
@@ -482,67 +493,69 @@ fn canonical_resource(url: &str) -> &str {
 /// Marks `url` as document-derived so range reads, headers, tiles and downloads of it connect
 /// only to public internet addresses, and forgets any earlier local read of it.
 pub fn restrict_to_public(url: &str) {
-    let base = canonical_resource(url);
-    if base.is_empty() {
-        return;
-    }
-    let added = {
-        let mut p = public_only().lock().unwrap_or_else(|e| e.into_inner());
-        let removed_named = p.named_local.remove(base);
-        if removed_named {
-            p.named_order.retain(|item| item != base);
-        }
-        let mut changed = removed_named;
-        if let Some(tpl) = PublicTemplate::parse(base)
-            && !p.templates.contains(&tpl)
-        {
-            if p.templates.len() < MAX_PUBLIC_TEMPLATES {
-                p.templates.push(tpl);
-                changed = true;
-            } else if !p.saturated {
-                p.saturated = true;
-                changed = true;
-            }
-        }
-        if !p.exact.contains(base) {
-            if p.exact.len() < MAX_PUBLIC_ONLY {
-                p.exact.insert(base.to_string());
-                changed = true;
-            } else if !p.saturated {
-                p.saturated = true;
-                changed = true;
-            }
-        }
-        changed
-    };
-    if added {
-        let aliases: Vec<String> =
-            lock().slots.keys().filter(|key| canonical_resource(key) == base).map(|key| resource_of(key).to_string()).collect();
-        forget(base);
-        if base != url {
-            forget(url);
-        }
-        for alias in aliases {
-            forget(&alias);
-        }
-        forget_restricted_aliases(base);
-    }
+    restrict_all_to_public([url]);
 }
 
-/// Forgets the cached answers of every address whose canonical resource is `base`: the plain
-/// spelling, the anonymous one and the login-wrapped ones alike ([`forget`] compares the spelling
-/// it was given). Reads under way are kept, as [`forget`] keeps them, and [`request`] and
-/// [`peek_from`] refuse what they complete under a wider reach.
-fn forget_restricted_aliases(base: &str) {
-    let mut c = lock();
-    c.slots.retain(|key, slot| {
-        if canonical_resource(key) != base {
-            return true;
+/// [`restrict_to_public`] for every address of `urls` (a received file's): each is recorded,
+/// then their earlier reads are forgotten ([`forget_resources`]), the cached answers gone through
+/// once for all of them rather than once for each.
+pub fn restrict_all_to_public<'a>(urls: impl IntoIterator<Item = &'a str>) {
+    let mut bases = std::collections::HashSet::new();
+    let mut spellings = std::collections::HashSet::new();
+    for url in urls {
+        let base = canonical_resource(url);
+        if base.is_empty() || !record_public(base) {
+            continue;
         }
-        slot.other = None;
-        matches!(slot.entry, Entry::Pending) && !crate::mbtiles::is_tile(key)
-    });
-    c.bytes = c.slots.values().map(Slot::bytes).sum();
+        bases.insert(base.to_string());
+        spellings.insert(forgotten_as(base).to_string());
+        spellings.insert(forgotten_as(url).to_string());
+    }
+    if bases.is_empty() {
+        return;
+    }
+    // Every spelling cached of the same resource: the plain one, the anonymous one and the
+    // login-wrapped ones alike ([`forget`] compares the spelling it was given).
+    let aliases: Vec<String> = lock()
+        .slots
+        .keys()
+        .filter(|key| bases.contains(canonical_resource(key)))
+        .map(|key| forgotten_as(resource_of(key)).to_string())
+        .collect();
+    spellings.extend(aliases);
+    forget_resources(&spellings, &bases);
+}
+
+/// Records `base` (a canonical resource) as held to public internet addresses. Whether that
+/// changed what is held, so its earlier reads must be forgotten.
+fn record_public(base: &str) -> bool {
+    let mut p = public_only().lock().unwrap_or_else(|e| e.into_inner());
+    let removed_named = p.named_local.remove(base);
+    if removed_named {
+        p.named_order.retain(|item| item != base);
+    }
+    let mut changed = removed_named;
+    if let Some(tpl) = PublicTemplate::parse(base)
+        && !p.templates.contains(&tpl)
+    {
+        if p.templates.len() < MAX_PUBLIC_TEMPLATES {
+            p.templates.push(tpl);
+            changed = true;
+        } else if !p.saturated {
+            p.saturated = true;
+            changed = true;
+        }
+    }
+    if !p.exact.contains(base) {
+        if p.exact.len() < MAX_PUBLIC_ONLY {
+            p.exact.insert(base.to_string());
+            changed = true;
+        } else if !p.saturated {
+            p.saturated = true;
+            changed = true;
+        }
+    }
+    changed
 }
 
 /// The origin a direct warp address's base is asked under. The restriction recorded for the warp
@@ -577,9 +590,28 @@ pub fn allow_named(url: &str) {
     }
 }
 
+/// Runs `f` with every address asked for in it read only from the internet when `held` (a
+/// plugin's command: plugins reach only the internet), whatever is recorded of the address, so
+/// the requests a command derives from the address it was given (a listing, a search, a next
+/// page) are held as that address is. The hold is part of the request context
+/// ([`rustgis_data::source::remote::held_still`]): the workers that carry the context on, as they
+/// carry cancellation, are held too. Requests made later outside it follow what is recorded
+/// ([`restrict_to_public`]).
+pub fn held_to_public<T>(held: bool, f: impl FnOnce() -> T) -> T {
+    if !held {
+        return f();
+    }
+    let still = rustgis_data::source::remote::held_still(Arc::new(|| true));
+    with_optional_still(Some(still), f)
+}
+
 /// The network reach ceiling recorded for `url`: [`crate::address::Reach::Public`] when a web
-/// document named it, [`crate::address::Reach::Local`] otherwise.
+/// document named it, or while this thread's requests are [`held_to_public`],
+/// [`crate::address::Reach::Local`] otherwise.
 pub fn ceiling_for(url: &str) -> crate::address::Reach {
+    if rustgis_data::source::remote::requests_held() {
+        return crate::address::Reach::Public;
+    }
     let base = canonical_resource(url);
     if base.is_empty() {
         return crate::address::Reach::Local;
@@ -594,6 +626,17 @@ pub fn ceiling_for(url: &str) -> crate::address::Reach {
     } else {
         crate::address::Reach::Local
     }
+}
+
+/// Whether the addresses recorded as reaching only the internet ([`restrict_to_public`]) have
+/// filled their table ([`MAX_PUBLIC_ONLY`] addresses or [`MAX_PUBLIC_TEMPLATES`] templates) and
+/// this hasn't said so yet: from then on every address not recorded is read only from the
+/// internet, until the restrictions are reset. True once, for the session to say.
+pub fn take_public_only_full() -> bool {
+    let mut p = public_only().lock().unwrap_or_else(|e| e.into_inner());
+    let new = p.saturated && !p.said_full;
+    p.said_full |= p.saturated;
+    new
 }
 
 /// Resets document-origin public restrictions recorded by [`restrict_to_public`] and [`allow_named`].
@@ -1125,15 +1168,30 @@ fn resource_of(key: &str) -> &str {
 /// whose address stays the same, read again with other keys). Reads under way are kept, except an
 /// MBTiles file's tiles: it is forgotten when it may be replaced, and its old tiles mustn't stay.
 pub fn forget(url: &str) {
+    forget_resources(&std::collections::HashSet::from([forgotten_as(url).to_string()]), &std::collections::HashSet::new());
+}
+
+/// The resource [`forget`] forgets for `url`: without a download limit, and without a COG's look.
+fn forgotten_as(url: &str) -> &str {
     let url = split_download_limit(url).0;
     // PMTiles and MBTiles paths are taken whole (see `resource_of`), even with a look-like name.
     let pmtiles = url.rsplit_once('.').is_some_and(|(_, ext)| ext.eq_ignore_ascii_case("pmtiles"));
-    let url = if pmtiles || crate::mbtiles::check(url).is_ok() { url } else { crate::cog::split(url).0 };
+    if pmtiles || crate::mbtiles::check(url).is_ok() { url } else { crate::cog::split(url).0 }
+}
+
+/// Forgets every resource of `resources` ([`forgotten_as`]) as [`forget`] does, and every cached
+/// answer whose canonical resource is one of `bases`. The cached answers are gone through once for
+/// all of them; the archives, COG tiles and remote files of each resource are forgotten one
+/// resource at a time, each going through its own cache. Reads under way are kept, and [`request`]
+/// and [`peek_from`] refuse what they complete under a wider reach.
+fn forget_resources(resources: &std::collections::HashSet<String>, bases: &std::collections::HashSet<String>) {
     // First: a tile answered from here on is dropped, and one answered before goes with the rest.
-    crate::mbtiles::forget_archive(url);
+    for url in resources {
+        crate::mbtiles::forget_archive(url);
+    }
     let mut c = lock();
     c.slots.retain(|k, s| {
-        if resource_of(k) != url {
+        if !resources.contains(resource_of(k)) && !bases.contains(canonical_resource(k)) {
             return true;
         }
         s.other = None;
@@ -1141,12 +1199,14 @@ pub fn forget(url: &str) {
     });
     c.bytes = c.slots.values().map(Slot::bytes).sum();
     drop(c);
-    crate::pmtiles::forget_archive(url);
-    crate::cog::forget_file(url);
+    for url in resources {
+        crate::pmtiles::forget_archive(url);
+        crate::cog::forget_file(url);
+        rustgis_data::source::remote::forget_file(url);
+    }
     // Map tiles made from a service's pictures, kept only while one is missing or on its way,
     // and their plans: all are made again (those kept in the cache stay till `clear`).
     crate::warp::forget();
-    rustgis_data::source::remote::forget_file(url);
     GENERATION.fetch_add(1, Ordering::Relaxed);
 }
 
@@ -1485,6 +1545,7 @@ fn decode_with(
             b,
             Box::new(move |r| {
                 settle(match r {
+                    // The browser read it as a picture: a failure here isn't a document.
                     Ok(raw) => decode_image(&raw).map(Payload::Image),
                     Err(b) => decode(&b, want),
                 })
@@ -1529,6 +1590,8 @@ pub fn split_tail(url: &str) -> (&str, Option<u64>) {
 /// it: those pass `address::check`, which takes only `http(s)://` ones.
 pub const DOWNLOAD: &str = "rustgis-download:";
 const LIMITED_DOWNLOAD: &str = "rustgis-download-limit:";
+// A bounded Test Connection read, not a long user download, even at local reach.
+const TILE_SAMPLE: &str = "rustgis-tile-sample:";
 
 /// The most bytes a data download may have.
 pub const MAX_DOWNLOAD: usize = if cfg!(target_arch = "wasm32") { 256 << 20 } else { 512 << 20 };
@@ -1542,6 +1605,9 @@ pub fn split_download(url: &str) -> (&str, bool) {
 /// Splits a download marker, including a caller's smaller byte budget. Fetchers must enforce
 /// this limit while reading, before allocating the whole response.
 pub fn split_download_limit(url: &str) -> (&str, Option<usize>) {
+    if let Some(url) = url.strip_prefix(TILE_SAMPLE) {
+        return (url, Some(MAX_BYTES));
+    }
     if let Some(marked) = url.strip_prefix(LIMITED_DOWNLOAD)
         && let Some((limit, url)) = marked.split_once(':')
         && let Ok(limit) = limit.parse::<usize>()
@@ -1559,10 +1625,10 @@ pub fn split_download_limit(url: &str) -> (&str, Option<usize>) {
 /// ([`download_public_limited`]): its address comes from data, like a picture for the pop-up.
 /// A download the user named is not given up.
 pub fn gives_up_when_stalled(url: &str, ceiling: crate::address::Reach) -> bool {
-    split_download_limit(url).1.is_none() || ceiling == crate::address::Reach::Public
+    url.starts_with(TILE_SAMPLE) || split_download_limit(url).1.is_none() || ceiling == crate::address::Reach::Public
 }
 
-fn download_address(url: &str, max: usize) -> String {
+pub(crate) fn download_address(url: &str, max: usize) -> String {
     if max >= MAX_DOWNLOAD { format!("{DOWNLOAD}{url}") } else { format!("{LIMITED_DOWNLOAD}{max}:{url}") }
 }
 
@@ -1736,6 +1802,36 @@ pub fn download_detailed(url: &str, max: usize, done: DoneDetailed) {
     download_detailed_within(url, max, DOWNLOAD_TIMEOUT, &[], done);
 }
 
+/// Like [`download_detailed`], preserving the final post-redirect [`crate::address::Origin`] and
+/// observed network reach alongside the bytes: for a service's document, whose links reach only as
+/// far as it did.
+pub fn download_detailed_with_origin(url: &str, max: usize, done: DoneFetchedDetailed) {
+    download_fetched_reaching(url, max, DOWNLOAD_TIMEOUT, &[], Reaching::Any, done);
+}
+
+/// Like [`download_within`], preserving the final post-redirect [`crate::address::Origin`] and
+/// observed network reach alongside the bytes.
+pub fn download_within_with_origin(url: &str, max: usize, timeout: std::time::Duration, done: FetchedDone) {
+    download_fetched_reaching(url, max, timeout, &[], Reaching::Any, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
+/// Like [`download_limited`], connecting no wider than `ceiling` and giving up after `timeout`
+/// natively (the usual download's when none), preserving the final post-redirect
+/// [`crate::address::Origin`] and observed network reach alongside the bytes: a paged read's
+/// next page is held to where the page before it was read, without recording its address
+/// ([`restrict_to_public`]).
+pub fn download_limited_reaching_with_origin(
+    url: &str,
+    max: usize,
+    timeout: Option<std::time::Duration>,
+    ceiling: crate::address::Reach,
+    done: FetchedDone,
+) {
+    let reaching = if ceiling == crate::address::Reach::Public { Reaching::Public } else { Reaching::Any };
+    let timeout = timeout.unwrap_or(DOWNLOAD_TIMEOUT);
+    download_fetched_reaching(url, max, timeout, &[], reaching, Box::new(move |r| done(r.map_err(|f| f.message))));
+}
+
 /// Like [`download`], preserving the final post-redirect [`crate::address::Origin`] and observed
 /// network reach alongside the downloaded bytes.
 pub fn download_with_origin(url: &str, done: FetchedDone) {
@@ -1784,7 +1880,8 @@ enum Reaching {
     Public,
 }
 
-type DoneFetchedDetailed = Box<dyn FnOnce(Result<Fetched, Failure>) + Send>;
+/// Called once with a download's bytes and where they came from, or what is known of its failure.
+pub type DoneFetchedDetailed = Box<dyn FnOnce(Result<Fetched, Failure>) + Send>;
 
 /// Like [`download_detailed`], giving up after `timeout` natively; a status in `omit` isn't
 /// recorded as a failure.
@@ -1868,6 +1965,13 @@ pub fn download_blocking_limited(url: &str, max: usize) -> Result<Vec<u8>, Strin
 #[cfg(not(target_arch = "wasm32"))]
 pub fn download_blocking_omitting(url: &str, omit: &'static [u16]) -> Result<Vec<u8>, String> {
     download_blocking_omitting_within(url, MAX_DOWNLOAD, BLOCKING_TIMEOUT, omit).map_err(large_file_hint)
+}
+
+/// [`download_blocking_omitting`] reaching no wider than `ceiling` (a file of a store, within the
+/// store's reach), nor than [`ceiling_for`] its own address.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn download_blocking_omitting_at(url: &str, omit: &'static [u16], ceiling: crate::address::Reach) -> Result<Vec<u8>, String> {
+    download_blocking_with_origin_within(url, MAX_DOWNLOAD, BLOCKING_TIMEOUT, omit, ceiling).map(|f| f.bytes).map_err(large_file_hint)
 }
 
 /// A waited-for download's error, with where a large file goes instead when it timed out.
@@ -2117,10 +2221,27 @@ pub(crate) fn head_with_ceiling(url: &str, ceiling: crate::address::Reach, done:
 /// to anonymous access or ambient S3 credentials.
 pub fn prepare_get(url: &str) -> Result<crate::s3::Prepared, String> {
     crate::logins::check(url).map_err(str::to_string)?;
+    // A login is never bound to an anonymous address (`login_address::bind` takes only a web
+    // address), so a bound one is never anonymous.
     if rustgis_data::login_address::is_wrapper(url) {
-        return Ok(crate::s3::Prepared { url: crate::logins::inner(url).to_string(), headers: Vec::new(), signed: false });
+        return Ok(crate::s3::Prepared {
+            url: crate::logins::inner(url).to_string(),
+            headers: Vec::new(),
+            signed: false,
+            anonymous: false,
+        });
     }
     crate::s3::prepare(url)
+}
+
+/// Fetches one uncached test tile with the tile byte limit and browser stall timeout.
+/// The address can be local when entered by the user, like other connection tests.
+pub fn fetch_tile_sample(url: &str, done: Done) {
+    if let Err(e) = crate::address::check_reach(url, ceiling_for(url)) {
+        done(Err(e));
+        return;
+    }
+    fetch_bytes(format!("{TILE_SAMPLE}{url}"), done, &[404]);
 }
 
 /// Fetches an address's bytes, uncached (through the browser's fetcher, or the worker threads).
@@ -2363,6 +2484,9 @@ fn payload_bytes(p: &Payload) -> usize {
     }
 }
 
+/// What an image fetch whose answer is in no picture format fails with first (then why).
+pub const NOT_A_PICTURE: &str = "not a picture";
+
 /// Decodes fetched bytes.
 pub fn decode(bytes: &[u8], want: Want) -> Result<Payload, String> {
     if bytes.is_empty() {
@@ -2372,7 +2496,11 @@ pub fn decode(bytes: &[u8], want: Want) -> Result<Payload, String> {
         return Err(format!("{} bytes is too large for a tile", bytes.len()));
     }
     match want {
-        Want::Image => decode_image(bytes).map(Payload::Image),
+        // An answer in no picture format (a WMS exception document) is said as such, so it is
+        // told from a failed fetch and from a picture that couldn't be read (one too large).
+        Want::Image => decode_image(bytes)
+            .map(Payload::Image)
+            .map_err(|e| if bytes.starts_with(RAW) || image::guess_format(bytes).is_ok() { e } else { format!("{NOT_A_PICTURE}: {e}") }),
         Want::Vector => mvt::decode(bytes).map(Payload::Vector),
         Want::Json => serde_json::from_slice(bytes).map(Payload::Json).map_err(|e| format!("not JSON: {e}")),
     }
@@ -2446,6 +2574,57 @@ mod native {
     use crate::address::{Origin, Reach};
     use crate::failure::{Failure, Reason};
 
+    /// Runs `work` on a thread of its own, handing it `done`. When the system refuses a thread,
+    /// `done` hears `refused` (given why) instead, so the caller is answered either way.
+    fn answer_on_own_thread<T: 'static>(
+        done: Box<dyn FnOnce(T) + Send>,
+        refused: impl FnOnce(String) -> T,
+        work: impl FnOnce(Box<dyn FnOnce(T) + Send>) + Send + 'static,
+    ) {
+        let spawn = |work| std::thread::Builder::new().name("rustgis-request".into()).spawn(work).map(drop);
+        answer_on_own_thread_with(spawn, done, refused, work);
+    }
+
+    /// [`answer_on_own_thread`], its thread started by `spawn`, which a test can make refuse.
+    fn answer_on_own_thread_with<T: 'static>(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        done: Box<dyn FnOnce(T) + Send>,
+        refused: impl FnOnce(String) -> T,
+        work: impl FnOnce(Box<dyn FnOnce(T) + Send>) + Send + 'static,
+    ) {
+        let held = std::sync::Arc::new(Mutex::new(Some(done)));
+        let given = held.clone();
+        let spawned = spawn(Box::new(move || {
+            let done = given.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(done) = done {
+                work(done);
+            }
+        }));
+        if let Err(e) = spawned {
+            let done = held.lock().unwrap_or_else(|e| e.into_inner()).take();
+            if let Some(done) = done {
+                done(refused(format!("the system refused a thread for the request ({e})")));
+            }
+        }
+    }
+
+    /// A thread the system refuses for a request answers its `done` with the refusal, the request
+    /// unsent.
+    #[cfg(test)]
+    #[test]
+    fn a_refused_thread_answers_the_request_with_the_refusal() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let heard: std::sync::Arc<Mutex<Option<Result<(), String>>>> = std::sync::Arc::default();
+        let (h, sent) = (heard.clone(), std::sync::Arc::new(AtomicBool::new(false)));
+        let s = sent.clone();
+        let done: Box<dyn FnOnce(Result<(), String>) + Send> = Box::new(move |r| *h.lock().unwrap() = Some(r));
+        let refuse = |_| Err(std::io::Error::other("no threads left"));
+        answer_on_own_thread_with(refuse, done, Err, move |_| s.store(true, Ordering::Relaxed));
+        let heard = heard.lock().unwrap().take();
+        assert!(heard.is_some_and(|r| r.is_err_and(|e| e.contains("no threads left"))));
+        assert!(!sent.load(Ordering::Relaxed));
+    }
+
     /// Fetches under way at once, over all servers: two servers at their cap.
     const WORKERS: usize = 2 * PER_HOST;
     /// Fetches under way at once from one server.
@@ -2485,6 +2664,7 @@ mod native {
     /// The server an address is fetched from (`host[:port]`, lowercase), or `""` for a local
     /// read, which no server limits.
     pub(super) fn host(url: &str) -> String {
+        let (url, _) = super::split_download_limit(url);
         if crate::mbtiles::is_tile(url) || url.starts_with(LOCAL) {
             return String::new();
         }
@@ -2562,7 +2742,12 @@ mod native {
 
     /// Workers share this agent's checked connections and bounded idle pool.
     pub(super) fn agent() -> ureq::Agent {
-        let config = config_builder(std::time::Duration::from_secs(30))
+        agent_with(std::time::Duration::from_secs(30))
+    }
+
+    /// An agent of the workers' kind with `timeout` for a whole request.
+    fn agent_with(timeout: std::time::Duration) -> ureq::Agent {
+        let config = config_builder(timeout)
             // The workers share the agent: keep a connection open for each fetch a server
             // may have under way, so the next tile doesn't connect again.
             .max_idle_connections_per_host(PER_HOST)
@@ -2575,6 +2760,26 @@ mod native {
     fn shared_agent() -> &'static ureq::Agent {
         static A: OnceLock<ureq::Agent> = OnceLock::new();
         A.get_or_init(agent)
+    }
+
+    /// A range read of more than this many bytes is a big tile (a cloud-optimised GeoTIFF's are
+    /// often 2 to 8 MB), which a slow server needs longer than a map tile's 30 seconds for.
+    const LONG_RANGE: u64 = 1 << 20;
+
+    /// The agent the workers read `url` with: the shared one, or for a range of more than
+    /// [`LONG_RANGE`] bytes the one with [`super::LONG_READ`] to spend, as a window waits for it. A
+    /// server that sends nothing is still given up on then (ureq 3 has no idle timeout). Each agent
+    /// has its own connections, as `download_agent`'s do.
+    pub(super) fn worker_agent(url: &str, ceiling: Reach) -> &'static ureq::Agent {
+        static LONG: OnceLock<ureq::Agent> = OnceLock::new();
+        static LONG_PUBLIC: OnceLock<ureq::Agent> = OnceLock::new();
+        let long = super::split_range(url).1.is_some_and(|(a, b)| b.saturating_sub(a) >= LONG_RANGE);
+        match (ceiling == Reach::Public, long) {
+            (false, false) => shared_agent(),
+            (true, false) => shared_public_agent(),
+            (false, true) => LONG.get_or_init(|| agent_with(super::LONG_READ)),
+            (true, true) => LONG_PUBLIC.get_or_init(|| public_agent(super::LONG_READ)),
+        }
     }
 
     /// An agent for downloads, which may take minutes.
@@ -2934,7 +3139,12 @@ mod native {
         }
         let capture = Capture::current();
         let still = super::current_still();
-        std::thread::spawn(move || {
+        // Refused a thread: the file is read without asking, as past the limit.
+        let refused = |_| {
+            HEADS.fetch_sub(1, Relaxed);
+            Ok(super::Head::default())
+        };
+        answer_on_own_thread(done, refused, move |done| {
             super::with_optional_still(still, || {
                 let _scope = capture.enter();
                 let r = super::check_current()
@@ -2975,7 +3185,8 @@ mod native {
             for redirects in 0..=5 {
                 // The login goes to its own origin only: once a redirect leaves it, never again.
                 let bound = crate::logins::inherit(url, &at);
-                let login = if same_origin { crate::logins::apply(&bound)? } else { None };
+                // An anonymous request carries no login (only an explicitly bound one applies).
+                let login = if same_origin && !prepared.anonymous { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
                 let sending = if ceiling == Reach::Public { public } else { agent };
                 let mut req = sending.head(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
@@ -2994,6 +3205,7 @@ mod native {
                 } else {
                     req.config().timeout_global(agent.config().timeouts().global).build()
                 };
+                crate::logins::check(url).map_err(str::to_string)?;
                 let (resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 diagnostics.answered(resp.status().as_u16());
@@ -3043,7 +3255,7 @@ mod native {
     pub(super) fn post_fetched(url: String, body: String, ceiling: Reach, done: FetchedDone) {
         let capture = Capture::current();
         let still = super::current_still();
-        std::thread::spawn(move || {
+        answer_on_own_thread(done, Err, move |done| {
             super::with_optional_still(still, || {
                 let _scope = capture.enter();
                 let timeout = std::time::Duration::from_secs(60);
@@ -3076,7 +3288,7 @@ mod native {
                 return Err("S3 signed JSON POST requests are not supported.".into());
             }
             let bound = crate::logins::inherit(url, &prepared.url);
-            let login = crate::logins::apply(&bound)?;
+            let login = if prepared.anonymous { None } else { crate::logins::apply(&bound)? };
             carried_login = login.is_some();
             let target = login.as_ref().map_or(prepared.url.as_str(), |a| a.url.as_str());
             crate::address::check_reach(target, ceiling)?;
@@ -3085,6 +3297,7 @@ mod native {
                 req = req.header(name.as_str(), value.as_str());
             }
             super::check_current()?;
+            crate::logins::check(url).map_err(str::to_string)?;
             let (mut resp, reached) = connected(|| req.send(body)).map_err(unanswered)?;
             let status = resp.status().as_u16();
             diagnostics.answered(status);
@@ -3135,17 +3348,21 @@ mod native {
         let capture = Capture::current();
         let still = super::current_still();
         let progress = super::current_progress();
-        std::thread::spawn(move || {
-            super::with_optional_still(still, || {
-                super::with_progress(progress, || {
-                    let _scope = capture.enter();
-                    let r = super::check_current()
-                        .map_err(Failure::from)
-                        .and_then(|_| get_fetched_omitting(&download_agent(timeout), &url, omit));
-                    done(r);
+        answer_on_own_thread(
+            done,
+            |why| Err(Failure::from(why)),
+            move |done| {
+                super::with_optional_still(still, || {
+                    super::with_progress(progress, || {
+                        let _scope = capture.enter();
+                        let r = super::check_current()
+                            .map_err(Failure::from)
+                            .and_then(|_| get_fetched_omitting(&download_agent(timeout), &url, omit));
+                        done(r);
+                    })
                 })
-            })
-        });
+            },
+        );
     }
 
     /// Like [`download_fetched_within`], connecting only to internet addresses ([`public_agent`]).
@@ -3163,25 +3380,28 @@ mod native {
         let capture = Capture::current();
         let still = super::current_still();
         let progress = super::current_progress();
-        std::thread::spawn(move || {
-            super::with_optional_still(still, || {
-                super::with_progress(progress, || {
-                    let _scope = capture.enter();
-                    let r = super::check_current().map_err(Failure::from).and_then(|_| {
-                        fetch_answer(&public_agent(timeout), &url, Reach::Public, true, omit).map(|mut f| {
-                            f.origin = f.origin.narrow_reach(Reach::Public);
-                            f
-                        })
-                    });
-                    done(r);
+        answer_on_own_thread(
+            done,
+            |why| Err(Failure::from(why)),
+            move |done| {
+                super::with_optional_still(still, || {
+                    super::with_progress(progress, || {
+                        let _scope = capture.enter();
+                        let r = super::check_current().map_err(Failure::from).and_then(|_| {
+                            fetch_answer(&public_agent(timeout), &url, Reach::Public, true, omit).map(|mut f| {
+                                f.origin = f.origin.narrow_reach(Reach::Public);
+                                f
+                            })
+                        });
+                        done(r);
+                    })
                 })
-            })
-        });
+            },
+        );
     }
 
     /// Dispatches each queued read through the pool matching its inherited IP ceiling.
     fn work() {
-        let agent = shared_agent();
         let q = queue();
         loop {
             let (url, done, host, capture, omit, still, ceiling) = {
@@ -3199,8 +3419,7 @@ mod native {
             let _scope = capture.enter();
             let result = super::with_optional_still(still.clone(), || {
                 super::check_current()?;
-                fetch_answer(if ceiling == Reach::Public { shared_public_agent() } else { agent }, &url, ceiling, false, omit)
-                    .map_err(|f| f.message)
+                fetch_answer(worker_agent(&url, ceiling), &url, ceiling, false, omit).map_err(|f| f.message)
             });
             {
                 let mut jobs = q.jobs.lock().unwrap_or_else(|e| e.into_inner());
@@ -3343,6 +3562,53 @@ mod native {
         len.trim().parse::<u64>().ok().filter(|len| *len > 0)
     }
 
+    /// The octets a `Content-Range` header says an answer holds (`bytes 200-299/1000`: 200 and
+    /// 299); none when it can't be read.
+    pub(super) fn content_range_span(header: &str) -> Option<(u64, u64)> {
+        let span = header.trim().strip_prefix("bytes")?.trim_start().split('/').next()?;
+        let (a, b) = span.split_once('-')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    }
+
+    /// The sign-ins' tokens a hop to `at` carries, as (header, value, whether a refusal must be
+    /// status-only): none for a `bare` request (signed for S3, or read anonymously, as a plugin's
+    /// `host.fetch` is), at any hop.
+    /// - An Earthdata Login token goes to NASA's Earthdata data hosts only, asked for at each hop:
+    ///   a redirect that leaves them (to a presigned address) goes without it.
+    /// - A Copernicus Data Space sign-in's token goes to its data hosts only, asked for at each hop
+    ///   like Earthdata's (and renewed first when it is about to expire). A hop carrying it makes a
+    ///   refusal status-only: a server may echo the token back.
+    /// - An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at each
+    ///   hop like Earthdata's, unless the connection's own ArcGIS token applies ([`implicit_arcgis`]).
+    pub(super) fn sign_ins(bare: bool, login: Option<&crate::logins::Applied>, at: &str) -> Vec<(&'static str, String, bool)> {
+        let mut out = Vec::new();
+        if bare {
+            return out;
+        }
+        if let Some(auth) = crate::earthdata::authorization(at) {
+            out.push(("Authorization", auth, false));
+        }
+        if let Some(auth) = crate::copernicus::authorization_fresh(at) {
+            out.push(("Authorization", auth, true));
+        }
+        if let Some(auth) = implicit_arcgis(bare, login, at) {
+            out.push(("X-Esri-Authorization", auth, false));
+        }
+        out
+    }
+
+    /// The portal sign-in's `X-Esri-Authorization` value for a hop to `at` (renewed first when it
+    /// is about to expire), or `None`. A connection's own ArcGIS token outranks it: with one
+    /// applied (already in the address) the sign-in's token is neither added nor renewed, and a
+    /// refused or expired connection token never falls back to it. A `bare` request (signed for
+    /// S3, or read anonymously) has none.
+    pub(super) fn implicit_arcgis(bare: bool, login: Option<&crate::logins::Applied>, at: &str) -> Option<String> {
+        if bare || login.is_some_and(|applied| applied.arcgis) {
+            return None;
+        }
+        crate::arcgis_auth::authorization_fresh(at)
+    }
+
     /// The answer to `url`; a refusal keeps the server's answer only when `detail` asks for it,
     /// as tiles a server doesn't have are routine and only their status is read. A status in
     /// `omit` is an expected answer: its failure isn't recorded, only noted once per server. A
@@ -3394,6 +3660,7 @@ mod native {
             let mut measuring: Option<u64> = None;
             // Explicit service logins outrank implicit S3 endpoint signing.
             let prepared = super::prepare_get(url)?;
+            let bare = prepared.bare();
             Origin { url: prepared.url.clone(), reach: initial }.check(&prepared.url)?;
             let mut at = prepared.url.clone();
             let mut ceiling = initial;
@@ -3403,7 +3670,7 @@ mod native {
             let mut resp = loop {
                 // The login goes to its own origin only: once a redirect leaves it, never again.
                 let bound = crate::logins::inherit(url, &at);
-                let login = if !prepared.signed && same_origin { crate::logins::apply(&bound)? } else { None };
+                let login = if !bare && same_origin { crate::logins::apply(&bound)? } else { None };
                 carried_login |= login.is_some();
                 let sending = if ceiling == Reach::Public && initial != Reach::Public { public } else { agent };
                 let mut req = sending.get(login.as_ref().map_or(at.as_str(), |a| a.url.as_str()));
@@ -3425,28 +3692,10 @@ mod native {
                         req = req.header(k.as_str(), v.as_str());
                     }
                 }
-                // An Earthdata Login token goes to NASA's Earthdata data hosts only, asked for at
-                // each hop: a redirect that leaves them (to a presigned address) goes without it.
-                if !prepared.signed
-                    && let Some(auth) = crate::earthdata::authorization(&at)
-                {
-                    req = req.header("Authorization", &auth);
-                }
-                // A Copernicus Data Space sign-in's token goes to its data hosts only, asked for at
-                // each hop like Earthdata's (and renewed first when it is about to expire). A hop
-                // carrying it makes a refusal status-only: a server may echo the token back.
-                if !prepared.signed
-                    && let Some(auth) = crate::copernicus::authorization_fresh(&at)
-                {
-                    carried_login = true;
-                    req = req.header("Authorization", &auth);
-                }
-                // An ArcGIS sign-in's token goes to the portal and the servers it covers, asked for at
-                // each hop like Earthdata's.
-                if !prepared.signed
-                    && let Some(auth) = crate::arcgis_auth::authorization_fresh(&at)
-                {
-                    req = req.header("X-Esri-Authorization", &auth);
+                // `echo`: the token may come back in a refusal, which is then status-only.
+                for (name, auth, echo) in sign_ins(bare, login.as_ref(), &at) {
+                    carried_login |= echo;
+                    req = req.header(name, &auth);
                 }
                 diagnostics.sending();
                 super::check_current()?;
@@ -3456,15 +3705,19 @@ mod native {
                 } else {
                     req.config().timeout_global(agent.config().timeouts().global).build()
                 };
+                // Recheck the original binding even after redirects dropped its credentials.
+                crate::logins::check(url).map_err(str::to_string)?;
                 let (mut resp, reached) = connected(|| req.call()).map_err(unanswered)?;
                 ceiling = ceiling.min(reached);
                 let status = resp.status().as_u16();
                 diagnostics.answered(status);
-                // A data host refusing the request (or the token): say what to do.
-                if status == 401 && crate::earthdata::is_data_host(&at) {
+                // A data host refusing the request (or the token): say what to do. Not to an anonymous
+                // request, which carried no token: signing in again wouldn't change its answer, a
+                // plain refusal (below).
+                if status == 401 && !prepared.anonymous && crate::earthdata::is_data_host(&at) {
                     return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(status)));
                 }
-                if status == 401 && crate::copernicus::is_data_host(&at) {
+                if status == 401 && !prepared.anonymous && crate::copernicus::is_data_host(&at) {
                     return Err(Failure::without_answer("", crate::copernicus::refused_message(url), Reason::Status(status)));
                 }
                 // A store that serves ranges but not the last bytes by their count (GitHub's release
@@ -3519,7 +3772,15 @@ mod native {
                 let next = crate::template::join(&at, location);
                 // An Earthdata data host sends a request it didn't accept to Earthdata Login.
                 if crate::earthdata::is_data_host(&at) && crate::earthdata::is_login(&next) {
-                    return Err(Failure::without_answer("", crate::earthdata::refused_message(url), Reason::Status(401)));
+                    let message = if prepared.anonymous {
+                        rustgis_data::diagnostics::message_with_address(
+                            crate::s3::split_anonymous(url).0,
+                            "the data host asks for a sign-in, which an anonymous read doesn't carry",
+                        )
+                    } else {
+                        crate::earthdata::refused_message(url)
+                    };
+                    return Err(Failure::without_answer("", message, Reason::Status(401)));
                 }
                 // Where a redirect leads is the server's choice, not the user's. A server can echo
                 // a login in its chosen destination, even after revocation.
@@ -3554,6 +3815,15 @@ mod native {
                 && a > 0
             {
                 return Err(rustgis_data::diagnostics::message_with_address(url, super::NO_RANGES).into());
+            }
+            // A range answered (206) with other octets than asked for: never read as the range. An
+            // answer may end sooner (the file's end), never start elsewhere or run past the range.
+            if let Some((a, b)) = range.filter(|_| !whole)
+                && let Some((from, to)) = resp.headers().get("content-range").and_then(|v| v.to_str().ok()).and_then(content_range_span)
+                && (from != a || to > b)
+            {
+                let why = format!("the server answered octets {from}-{to}, not the {a}-{b} asked for");
+                return Err(rustgis_data::diagnostics::message_with_address(url, &why).into());
             }
             let mut buf = Vec::new();
             if !resp.status().is_success() {
@@ -3646,6 +3916,7 @@ mod native {
     }
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     #[test]
@@ -4004,6 +4275,84 @@ mod tests {
 
     fn network_records(history: &rustgis_data::diagnostics::History, url: &str) -> Vec<rustgis_data::diagnostics::Record> {
         history.records().into_iter().filter(|record| record.network.as_ref().is_some_and(|network| network.url == url)).collect()
+    }
+
+    /// A range of more than 1 MiB is a big tile, which a slow server needs longer than a map
+    /// tile's 30 seconds for (#2570): the workers read it with the agent that has the long wait.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_range_of_more_than_1_mib_is_read_with_the_long_timeout() {
+        use crate::address::Reach;
+        use std::time::Duration;
+        let _turn = turn();
+        let (short, long) = (Some(Duration::from_secs(30)), Some(super::LONG_READ));
+        let wait = |url: &str, ceiling| native::worker_agent(url, ceiling).config().timeouts().global;
+        for ceiling in [Reach::Local, Reach::Public] {
+            for small in [
+                "https://example.org/a.tif",
+                "https://example.org/a.tif#rustgis-range=0-99",
+                "https://example.org/a.tif#rustgis-range=0-1048575",
+                "https://example.org/a.tif#rustgis-tail=2000000",
+                "https://example.org/a.tif#rustgis-range=9-1",
+                "https://example.org/a.tif#rustgis-range=x-y",
+            ] {
+                assert_eq!(wait(small, ceiling), short, "{small}");
+            }
+            for big in [
+                "https://example.org/a.tif#rustgis-range=0-1048576",
+                "https://example.org/a.tif#rustgis-range=5000000000-5003750013",
+                "https://example.org/a.tif#rustgis-range=0-18446744073709551615",
+            ] {
+                assert_eq!(wait(big, ceiling), long, "{big}");
+            }
+        }
+        let (local, public) = (
+            native::worker_agent("https://example.org/a.tif", Reach::Local),
+            native::worker_agent("https://example.org/a.tif", Reach::Public),
+        );
+        let (long_local, long_public) = (
+            native::worker_agent("https://example.org/a.tif#rustgis-range=0-2097151", Reach::Local),
+            native::worker_agent("https://example.org/a.tif#rustgis-range=0-2097151", Reach::Public),
+        );
+        let agents = [local, public, long_local, long_public];
+        for (i, a) in agents.iter().enumerate() {
+            for b in agents.iter().skip(i + 1) {
+                assert!(!std::ptr::eq(*a, *b), "each pool has its own agent");
+            }
+        }
+        assert!(std::ptr::eq(long_local, native::worker_agent("https://example.org/b.tif#rustgis-range=0-4194303", Reach::Local)));
+    }
+
+    /// A big range comes back through the real worker and the long agent, a small one through the
+    /// short agent, from a server that sends its body in two pieces.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn a_big_range_from_a_server_that_sends_it_in_pieces_is_read() {
+        use std::io::Write;
+        let _turn = turn();
+        for len in [1usize << 21, 20_000] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let request = read_request(&mut stream);
+                assert!(request.to_ascii_lowercase().contains(&format!("range: bytes=0-{}", len - 1)), "{request}");
+                let head = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 0-{}/9999999\r\nContent-Length: {len}\r\nConnection: close\r\n\r\n",
+                    len - 1
+                );
+                stream.write_all(head.as_bytes()).unwrap();
+                stream.write_all(&vec![7u8; len / 2]).unwrap();
+                stream.flush().unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(200)); // test-wait: a server sending its body in pieces
+                stream.write_all(&vec![7u8; len - len / 2]).unwrap();
+            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            native::fetch(format!("{base}/big.tif#rustgis-range=0-{}", len - 1), Box::new(move |result| tx.send(result).unwrap()), &[]);
+            let bytes = rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap().unwrap();
+            assert_eq!(bytes.len(), len);
+            server.join().unwrap();
+        }
     }
 
     /// Exercise the worker used for tiles, styles, services and remote data ranges, without
@@ -4456,11 +4805,12 @@ mod tests {
     /// download the user named, with or without a smaller budget, is not.
     #[test]
     fn only_downloads_the_user_named_wait_out_a_stall() {
+        use crate::address::Reach;
         let _turn = turn();
         let handed = Arc::new(Mutex::new(Vec::new()));
         let sent = handed.clone();
-        set_fetcher_with_origin(move |url, ceiling, done, _| {
-            sent.lock().unwrap().push(gives_up_when_stalled(&url, ceiling));
+        set_fetcher_with_origin(move |url, ceiling, done, omit| {
+            sent.lock().unwrap().push((gives_up_when_stalled(&url, ceiling), split_download_limit(&url).1, ceiling, omit));
             done(Err("not fetched".into()));
         });
         let (tx, rx) = std::sync::mpsc::channel::<()>();
@@ -4474,10 +4824,19 @@ mod tests {
         download_public_limited(url, 1024, answered());
         download_limited(url, 1024, answered());
         download(url, answered());
-        for _ in 0..3 {
+        fetch_tile_sample(url, answered());
+        for _ in 0..4 {
             rx.recv_timeout(std::time::Duration::from_secs(30)).unwrap();
         }
-        assert_eq!(*handed.lock().unwrap(), [true, false, false]);
+        assert_eq!(
+            *handed.lock().unwrap(),
+            [
+                (true, Some(1024), Reach::Public, &[][..]),
+                (false, Some(1024), Reach::Local, &[][..]),
+                (false, Some(MAX_DOWNLOAD), Reach::Local, &[][..]),
+                (true, Some(MAX_BYTES), Reach::Local, &[404][..]),
+            ]
+        );
         assert!(gives_up_when_stalled("https://tiles.example/1/2/3.png", crate::address::Reach::Local));
     }
 
@@ -4701,7 +5060,9 @@ mod tests {
         assert_eq!((back.width(), back.height()), (2, 2));
         assert!(matches!(decode(b"{\"a\": 1}", Want::Json), Ok(Payload::Json(_))));
         assert!(matches!(decode(b"", Want::Image), Ok(Payload::Empty)));
-        assert!(decode(b"not a picture", Want::Image).is_err());
+        assert!(decode(b"not a picture", Want::Image).is_err_and(|e| e.starts_with(NOT_A_PICTURE)));
+        // A picture that can't be read (here, cut short) is no document: said as it is.
+        assert!(decode(b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR", Want::Image).is_err_and(|e| !e.starts_with(NOT_A_PICTURE)));
         assert!(decode(b"{", Want::Json).is_err());
     }
 
@@ -5039,6 +5400,97 @@ Connection: close
         copernicus::logout();
     }
 
+    /// An anonymous request (a plugin's `host.fetch`) carries no sign-in's token: Copernicus Data
+    /// Space's and an ArcGIS portal's apply to the same address read plainly, and none to it read
+    /// anonymously. (Earthdata's token is global state another test owns, and goes through the
+    /// same gate.)
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_anonymous_request_carries_no_sign_in() {
+        let _turn = crate::cache::turn();
+        use crate::{arcgis_auth, copernicus};
+        let grant = r#"{"access_token":"synthetic-cdse-access","expires_in":1800,"refresh_expires_in":3600,"refresh_token":"synthetic-cdse-refresh"}"#;
+        let keycloak = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+            grant.len()
+        );
+        let (identity, _) = serve_recorded(vec![keycloak.into_bytes()]);
+        let (cdse, _) = serve_recorded(Vec::new());
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).push(cdse.clone());
+        copernicus::login_at(&identity, "synthetic.user@example.invalid", "synthetic-password", None).unwrap();
+        let portal = "https://anonymous-sign-in.example/portal";
+        let soon = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+        let grant =
+            arcgis_auth::Grant { access_token: "portal-token".into(), refresh_token: None, expires_at: soon, username: "ana".into() };
+        arcgis_auth::sign_in(portal, "client", grant, arcgis_auth::scopes_for(portal, None, &[]));
+        for (url, header) in [
+            (format!("{cdse}/odata/v1/Products(abc)/$value"), "Authorization"),
+            ("https://anonymous-sign-in.example/portal/sharing/rest/content/items/a/data".to_string(), "X-Esri-Authorization"),
+        ] {
+            let plain = native::sign_ins(false, None, &url);
+            assert!(plain.iter().any(|(name, _, _)| *name == header), "{url}: {plain:?}");
+            let prepared = crate::s3::prepare(&crate::s3::anonymous(&url)).unwrap();
+            assert!(prepared.anonymous && !prepared.signed, "{url}");
+            assert_eq!(prepared.url, url);
+            assert!(prepared.bare() && native::sign_ins(prepared.bare(), None, &url).is_empty(), "{url}");
+            assert!(!crate::s3::prepare(&url).unwrap().anonymous, "{url}");
+        }
+        arcgis_auth::sign_out(Some(portal));
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != cdse);
+        copernicus::logout();
+    }
+
+    /// A native GET of an anonymous address sends no sign-in's token, there or where a redirect
+    /// leads, while the same address read plainly carries it: a Copernicus Data Space sign-in and
+    /// fake data hosts on this computer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn an_anonymous_get_sends_no_token_at_any_hop() {
+        let _turn = crate::cache::turn();
+        use crate::copernicus;
+        let grant = r#"{"access_token":"synthetic-cdse-access","expires_in":1800,"refresh_expires_in":3600,"refresh_token":"synthetic-cdse-refresh"}"#;
+        let keycloak = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{grant}",
+            grant.len()
+        );
+        let (identity, _) = serve_recorded(vec![keycloak.into_bytes()]);
+        let ok = b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ndata".to_vec();
+        let refused = b"HTTP/1.1 401 Unauthorized\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec();
+        let (data, data_asked) = serve_recorded(vec![ok.clone(), ok.clone(), ok, refused]);
+        let to_data = format!("HTTP/1.1 302 Found\r\nLocation: {data}/hop\r\nContent-Length: 0\r\nConnection: close\r\n\r\n").into_bytes();
+        let (start, start_asked) = serve_recorded(vec![to_data]);
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).push(data.clone());
+        copernicus::login_at(&identity, "synthetic.user@example.invalid", "synthetic-password", None).unwrap();
+        let agent = native::agent();
+        let timeout = Duration::from_secs(5);
+
+        // Read plainly, the data host gets the token.
+        assert_eq!(native::get(&agent, &format!("{data}/plain"), &[]).unwrap(), b"data");
+        let asked = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(asked.contains("authorization: bearer synthetic-cdse-access\r\n"), "{asked}");
+
+        // Read anonymously, it doesn't, nor where a redirect leads.
+        assert_eq!(native::get(&agent, &crate::s3::anonymous(&format!("{data}/direct")), &[]).unwrap(), b"data");
+        let asked = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(asked.starts_with("get /direct http/1.1\r\n"), "{asked}");
+        assert!(!asked.contains("authorization") && !asked.contains("synthetic-cdse"), "{asked}");
+        assert_eq!(native::get(&agent, &crate::s3::anonymous(&format!("{start}/start")), &[]).unwrap(), b"data");
+        let first = start_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        let hop = data_asked.recv_timeout(timeout).unwrap().to_ascii_lowercase();
+        assert!(hop.starts_with("get /hop http/1.1\r\n"), "{hop}");
+        for text in [&first, &hop] {
+            assert!(!text.contains("authorization") && !text.contains("synthetic-cdse"), "{text}");
+        }
+
+        // Refused, it says so plainly: no token went, so signing in again wouldn't help.
+        let e = native::get(&agent, &crate::s3::anonymous(&format!("{data}/refused")), &[]).unwrap_err();
+        assert!(!e.contains("Copernicus Data Space") && !e.contains("copernicus.login"), "{e}");
+        assert!(e.contains("401"), "{e}");
+
+        copernicus::TEST_HOSTS.lock().unwrap_or_else(|e| e.into_inner()).retain(|h| *h != data);
+        copernicus::logout();
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     #[test]
     fn explicit_service_login_beats_ambient_s3_on_native_get_and_redirect() {
@@ -5162,6 +5614,169 @@ Connection: close
         assert!(!foreign.contains(encoded) && !foreign.contains(secret));
         assert!(logins::deactivate(&first));
         assert!(logins::deactivate(&second));
+    }
+
+    /// A connection's ArcGIS token goes in the address as its one `token`, on every hop at its
+    /// own origin (replacing a stale copy, any case or escaping), never to a redirect's other
+    /// origin, and with no portal sign-in header beside it.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_goes_once_to_its_origin_and_never_a_redirect_target() {
+        let _turn = crate::cache::turn();
+        use crate::logins::{self, Method};
+        let (other, other_asked) = serve_recorded(vec![b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\nConnection: close\r\n\r\ntile".to_vec()]);
+        let (base, asked) = serve_recorded(vec![
+            b"HTTP/1.1 302 Found\r\nLocation: /next?%54oken=stale-two&y=2\r\nContent-Length: 0\r\nConnection: close\r\n\r\n".to_vec(),
+            format!("HTTP/1.1 302 Found\r\nLocation: {other}/tile?token=foreign\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .into_bytes(),
+        ]);
+        let token = "connection-token/+=";
+        let encoded = "connection-token%2F%2B%3D";
+        let first = logins::activate(&base, "arcgis-first", Method::Arcgis { expires_at: None }, token, true).unwrap();
+        let second = logins::activate(&other, "arcgis-second", Method::Arcgis { expires_at: None }, "second-token", true).unwrap();
+        let url = logins::bind(&first, &format!("{base}/start?x=1&ToKeN=stale-one")).unwrap();
+        assert_eq!(native::get(&native::agent(), &url, &[]).unwrap(), b"tile");
+        let timeout = std::time::Duration::from_secs(5);
+        let one = asked.recv_timeout(timeout).unwrap();
+        let two = asked.recv_timeout(timeout).unwrap();
+        assert!(one.starts_with(&format!("GET /start?x=1&token={encoded} HTTP/1.1\r\n")), "{one}");
+        assert!(two.starts_with(&format!("GET /next?y=2&token={encoded} HTTP/1.1\r\n")), "{two}");
+        let foreign = other_asked.recv_timeout(timeout).unwrap();
+        assert!(foreign.starts_with("GET /tile?token=foreign HTTP/1.1\r\n"), "{foreign}");
+        for text in [&one, &two, &foreign] {
+            assert!(!text.contains("stale") && !text.contains("second-token"), "{text}");
+            assert!(!text.to_ascii_lowercase().contains("x-esri-authorization"), "{text}");
+        }
+        assert!(!foreign.contains(encoded) && !foreign.contains(token));
+        assert!(logins::deactivate(&first));
+        assert!(logins::deactivate(&second));
+    }
+
+    /// With a portal sign-in covering the address and the connection's own token applied, only the
+    /// connection's is used: the sign-in's is neither sent nor renewed. Another kind of login, or
+    /// none, still gets the sign-in's.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_outranks_the_portal_sign_in() {
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_auth::{self, Grant},
+            logins::{self, Method},
+        };
+        let portal = "https://explicit-over-portal.example/portal";
+        let origin = "https://explicit-over-portal.example";
+        let url = "https://explicit-over-portal.example/server/rest/services/A/MapServer";
+        let soon = web_time::SystemTime::now().duration_since(web_time::UNIX_EPOCH).unwrap().as_secs() as i64 + 3600;
+        let grant = Grant { access_token: "portal-token".into(), refresh_token: None, expires_at: soon, username: "ana".into() };
+        arcgis_auth::sign_in(portal, "client", grant, arcgis_auth::scopes_for(portal, None, &[]));
+        let token = logins::activate(origin, "outranks-token", Method::Arcgis { expires_at: None }, "connection-token", false).unwrap();
+        let key = logins::activate(origin, "outranks-key", Method::Header("X-Key".into()), "connection-key", false).unwrap();
+        let explicit = logins::apply(&logins::bind(&token, url).unwrap()).unwrap().unwrap();
+        let keyed = logins::apply(&logins::bind(&key, url).unwrap()).unwrap().unwrap();
+        assert_eq!(explicit.url, format!("{url}?token=connection-token"));
+        assert_eq!(native::implicit_arcgis(false, None, url).as_deref(), Some("Bearer portal-token"));
+        assert_eq!(native::implicit_arcgis(false, Some(&keyed), url).as_deref(), Some("Bearer portal-token"));
+        assert_eq!(native::implicit_arcgis(false, Some(&explicit), url), None);
+        assert_eq!(native::implicit_arcgis(true, None, url), None);
+        assert!(logins::deactivate(&token));
+        assert!(logins::deactivate(&key));
+        arcgis_auth::sign_out(Some(portal));
+    }
+
+    /// Expiry during request preparation prevents the send, not just accepting its answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_expiry_during_preparation_blocks_native_sends() {
+        if isolate_cache_fixture("cache::tests::arcgis_token_expiry_during_preparation_blocks_native_sends") {
+            return;
+        }
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_token,
+            logins::{self, Method},
+        };
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let agent = native::download_agent(std::time::Duration::from_secs(1));
+        for (method, final_check) in [("GET", 2), ("HEAD", 1), ("POST", 1)] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            listener.set_nonblocking(true).unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let now = arcgis_token::now_millis().unwrap();
+            let expires = now + 60_000;
+            let binding =
+                logins::activate(&base, method, Method::Arcgis { expires_at: Some(expires) }, "preparation-expiry-token", true).unwrap();
+            let clock = logins::clock_for_test(&binding, now).unwrap();
+            let url = logins::bind(&binding, &format!("{base}/prepared")).unwrap();
+            let checks = Arc::new(AtomicUsize::new(0));
+            let observed = checks.clone();
+            let result = with_still(
+                Arc::new(move || {
+                    // GET also checks its continuation before preparing or applying the login.
+                    if observed.fetch_add(1, Ordering::SeqCst) + 1 == final_check {
+                        clock.store(expires, Ordering::SeqCst);
+                    }
+                    true
+                }),
+                || match method {
+                    "GET" => native::get(&agent, &url, &[]).map(|_| ()),
+                    "HEAD" => native::head_with(&agent, &url).map(|_| ()),
+                    _ => native::post_with(&agent, &url, "{}").map(|_| ()),
+                },
+            );
+            assert_eq!(result.unwrap_err(), arcgis_token::EXPIRED, "{method}");
+            assert_eq!(checks.load(Ordering::SeqCst), final_check, "{method}");
+            assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock, "{method}");
+            assert!(logins::deactivate(&binding));
+        }
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn arcgis_token_expiry_blocks_cached_and_in_flight_bytes() {
+        if isolate_cache_fixture("cache::tests::arcgis_token_expiry_blocks_cached_and_in_flight_bytes") {
+            return;
+        }
+        let _turn = crate::cache::turn();
+        use crate::{
+            arcgis_token,
+            logins::{self, Method},
+        };
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let now = arcgis_token::now_millis().unwrap();
+        let expires = now + 60_000;
+        let binding =
+            logins::activate(&base, "expiry-cache-session", Method::Arcgis { expires_at: Some(expires) }, "expiry-cache-token", true)
+                .unwrap();
+        let clock = logins::clock_for_test(&binding, now).unwrap();
+        let cached = logins::bind(&binding, &format!("{base}/cached")).unwrap();
+        store(&cached, Entry::Ready(Arc::new(Payload::Json(serde_json::json!({"private": true}))), 64, None));
+        assert!(peek(&cached).is_some());
+        let pending = logins::bind(&binding, &format!("{base}/pending")).unwrap();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut buf = [0u8; 2048];
+            let n = stream.read(&mut buf).unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /pending?token=expiry-cache-token HTTP/1.1"));
+            started_tx.send(()).unwrap();
+            release_rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+            stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\nConnection: close\r\n\r\nold-body").unwrap();
+            listener
+        });
+        let worker = std::thread::spawn(move || native::get(&native::agent(), &pending, &[]));
+        started_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+        clock.store(expires, std::sync::atomic::Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap().unwrap_err(), arcgis_token::EXPIRED);
+        let listener = server.join().unwrap();
+        assert!(peek(&cached).is_none());
+        assert!(matches!(get(&cached, Want::Json), State::Failed(_)));
+        assert_eq!(native::get(&native::agent(), &cached, &[]).unwrap_err(), arcgis_token::EXPIRED);
+        listener.set_nonblocking(true).unwrap();
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+        assert!(logins::deactivate(&binding));
     }
 
     /// A HEAD and a POST carry the query key too, to the address the caller named.
@@ -5646,6 +6261,7 @@ Connection: close
             layers: vec![],
             style_layers: String::new(),
             hidden_layers: vec![],
+            nearest: false,
         };
         let mut resolved = None;
         for _ in 0..200 {
@@ -5875,6 +6491,7 @@ Connection: close
                 layers: Vec::new(),
                 style_layers: String::new(),
                 hidden_layers: Vec::new(),
+                nearest: false,
             };
             let Resolve::Ready(resolved) = crate::source::resolve(&spec) else { panic!("the cached document must resolve") };
             if kind == Kind::Style {
@@ -6475,6 +7092,10 @@ Connection: close
         assert_eq!(native::host("http://127.0.0.1:8080/a?b#c"), "127.0.0.1:8080");
         assert_eq!(native::host("https://user:pw@example.org"), "example.org");
         assert_eq!(native::host(&format!("{DOWNLOAD}https://example.org/x")), "example.org");
+        let origin = "https://tile.openstreetmap.org";
+        let tile = format!("{origin}/0/0/0.png");
+        let bound = rustgis_data::login_address::bind("0123456789abcdef", origin, &tile).unwrap();
+        assert_eq!(native::host(&format!("{TILE_SAMPLE}{bound}")), "tile.openstreetmap.org");
         assert_eq!(native::host("https://example.org/a.pmtiles#rustgis-range=0-9"), "example.org");
         assert_eq!(native::host("mbtiles:/data/a.mbtiles/1/2/3"), "");
         assert_eq!(native::host("not an address"), "");
@@ -7254,6 +7875,37 @@ Connection: close
         assert_eq!(ceiling_for(tif), crate::address::Reach::Local);
     }
 
+    /// While a thread's requests are held to the internet (a plugin's command), an address with
+    /// nothing recorded of it, as a listing or search derived from the one given, is read only
+    /// from the internet: one on this computer is refused, and read again once the hold ends.
+    #[test]
+    fn a_held_thread_reads_only_from_the_internet() {
+        let _turn = turn();
+        let ok = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok".to_string();
+        let base = serve(vec![ok.clone(), ok]);
+        let derived = format!("{base}/api/collections");
+        assert_eq!(ceiling_for(&derived), crate::address::Reach::Local);
+        let held = held_to_public(true, || {
+            held_to_public(false, || assert_eq!(ceiling_for(&derived), crate::address::Reach::Public, "nested, still held"));
+            // A worker carrying the request context on, as readers carry cancellation, is held.
+            let context = current_still();
+            let worker = derived.clone();
+            let ceiling = std::thread::scope(|scope| {
+                std::thread::Builder::new()
+                    .spawn_scoped(scope, move || with_optional_still(context, || ceiling_for(&worker)))
+                    .unwrap()
+                    .join()
+                    .unwrap()
+            });
+            assert_eq!(ceiling, crate::address::Reach::Public, "a worker carrying the context");
+            download_blocking(&derived)
+        });
+        let e = held.unwrap_err();
+        assert!(e.contains("local network"), "{e}");
+        assert_eq!(ceiling_for(&derived), crate::address::Reach::Local, "the hold ends with it");
+        assert_eq!(download_blocking(&derived).unwrap(), b"ok");
+    }
+
     /// A read begun while its resource could reach the local network, and answered after a web
     /// document restricted it to public addresses, is not kept for a public read (#2055).
     #[test]
@@ -7287,12 +7939,15 @@ Connection: close
         let first_tpl = "https://dated.example/{YYYY}/{MM}/{DD}.tif";
         restrict_to_public(first_exact);
         restrict_to_public(first_tpl);
+        assert!(!take_public_only_full(), "nothing to say before the table fills");
         for i in 0..(MAX_PUBLIC_TEMPLATES + 8) {
             restrict_to_public(&format!("https://t{i}.example/{{z}}/{{x}}/{{y}}.png"));
         }
         for i in 0..(MAX_PUBLIC_ONLY + 8) {
             restrict_to_public(&format!("https://e.example/asset-{i}.tif"));
         }
+        assert!(take_public_only_full(), "a full table is said");
+        assert!(!take_public_only_full(), "once");
         assert_eq!(ceiling_for(first_exact), crate::address::Reach::Public);
         assert_eq!(ceiling_for("https://dated.example/2025/01/15.tif"), crate::address::Reach::Public);
         assert_eq!(ceiling_for("https://unseen.example/other.tif"), crate::address::Reach::Public, "saturated table fails closed");

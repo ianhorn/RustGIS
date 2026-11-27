@@ -1,14 +1,16 @@
 //! Committed files and their losses remain visible after a workflow rolls its project back.
+#![expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 
 use rustgis_data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
 use serde_json::{Value, json};
 
 use crate::{Project, Session};
 
-struct Files(std::path::PathBuf);
+/// A fresh folder for a test's files, removed when the test ends, failed or not.
+pub(super) struct Files(std::path::PathBuf);
 
 impl Files {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let serial = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let time = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos();
@@ -17,7 +19,7 @@ impl Files {
         Self(path)
     }
 
-    fn path(&self) -> &std::path::Path {
+    pub(super) fn path(&self) -> &std::path::Path {
         &self.0
     }
 }
@@ -36,6 +38,112 @@ fn places() -> Session {
     s.map_mut().add_dataset(ds);
     s.map_mut().editing.settings.enabled = true;
     s
+}
+
+/// The command and its background worker apply the query before writing, even when the layer
+/// reads in place. Whole-data and chunk writers report omissions and unreadable saved queries.
+#[test]
+fn export_features_respects_the_definition_query() {
+    use crate::cmd::exports::{export_land, export_start};
+
+    let dir = Files::new();
+    let mut s = places();
+    let id = s.map().layer_by_name("Places").unwrap().id;
+    s.map_mut()
+        .layer_mut(id)
+        .unwrap()
+        .dataset
+        .push(Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))), vec![Cell::Text("hidden".into())]);
+    let seed = dir.path().join("source.gpkg");
+    s.run("share.exportLayer", &json!({"layer": id, "path": seed})).unwrap();
+    s.run("layer.addData", &json!({"name": "Streamed", "path": seed, "layer": "Places", "stream": true})).unwrap();
+    assert!(s.map().layer_by_name("Streamed").unwrap().is_streamed());
+
+    for (layer, ext, background) in [("Places", "gpkg", false), ("Streamed", "shp", false), ("Streamed", "gpkg", true)] {
+        for (case, query, expected) in [("valid", "long_attribute_name = 'kept'", 1), ("absent", "", 2), ("unreadable", "missing = 1", 2)] {
+            if case == "unreadable" {
+                // A project can retain a query that refers to a field its source no longer has.
+                let id = s.map().layer_by_name(layer).unwrap().id;
+                s.map_mut().layer_mut(id).unwrap().definition_query = Some(query.into());
+            } else {
+                s.run("layer.definitionQuery", &json!({"layer": layer, "where": query})).unwrap();
+            }
+            let path = dir.path().join(format!("{layer}-{case}.{ext}"));
+            let params = json!({"layer": layer, "path": path});
+            let mark = s.notice_mark();
+            let result = if background {
+                let work = export_start(&mut s, "share.exportLayer", &params).unwrap();
+                let started = work.started();
+                let done = std::thread::spawn(move || work.run(&rustgis_analysis::control::Control::new())).join().unwrap();
+                export_land(&mut s, started, done)
+            } else {
+                s.run("share.exportLayer", &params)
+            }
+            .unwrap();
+            assert_eq!(result["features"], expected);
+            assert_eq!(result["leftOut"], 0);
+            let (written, _) = rustgis_data::io::read_path(&path).unwrap();
+            assert_eq!(written.features.len(), expected);
+            assert_eq!(written.value(0, 0), &Cell::Text("kept".into()));
+            let notices: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            if case == "absent" {
+                assert!(notices.is_empty(), "{layer}: {notices:?}");
+            } else if case == "unreadable" {
+                assert_eq!(notices.len(), 1);
+                assert!(notices[0].text.contains("could not be read") && notices[0].text.contains("missing"), "{notices:?}");
+            } else {
+                assert_eq!(notices.len(), 1);
+                assert_eq!(
+                    notices[0].text,
+                    format!("{}: the definition query on {layer} left out 1 of the source features", path.display())
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn data_interop_respects_the_definition_query() {
+    let dir = Files::new();
+    let mut s = places();
+    let id = s.map().layer_by_name("Places").unwrap().id;
+    s.map_mut()
+        .layer_mut(id)
+        .unwrap()
+        .dataset
+        .push(Some(Geometry::Point(rustgis_data::Coord::new(3.0, 4.0))), vec![Cell::Text("hidden".into())]);
+    let seed = dir.path().join("source.gpkg");
+    s.run("share.exportLayer", &json!({"layer": id, "path": seed})).unwrap();
+    s.run("layer.addData", &json!({"name": "Streamed", "path": seed, "layer": "Places", "stream": true})).unwrap();
+    assert!(s.map().layer_by_name("Streamed").unwrap().is_streamed());
+
+    // Text uses the browser/script path. Streamed GeoJSON uses chunks, while WKT reads the whole source.
+    for (layer, format, to_file) in [("Places", "geojson", false), ("Streamed", "geojson", true), ("Streamed", "wkt", true)] {
+        for (query, expected) in [("", 2), ("long_attribute_name = 'kept'", 1)] {
+            s.run("layer.definitionQuery", &json!({"layer": layer, "where": query})).unwrap();
+            let path = dir.path().join(format!("{layer}-{format}-{expected}.out"));
+            let mut params = json!({"layer": layer, "format": format});
+            if to_file {
+                params["path"] = json!(path);
+            }
+            let mark = s.notice_mark();
+            let answer = s.run("data.convert", &params).unwrap();
+            let text = if to_file { std::fs::read_to_string(&path).unwrap() } else { answer["text"].as_str().unwrap().into() };
+            let rows = if format == "geojson" {
+                rustgis_data::io::read_geojson(&text, "converted").unwrap().0.features.len()
+            } else {
+                text.lines().count() - 1
+            };
+            assert_eq!(rows, expected, "{layer}, {format}");
+            assert!(text.contains("kept"));
+            assert_eq!(text.contains("hidden"), expected == 2);
+            let notices: Vec<_> = s.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            assert_eq!(notices.len(), usize::from(expected == 1));
+            if let Some(notice) = notices.first() {
+                assert!(notice.text.contains(&format!("the definition query on {layer} left out 1 of the source features")));
+            }
+        }
+    }
 }
 
 #[test]
@@ -244,7 +352,7 @@ fn write_notices_keep_the_ordinary_queue_bounded_and_marks_consistent() {
             s.notify("rolled-back edit", false);
             s.guarded("Inner", true, |s| {
                 for i in 0..250 {
-                    s.notify_written(format!("committed {i}"), false);
+                    s.notify_written(format!("committed {i}"));
                 }
                 Err("inner failed".into())
             })?;

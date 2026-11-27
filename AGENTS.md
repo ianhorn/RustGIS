@@ -41,16 +41,17 @@ is out of scope.
   without a count is fine; Cancel is not optional.
 - A command that must run on the UI thread says why in its doc comment.
 - A new background raster command or export, or a tool whose work grows with its input, goes in
-  the lists in `crates/engine/src/tests.rs` (`cancel_rasters`, `cancel_exports`, `cancel_tools`);
-  `cancel_rasters` and `cancel_exports` must match the background registries. A read-ahead command
-  (`reads::prepare`, such as `service.layers`) has no list: add its call to
-  `long_commands_stop_when_cancelled_while_they_run` by hand.
+  the lists in `long_commands` (`crates/engine/src/tests/cancellation.rs`), which both cancel tests
+  run; the raster and export lists must match the background registries. A read-ahead command
+  goes in `reads::IN_BACKGROUND` (a table edit in `edit::TABLE_EDITS`), and `long_commands`
+  fails until it runs every one there or names why not in its exemptions.
   `long_commands_stop_when_cancelled_while_they_run` fails one that never looks at Cancel;
-  `cancelling_at_each_check_leaves_nothing_behind` cancels each command of the three lists at its
-  first three checks and its last, and fails one that leaves the project, its undo steps or the
-  files changed, or can't run again (read-aheads and commands that read from the network are left
-  out). Passing shows the work looks, not that
-  it looks often: a long step without a check (one union, one read) is said in its doc comment.
+  `cancelling_at_each_check_leaves_nothing_behind` cancels at every check in turn until the command
+  finishes before reaching it, on small fixtures, failing if one needs 256 or more checks. It
+  checks project data, Undo/Redo, files and an immediate retry. Network-bound cases keep only
+  first-check coverage.
+  Passing shows the work looks, not that it looks often: a long step without a check (one union,
+  one read) is said in its doc comment.
 
 ## Use the threads
 Work that splits into independent parts runs on several threads where practical:
@@ -58,7 +59,23 @@ Work that splits into independent parts runs on several threads where practical:
 - in `analysis`, the shared helpers (`parallel::for_each_row`, `try_map`, `try_map_on`);
   everywhere, the thread count from `rustgis_data::threads` (it follows the user's setting), never
   `available_parallelism` or a fixed number, and scratch memory within `memory::thread_scratch`;
-- a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`).
+- a thread the OS refuses costs speed, not the run (`Builder::spawn_scoped`), and a job's thread
+  it refuses ends that job with an error (`Builder::spawn`; `work_off_frame` in `ui-egui`).
+  `clippy.toml` refuses `available_parallelism`, and `std::thread::spawn` and `Scope::spawn`, which
+  panic then; an exception says why in its `#[expect(clippy::disallowed_methods, reason = "…")]`.
+
+## Size for real data
+Real data dwarfs the sample project: a parcel layer of half a million rows and a hundred fields
+loads at about 2.5 GB, national layers run to tens of millions of rows and more, and a 1 m
+elevation model of 1,000 km² is a billion cells. When a change stores, copies or compares layer
+data, give in the pull request what it holds as a multiple of the layer, as `cargo xtask memory`
+measures.
+- Memory follows what an operation changes or produces: an Undo step, a version, a sync base or a
+  cache holds only the changed rows or shares storage with the original. New work adds no second
+  full copy of a layer or raster; #2431 measured what one costs.
+- Work that grows with its input goes in pieces (chunks, tiles, slices) that it doesn't keep, or
+  sizes its limit with `memory::planned` and refuses past it with a way out, such as filtering or
+  clipping first. Running out of memory partway counts as a crash.
 
 ## Architecture
 | Layer | Crate | Job |
@@ -76,6 +93,11 @@ Work that splits into independent parts runs on several threads where practical:
 - **Everything is a command**: a `CommandSpec` in `crates/engine/src/cmd/*.rs`. UI-only
   commands (`ui.*`) live in `crates/ui-egui/src/lib.rs`. The ribbon, shortcuts, command search
   and CLI dispatch by id. Commands never open dialogs.
+- **`.view()` leaves the layers as they are**: a command that adds, removes or reorders layers
+  mutates, even when it fails part way. Declared `.view()`, it leaves no Undo step when it runs by
+  itself. Only Undo, Redo (`Effect::History`) and a project replaced (`Effect::Replaces`) may.
+  The engine's unit and integration tests fail a registered command declared wrong (the check in
+  `invoke`, `policy/dispatch.rs`, feature `declaration-check`), but only on the paths they run.
 - **Command ingress**: root `Session::run` is trusted native User dispatch. Assistant, MCP,
   plugin, imported-item and continuation adapters carry their named opaque policy scope;
   scopes inherit or narrow, and `with_scope` rejects nested ingress. Peer project text uses
@@ -99,11 +121,17 @@ Work that splits into independent parts runs on several threads where practical:
   catalogs in `crates/ui-egui/src/i18n/*.tsv`: a missing entry shows in English, and the
   maintainer translates them before each release (format in `docs/i18n.md`). Command ids, data
   and the CLI are never translated.
-- **Layering** is enforced by `cargo xtask layers`: nothing below L6 depends on egui/eframe/rfd.
+- **Layering** is enforced by `cargo xtask layers`: nothing below L6 depends on egui/eframe/rfd, a crate
+  depends only on lower layers (`[target.…]` dependencies count, dev- and build-dependencies don't), and a
+  new crate under `crates/` gets its layer in `LAYERS` (`xtask/src/main.rs`).
 - **The expression language has one vocabulary**: a new function, variable or keyword goes in
   the catalogs in `crates/data/src/query.rs` (`Func::spec`, `VARS`, `Kw`), which the parser
   reads, and in `docs/user-guide/expressions.md`; the `query` tests fail when the guide misses
   a signature, unit, variable or keyword, or names a function that doesn't exist.
+- **A parameter that takes an expression says so**: a command's key gives its type as `sql` or
+  `expression` in its params (`"where": sql`, `"size"?: expression|null`), and a tool's
+  parameter is `ParamKind::Expression`, so it can be told from plain text. Another language (a
+  database's, a service's) is described in quoted prose instead.
 
 ## Reach every surface
 A change that works where you tried it is often missing elsewhere. Before calling it done, say in
@@ -116,7 +144,8 @@ the pull request which of these it reaches and why the rest don't apply:
 
 ## Assets
 - No third-party vendor icons, images, styles, fonts, help text or code. Icons are drawn in
-  code (`icons.rs`). Every asset file has a row in `ATTRIBUTION.md`.
+  code (`icons.rs`). Every asset file has a row in `ATTRIBUTION.md`; `cargo xtask attribution` (in CI) fails an image or
+  font file that no row names, by path, directory or pattern.
 - Never copy or translate code from GPL, LGPL or other copyleft projects (such as GRASS, QGIS or
   GEOS) into RustGIS, by hand or with an AI tool. Implementing a published algorithm is fine: cite
   the paper or standard. Name in the pull request any project whose code you followed (see
@@ -128,9 +157,42 @@ the pull request which of these it reaches and why the rest don't apply:
 ## Quality gates
 `cargo xtask ci` (fmt, clippy -D warnings, tests, layers) before every commit.
 `cargo xtask test-hygiene` (also in CI) requires `// test-wait: reason` on timer waits in tests and
-`#[ignore = "reason"]` on ignored tests; prefer completion or progress signals.
+`#[ignore = "reason"]` on ignored tests, and refuses an `assert_eq!` or `assert_ne!` (or `debug_assert_*`)
+whose two sides are the same tokens; prefer completion or progress signals, and a fixed expected value.
+A test that needs GDAL or DuckDB skips with `if !gdal::test_runs().unwrap() { return; }` (`duckdb::`,
+`raster::gdal::`), never on `available()` or `usable()`: CI's `GDAL and DuckDB` job installs both and
+sets `RUSTGIS_REQUIRE_GDAL` and `RUSTGIS_REQUIRE_DUCKDB`, so only then does a missing program fail it.
+`clippy.toml` refuses the four sphere measures in `rustgis-geom` (`haversine_m`, `geodesic_length_m`,
+`geodesic_ring_perimeter_m`, `geodesic_ring_area_m2`): the Earth measures on the WGS 84 ellipsoid
+(`wgs84_distance_m`, `wgs84_length_m`, `wgs84_step_m`, `wgs84_ring_perimeter_area_m2`), and a call kept on
+the sphere, for another body or a comparison it can't change, says why in its
+`#[expect(clippy::disallowed_methods, reason = "…")]`.
+The engine test `command_surface_matches_the_snapshot` fails on any difference between the registered
+commands and `crates/engine/command-surface.txt` (each command id with its parameter keys and optional
+marks, not the help text): a pull request that adds, removes or renames a command or a parameter runs
+`cargo xtask commands` and commits the file. A removal or rename is a coordinate-first change.
+`cargo xtask memory` (in CI on Linux) fails when a command line workflow's peak memory grows past
+its limit in `xtask/memory-limits.txt`; a change that lowers one commits the lower limit with it.
+`cargo xtask rows` (also in CI) fails when code outside `rustgis-data` uses a layer's rows directly
+(`Feature` fields, the row vector) more often than `xtask/row-uses.txt` allows: use the accessors on
+`Features` (`row`, `rows`, `value`, `set_value`, …), and `--update` when you lower the count (#2431).
+It counts only the libraries and programs built for the host, not tests, examples, benches or code
+built only for other targets, nor a row indexed without reading a field (`features[i]` alone); use
+the accessors there too.
+Both limit files only go down: CI's `Limits only go down` job fails a pull request that raises or
+removes a limit against its base (a new memory scenario is fine). A maintainer approves a deliberate
+raise by commenting on the pull request with the line the failure prints for it, on a line of its
+own (`<!-- ratchet-raise-approved: xtask/row-uses.txt count=790 -->`), then re-runs the job.
+The test `command_ids_in_hand_kept_lists_are_registered` (`crates/ui-egui/tests/command_ids.rs`) fails when
+non-test source holds a command id that no command has (a dotted literal in a registered namespace, such
+as `layer.add`, or a `ui.*` id with no match arm in `run_ui`, in `crates/ui-egui/src/lib.rs`): a renamed or removed
+command leaves the lists that name it, such as `ON_A_COPY`, the policy tables and Command Search, pointing
+at nothing. A literal that isn't a command goes in its `EXEMPT` list with a reason (file and host names
+ending in a `NOT_IDS` word need none), and an `EXEMPT` entry the source no longer
+holds fails it too.
 While you work, `cargo xtask changed` runs the same checks on only the packages your branch changes
-and those that depend on them (and `test-hygiene` on the whole workspace), or everything when a
+and those that depend on them (and `test-hygiene` on the whole workspace, and formatting, `layers`,
+`attribution` and `rows` when packages are checked; `attribution` also when only non-code files change), or everything when a
 changed file such as `Cargo.lock` is outside every package and nothing includes it.
 A new dependency must have a licence `deny.toml` allows (CI runs `cargo deny check licenses`); after
 changing dependencies, run `cargo xtask notices` to refresh the `THIRD-PARTY-LICENSES.txt` files the
@@ -148,6 +210,10 @@ immediately; label-gated build jobs in `ci.yml` start from the next push.
   wait for the **release quality pass**, where maintainers handle them together before each
   release. Reply that it's left for the release quality pass, end the reply with
   `<!-- quality-sweep -->`, and leave it out of the next push.
+- The Claude review ends each inline finding with its category (a last line such as `Category: bug`).
+  CI's `Review deferrals` job fails, on each push and in the merge queue, when the marker answers
+  a `bug`, `security` or `agents-md` finding, or one edited since it was posted. A maintainer
+  overrides it for one finding by ending a reply in its thread with `<!-- deferral-approved -->`.
 
 ## Looking at the app
 - `cargo run --release -p rustgis` (opens the World Atlas sample).

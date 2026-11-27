@@ -3,8 +3,9 @@
 //! stands for the web app. Each system's module makes its [`Phone`] and calls [`run`].
 
 use eframe::egui;
+use rustgis_engine::data::secrets::SecretStore;
 use rustgis_engine::platform::{Event, Platform};
-use rustgis_ui_egui::{Inbox, RustGisApp, i18n, tl};
+use rustgis_ui_egui::{FolderStore, Inbox, RustGisApp, i18n, tl};
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -14,6 +15,15 @@ use std::sync::{Arc, Mutex};
 /// How long the window keeps looking for the soft keyboard's room after a field last wanted
 /// it: long enough for the keyboard to finish closing.
 const KEYBOARD_SETTLES: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// The memory the limits plan with where a phone's system doesn't say what it allows: 1.5 GiB,
+/// what a small phone can give an app.
+pub const MEMORY_UNSAID: u64 = 1536 << 20;
+
+/// Says, in the window, that the limits plan with [`MEMORY_UNSAID`].
+pub fn say_memory_unsaid(app: &mut RustGisApp) {
+    app.session.warn(tl!("This device didn't say how much memory RustGIS may use, so its limits plan for 1.5 GiB."));
+}
 
 /// What the shell asks of a phone beyond [`Platform`].
 pub trait Phone: Platform {
@@ -36,9 +46,35 @@ pub trait Phone: Platform {
         self.busy()
     }
 
+    /// How often (milliseconds) a window with nothing else to look for looks again, for a phone
+    /// that reports only when asked and can't wake the window (Android's memory). `None`, the
+    /// default: the phone wakes it.
+    fn idle_look(&self) -> Option<u64> {
+        None
+    }
+
     /// Whether the soft keyboard's Return was pressed since the last frame, where the system
     /// passes it on as no key egui knows (iOS). The shell gives egui an Enter for it.
     fn take_return(&self) -> bool {
+        false
+    }
+
+    /// Puts `text`, copied in the window, on the system's clipboard too, where other apps can
+    /// paste it; an error says why it couldn't be asked. The default does nothing: the window's
+    /// own clipboard keeps it (iOS).
+    fn copy_text(&self, text: &str) -> Result<(), String> {
+        let _ = text;
+        Ok(())
+    }
+
+    /// Asks the system for its Back (`on`), or leaves it to the system, where it keeps Back from
+    /// an app that doesn't ask (Android 16 on). Where Back comes as a key, or there is none (iOS),
+    /// this does nothing.
+    fn takes_back(&self, _on: bool) {}
+
+    /// Whether the system's Back asked for came since the last frame, where it comes as no key egui
+    /// knows (Android 16 on). The shell gives egui the Back key for it.
+    fn take_back(&self) -> bool {
         false
     }
 }
@@ -98,6 +134,9 @@ struct App<P: Phone> {
     keeping: bool,
     /// Whether the soft keyboard was up, where the phone says.
     keyboard: Option<bool>,
+    /// Whether the interface has something Back lowers (`rustgis_ui_touch::takes_back`), as
+    /// the phone was last told.
+    back: bool,
     /// Until when the window looks again for the soft keyboard's room: a moment after the
     /// last frame a field wanted the keyboard.
     typing: Option<std::time::Instant>,
@@ -128,7 +167,16 @@ struct App<P: Phone> {
 enum Problem {
     /// The shortcut file `name` is over `SHORTCUT_FILE_MAX_BYTES`.
     ShortcutTooLarge { name: String },
-    /// The file `name` is over the size read into memory (`rustgis_data::io::MAX_BYTES`), by
+    /// The script file `name`, picked for the Script pane's Load…, is over `SCRIPT_FILE_MAX_BYTES`.
+    ScriptTooLarge { name: String },
+    /// The image picked for a marker's «Image…» is over `MARKER_FILE_MAX_BYTES`.
+    MarkerTooLarge,
+    /// The pictures `names`, picked for the AI Assistant's message, are over
+    /// `ASSISTANT_FILE_MAX_BYTES`: said once, with how many.
+    PicturesTooLarge { names: Vec<String> },
+    /// The pictures `names`, picked for the AI Assistant's message, are past what a message takes.
+    PicturesLeftOut { names: Vec<String> },
+    /// The file `name` is over the size a pick reads into memory ([`PICK_MAX_BYTES`]), by
     /// itself or `together` with the files picked with it and already read.
     TooLarge { name: String, together: bool },
     /// The copy of the file `name` couldn't be read.
@@ -144,6 +192,10 @@ impl<P: Phone> App<P> {
     /// said in the window.
     fn take_phone_events(&mut self, ctx: &egui::Context, raw_input: &mut egui::RawInput) {
         for text in self.refusals.borrow_mut().drain(..) {
+            self.app.session.notify(text, true);
+        }
+        let notices = std::mem::take(&mut *settings_notices());
+        for text in notices {
             self.app.session.notify(text, true);
         }
         let Some(phone) = self.phone.clone() else { return };
@@ -173,7 +225,11 @@ impl<P: Phone> App<P> {
         }
         for event in events {
             match event {
-                Event::Picked { purpose, name, path } => {
+                Event::Picked { purpose, name, path, document } => {
+                    // A project the phone may write back to: Save writes there once it is open.
+                    if let Some(document) = document.filter(|_| purpose == "project") {
+                        self.app.picked_document(path.clone(), document);
+                    }
                     // A file answers its own request; one of an earlier request (still being
                     // copied when another was asked for) leaves the later one waiting.
                     self.asked.borrow_mut().picked(&purpose);
@@ -194,6 +250,25 @@ impl<P: Phone> App<P> {
                     self.app.photos.push(path);
                 }
                 Event::Saved { name } => self.app.session.notify(i18n::fmt("Saved {name}.", &[("name", &name)]), false),
+                Event::ProjectDocument(document) => self.app.project_document(document),
+                Event::ProjectSave(result) => self.app.complete_project_save(result),
+                Event::WriteBackFailed { name, reason, kept } => {
+                    // Save again only helps while the project saved is the one open.
+                    let open = self.app.saving_the_open_project();
+                    let damaged = kept.is_some();
+                    let text = write_back_failure(&name, &reason, kept.as_deref(), open);
+                    // Turned down while busy with another file: the document wasn't touched.
+                    if reason == "code:busy" {
+                        self.app.project_save_refused(text);
+                    } else {
+                        self.app.complete_project_save(Err(text));
+                    }
+                    // The file may hold part of the project: what is open no longer matches any
+                    // saved file, so it counts as unsaved (and asks before it is closed).
+                    if damaged && open {
+                        self.app.session.mark_unsaved();
+                    }
+                }
                 Event::Position(fix) if self.locating => self.app.report_position(fix),
                 // A fix that was on its way when positioning was turned off.
                 Event::Position(_) => {}
@@ -204,6 +279,15 @@ impl<P: Phone> App<P> {
                     self.locating = false;
                     self.app.position = None;
                 }
+                Event::LowMemory => self.app.release_memory(),
+                // The Capture form takes it (`rustgis_ui_touch`).
+                Event::Typed(typed) => {
+                    if let rustgis_engine::platform::Typed::Closed { failed: Some(error), .. } = &typed {
+                        self.app.session.notify(i18n::fmt("The text box couldn't be opened: {error}", &[("error", error)]), true);
+                    }
+                    self.app.typed.push(typed);
+                }
+                Event::CopyFailed(error) => copy_failed(&mut self.app, &error),
                 Event::Failed(text) => self.app.session.notify(text, true),
             }
         }
@@ -213,8 +297,28 @@ impl<P: Phone> App<P> {
                     let limit = rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES.to_string();
                     i18n::fmt("{name} wasn't opened: a shortcut file is at most {limit} bytes.", &[("name", &name), ("limit", &limit)])
                 }
+                Problem::ScriptTooLarge { name } => i18n::fmt("{file} is larger than 1 MB", &[("file", &name)]),
+                Problem::MarkerTooLarge => rustgis_ui_egui::marker_file_too_large().to_string(),
+                Problem::PicturesTooLarge { names } => {
+                    let n = names.len();
+                    let first = names.into_iter().next().unwrap_or_default();
+                    let why = rustgis_ui_egui::rustgis_assistant::attach::too_large(first);
+                    if n == 1 {
+                        i18n::note(&why)
+                    } else {
+                        // In logical order inside the count's message, put in display form once.
+                        i18n::fmt(
+                            "{n} pictures weren't attached, such as {first}",
+                            &[("n", &n.to_string()), ("first", &i18n::note_raw(&why))],
+                        )
+                    }
+                }
+                Problem::PicturesLeftOut { names } => i18n::fmt(
+                    "{names} weren't attached: a message takes at most {n} pictures",
+                    &[("names", &names.join(", ")), ("n", &rustgis_ui_egui::rustgis_assistant::attach::MAX_PER_MESSAGE.to_string())],
+                ),
                 Problem::TooLarge { name, together } => {
-                    let limit = (rustgis_engine::data::io::MAX_BYTES >> 20).to_string();
+                    let limit = (PICK_MAX_BYTES >> 20).to_string();
                     let template = if together {
                         "{name} wasn't opened: with the files picked with it, it is over {limit} MiB."
                     } else {
@@ -246,16 +350,13 @@ impl<P: Phone> App<P> {
         } else if self.locating {
             Some(1000)
         } else {
-            None
+            phone.idle_look()
         };
     }
 
-    /// Ends a request for files that got none (`purpose`): a dialog waiting for its answer
-    /// (Import DXF) is answered empty, and stops waiting.
+    /// Ends a request for files that got none (`purpose`), as [`answer_ended`] does.
     fn end(&self, purpose: Option<String>) {
-        if let Some(purpose) = purpose.filter(|p| p.starts_with("dxf:")) {
-            self.inbox.lock().unwrap_or_else(|e| e.into_inner()).push((crate::mark(&purpose), Vec::new()));
-        }
+        answer_ended(&self.inbox, purpose);
     }
 
     /// Opens the picked files, now that every picker has answered in full, what was picked
@@ -294,8 +395,7 @@ impl<P: Phone> App<P> {
         }
         let (inbox, problems, reading, ctx) = (self.inbox.clone(), self.problems.clone(), self.reading.clone(), ctx.clone());
         let unread: Vec<(String, PathBuf)> = reads.iter().flat_map(|(_, files)| files.clone()).collect();
-        let retire: Vec<_> =
-            reads.iter().filter(|(purpose, _)| purpose.starts_with("dxf:")).map(|(purpose, _)| crate::mark(purpose)).collect();
+        let retire: Vec<_> = reads.iter().filter(|(purpose, _)| waits(purpose)).map(|(purpose, _)| crate::mark(purpose)).collect();
         let started = start_reader(&self.inbox, &self.reading, retire, || {
             std::thread::Builder::new().name("picked files".into()).spawn(move || {
                 let mut held = 0u64;
@@ -335,27 +435,52 @@ fn start_reader<T>(
     }
 }
 
-/// A worker that cannot start answers its DXF requests just as a cancelled picker does.
+/// A worker that cannot start answers its waiting requests ([`waits`]) just as a cancelled
+/// picker does.
 fn retire_unread(inbox: &Inbox, marks: Vec<String>) {
     inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(marks.into_iter().map(|mark| (mark, Vec::new())));
 }
 
+/// The most a pick reads into memory, in one file or the files picked together: fixed at the
+/// size every computer reads ([`rustgis_engine::data::io::BYTES_FLOOR`]), whatever the phone's
+/// memory. A phone reports all its memory, but an app may use much less of it before the system
+/// stops it, so the desktop's share of the memory isn't a phone's (#2408).
+const PICK_MAX_BYTES: u64 = rustgis_engine::data::io::BYTES_FLOOR;
+
 /// Reads one folder's files of a pick (name, copy) into `inbox`, marked for the dialog that
 /// asked, and removes the copies: their bytes are all that was wanted of them. `held` counts the
 /// bytes the pick has read so far, across its folders.
-fn read_batch(purpose: &str, files: Vec<(String, PathBuf)>, inbox: &Inbox, problems: &Problems, held: &mut u64) {
+fn read_batch(purpose: &str, mut files: Vec<(String, PathBuf)>, inbox: &Inbox, problems: &Problems, held: &mut u64) {
     let mark = crate::mark(purpose);
     let say = |problem| problems.lock().unwrap_or_else(|e| e.into_inner()).push(problem);
+    // No more of the assistant's pictures are read than a message takes; the rest are said.
+    let most = rustgis_ui_egui::rustgis_assistant::attach::MAX_PER_MESSAGE;
+    if mark == rustgis_ui_egui::ASSISTANT_PICK && files.len() > most {
+        let left: Vec<(String, PathBuf)> = files.drain(most..).collect();
+        for (_, path) in &left {
+            remove_copy(path);
+        }
+        say(Problem::PicturesLeftOut { names: left.into_iter().map(|(name, _)| name).collect() });
+    }
+    let max = PICK_MAX_BYTES;
     let mut read = Vec::new();
+    let mut too_large = Vec::new();
     for (name, path) in files {
         let shortcut = mark == rustgis_ui_egui::SHORTCUT_PICK || (mark.is_empty() && name.to_ascii_lowercase().ends_with(".rgisshortcuts"));
         let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
         if shortcut && size > rustgis_ui_egui::SHORTCUT_FILE_MAX_BYTES as u64 {
             say(Problem::ShortcutTooLarge { name });
-        } else if held.saturating_add(size) > rustgis_engine::data::io::MAX_BYTES {
+        } else if mark == rustgis_ui_egui::SCRIPT_PICK && size > rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES as u64 {
+            // Refused before it is read, as the pane would refuse it after.
+            say(Problem::ScriptTooLarge { name });
+        } else if mark.starts_with(rustgis_ui_egui::MARKER_PICK) && size > rustgis_ui_egui::MARKER_FILE_MAX_BYTES as u64 {
+            say(Problem::MarkerTooLarge);
+        } else if mark == rustgis_ui_egui::ASSISTANT_PICK && size > rustgis_ui_egui::ASSISTANT_FILE_MAX_BYTES as u64 {
+            too_large.push(name);
+        } else if held.saturating_add(size) > max {
             // Refused before it is read: no more than the cap is held in memory at once, in
             // one file or in the files picked together.
-            say(Problem::TooLarge { name, together: size <= rustgis_engine::data::io::MAX_BYTES });
+            say(Problem::TooLarge { name, together: size <= max });
         } else {
             match std::fs::read(&path) {
                 Ok(bytes) => {
@@ -367,12 +492,16 @@ fn read_batch(purpose: &str, files: Vec<(String, PathBuf)>, inbox: &Inbox, probl
         }
         remove_copy(&path);
     }
+    if !too_large.is_empty() {
+        say(Problem::PicturesTooLarge { names: too_large });
+    }
     let (read, found) = rustgis_engine::data::io::gather_shapefiles(read);
     for text in found {
         say(Problem::Shapefile(text));
     }
-    // A DXF request with nothing read is ended, as a cancelled one is: Import DXF stops waiting.
-    if mark.starts_with(rustgis_ui_egui::DXF_PICK) && read.is_empty() {
+    // A waiting request with nothing read is ended, as a cancelled one is: Import DXF, or a
+    // marker's «Image…», stops waiting.
+    if waits(purpose) && read.is_empty() {
         inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.clone(), Vec::new()));
     }
     inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(read.into_iter().map(|(name, bytes)| (format!("{mark}{name}"), bytes)));
@@ -385,6 +514,68 @@ fn remove_copy(path: &Path) {
     for folder in path.ancestors().skip(1).take(2) {
         // Not removed while it holds anything (another copy).
         let _ = std::fs::remove_dir(folder);
+    }
+}
+
+/// Whether a request for files (`purpose`) has something waiting on its answer, which an empty
+/// one ends: Import DXF (`dxf:<id>`) or a marker's «Image…» (`marker:<id>`).
+fn waits(purpose: &str) -> bool {
+    purpose.starts_with("dxf:") || purpose.starts_with("marker:")
+}
+
+/// Ends a request for files that got none (`purpose`): a dialog or marker waiting for its answer
+/// (Import DXF, a marker's «Image…») is answered empty in `inbox`, and stops waiting.
+fn answer_ended(inbox: &Inbox, purpose: Option<String>) {
+    if let Some(purpose) = purpose.filter(|p| waits(p)) {
+        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((crate::mark(&purpose), Vec::new()));
+    }
+}
+
+/// What the user is told when project `name` couldn't be written back: why ([`write_back_reason`]),
+/// whether the file was left as it was or may be damaged (the project as saved `kept` there), and,
+/// while the project is still `open`, that Save again asks where.
+fn write_back_failure(name: &str, reason: &str, kept: Option<&Path>, open: bool) -> String {
+    // Turned down while busy: nothing was touched, and Save writes back there once it is done.
+    if reason == "code:busy" {
+        let text = if open {
+            "{name} wasn't saved: another file is being chosen or saved. Save again once it is done."
+        } else {
+            "{name} wasn't saved: another file is being chosen or saved."
+        };
+        return i18n::fmt(text, &[("name", name)]);
+    }
+    let reason = write_back_reason(reason);
+    match (kept, open) {
+        (None, true) => i18n::fmt(
+            "{name} wasn't saved where it was opened from: {reason}. The file wasn't changed: Save again to choose where to save it.",
+            &[("name", name), ("reason", &reason)],
+        ),
+        (None, false) => i18n::fmt(
+            "{name} wasn't saved where it was opened from: {reason}. The file wasn't changed.",
+            &[("name", name), ("reason", &reason)],
+        ),
+        (Some(kept), true) => i18n::fmt(
+            "{name} may be damaged where it was opened from: {reason}. The project is still open: Save again to choose where to save it. A copy of it as saved is kept at {kept}.",
+            &[("name", name), ("reason", &reason), ("kept", &kept.display().to_string())],
+        ),
+        (Some(kept), false) => i18n::fmt(
+            "{name} may be damaged where it was opened from: {reason}. A copy of it as saved is kept at {kept}.",
+            &[("name", name), ("reason", &reason), ("kept", &kept.display().to_string())],
+        ),
+    }
+}
+
+/// Why a project couldn't be written back, in the user's language: the app's codes for its own
+/// reasons (`DocumentWrite.java`), or the system's text as it gave it.
+fn write_back_reason(reason: &str) -> String {
+    match reason {
+        "code:busy" => tl!("another file is being chosen or saved").to_string(),
+        "code:storage" => tl!("the app's storage can't be written to").to_string(),
+        "code:unwritable" => tl!("the file can't be written to").to_string(),
+        "code:stalled" => tl!("the file took no more bytes").to_string(),
+        "code:short" => tl!("the file doesn't hold all of the project after writing it").to_string(),
+        "code:unfinished" => tl!("the app ended before it was written").to_string(),
+        other => other.to_string(),
     }
 }
 
@@ -432,13 +623,17 @@ fn use_picker<P: Phone + 'static>(
         if refused_here && up {
             refused_while_up.set(true);
         }
-        // A DXF request whose picker didn't show is ended now: Import DXF stops waiting.
-        if let Some(purpose) = ended.filter(|p| p.starts_with("dxf:")) {
-            answers.lock().unwrap_or_else(|e| e.into_inner()).push((crate::mark(&purpose), Vec::new()));
-        }
+        // A request whose picker didn't show is ended now: Import DXF, or a marker's «Image…»,
+        // stops waiting.
+        answer_ended(&answers, ended);
     }));
     let saver = phone.clone();
-    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes)));
+    app.services.download = Some(Box::new(move |name: &str, bytes: Vec<u8>| saver.save_file(name, bytes, false)));
+    let saver = phone.clone();
+    app.services.save_project = Some(Box::new(move |name: &str, bytes: Vec<u8>, document: Option<&str>| match document {
+        Some(document) => saver.write_back(document, name, bytes),
+        None => saver.save_file(name, bytes, true),
+    }));
     app.services.inbox = Some(inbox.clone());
     let (camera, photographing) = (phone.clone(), asked.clone());
     app.services.take_photo = Some(Box::new(move || {
@@ -447,9 +642,20 @@ fn use_picker<P: Phone + 'static>(
         photographing.borrow_mut().photo_asked();
         Ok(())
     }));
+    // Where the phone has text fields of its own, the touch interface's fields open one.
+    if phone.enters_text() {
+        let typist = phone.clone();
+        app.services.enter_text = Some(Box::new(move |entry| typist.enter_text(entry)));
+    }
 }
 
 impl<P: Phone> eframe::App for App<P> {
+    /// When the event loop exits, give the recovery writer a short chance to finish the latest
+    /// edit. The next launch offers the last complete copy, if one exists.
+    fn on_exit(&mut self) {
+        self.app.finish_recovery_copy();
+    }
+
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The GPU map backend draws inside egui's wgpu pass; hand over the render state.
         self.app.set_render_state(frame.wgpu_render_state().cloned());
@@ -470,6 +676,30 @@ impl<P: Phone> eframe::App for App<P> {
         }
         ui.painter().rect_filled(ctx.viewport_rect(), 0.0, tokens.pane);
         ui.scope_builder(egui::UiBuilder::new().max_rect(ctx.content_rect()), |ui| self.app.ui(ui));
+        // Text copied in the window goes on the system's clipboard as well, for other apps.
+        if let Some(phone) = &self.phone {
+            let copied: Vec<String> = ctx.output(|o| {
+                o.commands
+                    .iter()
+                    .filter_map(|c| match c {
+                        egui::OutputCommand::CopyText(text) => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            });
+            copy_out(&mut self.app, phone.as_ref(), copied);
+        }
+        let back = rustgis_ui_touch::takes_back(&self.app, &ctx);
+        if back != self.back {
+            self.back = back;
+            if let Some(phone) = &self.phone {
+                phone.takes_back(back);
+            }
+        }
+        // A settings file that couldn't be read or saved in this frame is said in the next one.
+        if !settings_notices().is_empty() {
+            ctx.request_repaint();
+        }
         // A second picker asked for while one was up was refused: what the front end kept for
         // the first is put back, so its file is read as it was asked for.
         if self.refused_picker.replace(false)
@@ -479,7 +709,7 @@ impl<P: Phone> eframe::App for App<P> {
         }
         // Something of the phone's is still to arrive (a picked file, a position): look again.
         // A picker or a save asked for in this frame counts too: the poll was set before it.
-        if self.poll.is_none() && self.phone.as_ref().is_some_and(|phone| phone.busy()) {
+        if self.poll.is_none_or(|wait| wait > 250) && self.phone.as_ref().is_some_and(|phone| phone.busy()) {
             self.poll = Some(250);
         }
         if let Some(wait) = self.poll {
@@ -518,15 +748,11 @@ impl<P: Phone> eframe::App for App<P> {
         // The soft keyboard's Return, as the Enter key egui knows: each field does with it what
         // it does with Enter.
         if self.phone.as_ref().is_some_and(|phone| phone.take_return()) {
-            for pressed in [true, false] {
-                raw_input.events.push(egui::Event::Key {
-                    key: egui::Key::Enter,
-                    physical_key: None,
-                    pressed,
-                    repeat: false,
-                    modifiers: egui::Modifiers::NONE,
-                });
-            }
+            press(raw_input, egui::Key::Enter);
+        }
+        // The system's Back, as the key older Androids send for it.
+        if self.back && self.phone.as_ref().is_some_and(|phone| phone.take_back()) {
+            press(raw_input, egui::Key::BrowserBack);
         }
         if !self.phone.as_ref().is_some_and(|phone| phone.picking()) {
             self.kept.borrow_mut().take();
@@ -540,6 +766,13 @@ impl<P: Phone> eframe::App for App<P> {
             raw_input.dropped_files.push(Arc::new(Pushed(path)));
         }
         self.app.drop_stale_clicks(raw_input);
+    }
+}
+
+/// Gives egui a press and release of `key`.
+fn press(raw_input: &mut egui::RawInput, key: egui::Key) {
+    for pressed in [true, false] {
+        raw_input.events.push(egui::Event::Key { key, physical_key: None, pressed, repeat: false, modifiers: egui::Modifiers::NONE });
     }
 }
 
@@ -617,23 +850,107 @@ pub fn pushed(dir: Option<PathBuf>, app: &mut RustGisApp) -> Vec<PathBuf> {
     files
 }
 
-/// Makes the front end with the sample project, ready for a phone: commands run on the window's
-/// thread don't hold it, and `folders` (whether the system gave the app a folder of its own) is
-/// said when it is false.
-pub fn front_end(folders: bool) -> RustGisApp {
-    let mut app = RustGisApp::with_sample();
-    if !folders {
+/// Makes the front end with the sample project and recovery in the phone's private storage.
+pub fn front_end(root: Option<&Path>, secrets: Option<Arc<dyn SecretStore>>) -> RustGisApp {
+    // Datum grids: the app's own folder, where downloaded ones are kept (#2032 A4);
+    // a phone has no PROJ install to share.
+    if root.is_some() {
+        rustgis_engine::data::raster::crs::use_grid_folders();
+    }
+    let mut app = RustGisApp::with_sample().with_services(services(root.is_some(), secrets));
+    if let Some(root) = root {
+        match FolderStore::open(&root.join("recovery")) {
+            Ok(store) => app = app.with_edit_recovery(Box::new(store)),
+            Err(e) => app.session.notify(i18n::fmt("Autosave couldn't keep a recovery copy: {error}", &[("error", &e)]), true),
+        }
+    } else {
         app.session.warn(tl!("This device gives RustGIS no folder of its own: settings, the tile cache and recovery copies are off."));
     }
     // As on the desktop: commands run on the window's thread must not hold it.
     app.session.in_place_wait = false;
     app.session.on_window_thread = true;
     app.reads_off_frame = true;
-    if let Err(e) = app.start(&rustgis_ui_egui::Start { blank: Some(false), ..Default::default() }) {
+    // Start With's Blank Map or the sample; a project by its path (Last Project, a file) isn't one
+    // a phone can open at start, so the sample stands in for it.
+    let blank = app.ui.start_with == rustgis_ui_egui::StartWith::Blank;
+    if let Err(e) = app.start(&rustgis_ui_egui::Start { blank: Some(blank), ..Default::default() }) {
         log::warn!("start-up: {e}");
         app.session.notify(e, true);
     }
     app
+}
+
+/// The phone's settings and secrets, for [`RustGisApp::with_services`]: the preferences in
+/// `prefs.json` in the app's settings folder, as on the desktop, where it has a folder of its own
+/// (`settings`), and the system's secret store where it has one (`secrets`). With both, what the
+/// Assistant keeps (its provider, Remember the key, the key) lasts from one start to the next.
+/// Without a store, a key lasts for the session, as on a computer with no keychain.
+fn services(settings: bool, secrets: Option<Arc<dyn SecretStore>>) -> rustgis_ui_egui::Services {
+    // The ChatGPT sign-in's tokens go to the same store, as on the desktop.
+    rustgis_ui_egui::rustgis_assistant::chatgpt::set_secret_store(secrets.clone());
+    let mut services = rustgis_ui_egui::Services { secrets, ..Default::default() };
+    if settings {
+        // Read once and kept, as the desktop keeps its snapshot: the Assistant's settings ask for
+        // one every frame they are up. A save, which may have merged with, set aside or (failing)
+        // still replaced the file, has it read again at the next ask.
+        let kept: Arc<Mutex<Option<serde_json::Map<String, serde_json::Value>>>> = Arc::default();
+        let read = kept.clone();
+        services.load_pref = Some(Box::new(move |key: &str| {
+            let mut kept = read.lock().unwrap_or_else(|e| e.into_inner());
+            kept.get_or_insert_with(read_settings).get(key).and_then(serde_json::Value::as_str).map(str::to_string)
+        }));
+        services.save_pref = Some(Box::new(move |key: &str, value: &str| {
+            let result = rustgis_engine::prefs::write(key, value);
+            *kept.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            settings_saved(result);
+        }));
+    }
+    services
+}
+
+/// What reading or saving the settings came to that the window is still to say (it may not be up
+/// yet when they are first read).
+fn settings_notices() -> std::sync::MutexGuard<'static, Vec<String>> {
+    static NOTICES: Mutex<Vec<String>> = Mutex::new(Vec::new());
+    NOTICES.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// The saved settings, or none when the file can't be read: said once a run.
+fn read_settings() -> serde_json::Map<String, serde_json::Value> {
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    rustgis_engine::prefs::read().unwrap_or_else(|error| {
+        if !SAID.swap(true, Ordering::Relaxed) {
+            log::warn!("{error}");
+            settings_notices()
+                .push(i18n::fmt("Your settings couldn't be read ({error}), so RustGIS is using its defaults.", &[("error", &error)]));
+        }
+        serde_json::Map::new()
+    })
+}
+
+/// Says what a save of the settings came to: an unreadable file set aside, or a failure, said
+/// once until a save works again.
+fn settings_saved(result: Result<Option<PathBuf>, String>) {
+    static LAST_FAILURE: Mutex<Option<String>> = Mutex::new(None);
+    let mut last = LAST_FAILURE.lock().unwrap_or_else(|e| e.into_inner());
+    match result {
+        Ok(set_aside) => {
+            *last = None;
+            if let Some(path) = set_aside {
+                settings_notices().push(i18n::fmt(
+                    "Your settings couldn't be read, so RustGIS started new ones. The old settings file was kept as {path}.",
+                    &[("path", &path.display().to_string())],
+                ));
+            }
+        }
+        Err(error) => {
+            log::warn!("{error}");
+            if last.as_deref() != Some(error.as_str()) {
+                settings_notices().push(i18n::fmt("Settings could not be saved reliably ({error}).", &[("error", &error)]));
+                *last = Some(error);
+            }
+        }
+    }
 }
 
 /// Runs `app` in the phone's window with the touch interface: `phone` (or why it can't be
@@ -659,13 +976,16 @@ pub fn run<P: Phone + 'static>(
             None
         }
     };
-    // A phone gets the touch interface; its More sheet has the desktop one.
+    // A phone gets the touch interface; its More sheet has the desktop one, whose View tab has
+    // this one again.
     app.chrome = Some(rustgis_ui_touch::chrome);
+    app.touch = app.chrome;
     app.session.mark_saved();
     eframe::run_native(
         "RustGIS",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            app.enable_native_font_downloads(&cc.egui_ctx);
             Ok(Box::new(App {
                 app,
                 poll: None,
@@ -673,6 +993,7 @@ pub fn run<P: Phone + 'static>(
                 keeping: false,
                 typing: None,
                 keyboard: None,
+                back: false,
                 bars_light: None,
                 pushed,
                 phone,
@@ -689,20 +1010,46 @@ pub fn run<P: Phone + 'static>(
     )
 }
 
+/// Puts the text copied in the window on the system's clipboard; a copy the phone couldn't be
+/// asked to take is said, as one it refused is ([`Event::CopyFailed`]).
+fn copy_out(app: &mut RustGisApp, phone: &impl Phone, copied: Vec<String>) {
+    for text in copied {
+        if let Err(error) = phone.copy_text(&text) {
+            copy_failed(app, &error);
+        }
+    }
+}
+
+/// Says that text copied in the window didn't reach the system's clipboard.
+fn copy_failed(app: &mut RustGisApp, error: &str) {
+    app.session.notify(
+        i18n::fmt("The text copied wasn't put on the system's clipboard, so other apps can't paste it: {error}", &[("error", error)]),
+        true,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::{Value, json};
     use std::cell::Cell;
 
+    /// Held by a test that queues settings notices and by one that runs the window's events,
+    /// which say and empty them: the tests run in parallel.
+    fn settings_notices_held() -> std::sync::MutexGuard<'static, ()> {
+        static HELD: Mutex<()> = Mutex::new(());
+        HELD.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A phone that is busy once asked for a file, and reports the events put in it.
     #[derive(Default)]
-    struct FakePhone(Cell<bool>);
+    struct FakePhone(Cell<bool>, RefCell<Vec<Event>>);
     impl Platform for FakePhone {
         fn pick_files(&self, _: &str) -> Result<(), String> {
             self.0.set(true);
             Ok(())
         }
-        fn save_file(&self, _: &str, _: Vec<u8>) -> Result<(), String> {
+        fn save_file(&self, _: &str, _: Vec<u8>, _: bool) -> Result<(), String> {
             Ok(())
         }
         fn locate(&self, _: bool) -> Result<(), String> {
@@ -715,7 +1062,7 @@ mod tests {
             Ok(())
         }
         fn take_events(&self) -> Vec<Event> {
-            Vec::new()
+            self.1.take()
         }
     }
     impl Phone for FakePhone {
@@ -726,6 +1073,92 @@ mod tests {
         fn busy(&self) -> bool {
             self.0.get()
         }
+        fn idle_look(&self) -> Option<u64> {
+            Some(5000)
+        }
+        fn copy_text(&self, text: &str) -> Result<(), String> {
+            if text == "refused" { Err("no clipboard".into()) } else { Ok(()) }
+        }
+    }
+
+    /// The phone's low-memory warnings reach the front end: the tile cache and the drawing copy
+    /// of a layer switched off go (a drawn layer's stays), it is said once however often it
+    /// comes, and an idle window looks again as often as the phone asks.
+    #[test]
+    fn a_low_memory_warning_drops_caches_and_is_said_once() {
+        use rustgis_engine::render::rustgis_tiles::cache;
+
+        let mut app = RustGisApp::with_sample();
+        let layers = &mut app.session.map_mut().layers;
+        assert!(layers.len() >= 2);
+        layers[0].visible = false;
+        layers[1].visible = true;
+        for layer in layers.iter_mut().take(2) {
+            layer.projected();
+            assert!(layer.is_cached("mercator"));
+        }
+        let (clears, mark) = (cache::clears(), app.session.notice_mark());
+        let phone = Rc::new(FakePhone::default());
+        phone.1.borrow_mut().extend([Event::LowMemory, Event::LowMemory]);
+        let _held = settings_notices_held();
+        let mut window = App {
+            app,
+            pushed: Vec::new(),
+            poll: None,
+            locating: false,
+            keeping: false,
+            keyboard: None,
+            typing: None,
+            back: false,
+            bars_light: None,
+            phone: Some(phone),
+            inbox: Inbox::default(),
+            refusals: Refusals::default(),
+            asked: Asked::default(),
+            kept: Rc::default(),
+            refused_picker: Rc::default(),
+            waiting: Vec::new(),
+            problems: Problems::default(),
+            reading: Arc::default(),
+        };
+        window.take_phone_events(&egui::Context::default(), &mut egui::RawInput::default());
+        assert!(cache::clears() > clears);
+        let layers = &window.app.session.map().layers;
+        assert_eq!([layers[0].is_cached("mercator"), layers[1].is_cached("mercator")], [false, true]);
+        let said = window.app.session.notices_since(mark).iter().filter(|n| n.text.contains("low on memory")).count();
+        assert_eq!(said, 1);
+        assert_eq!(window.poll, Some(5000));
+    }
+
+    /// A copy the phone couldn't be asked to take is said once; one it took says nothing.
+    #[test]
+    fn a_copy_that_cannot_reach_the_clipboard_is_said() {
+        let mut app = RustGisApp::with_sample();
+        let before = app.session.notice_mark();
+        copy_out(&mut app, &FakePhone::default(), vec!["taken".into()]);
+        assert!(app.session.notices_since(before).is_empty());
+        copy_out(&mut app, &FakePhone::default(), vec!["refused".into(), "taken".into()]);
+        let said = app.session.notices_since(before);
+        assert_eq!(said.len(), 1);
+        assert!(said[0].text.contains("system's clipboard") && said[0].text.contains("no clipboard"));
+    }
+
+    /// A settings save that fails is said once, not on every later save that fails the same way,
+    /// and again after one works; a file set aside is said where it went.
+    #[test]
+    fn a_failed_settings_save_is_said_once_until_one_works() {
+        let _held = settings_notices_held();
+        settings_notices().clear();
+        settings_saved(Err("no room".into()));
+        settings_saved(Err("no room".into()));
+        assert_eq!(std::mem::take(&mut *settings_notices()), vec!["Settings could not be saved reliably (no room).".to_string()]);
+        settings_saved(Ok(None));
+        assert!(settings_notices().is_empty());
+        settings_saved(Err("no room".into()));
+        settings_saved(Ok(Some(PathBuf::from("/data/settings/prefs.json.bad"))));
+        let said = std::mem::take(&mut *settings_notices());
+        assert_eq!(said.len(), 2, "{said:?}");
+        assert!(said[1].ends_with("kept as /data/settings/prefs.json.bad."), "{said:?}");
     }
 
     #[test]
@@ -746,7 +1179,42 @@ mod tests {
         app.run("ui.addDxf", Value::Null).unwrap();
         assert_eq!(inbox.lock().unwrap().len(), 1);
         assert!(inbox.lock().unwrap()[0].0.starts_with(rustgis_ui_egui::DXF_PICK));
+        // So does a marker's «Image…» refused the same way: the marker stops waiting.
+        (app.services.open_async.as_ref().unwrap())("marker:9");
+        assert_eq!(inbox.lock().unwrap().last().unwrap().0, format!("{}9:", rustgis_ui_egui::MARKER_PICK));
     }
+    /// A failed write-back says whether the file was changed, and offers Save again only while the
+    /// project saved is still open; the app's own reasons are worded, the system's passed on.
+    #[test]
+    fn a_failed_write_back_is_worded_by_what_happened() {
+        let kept = Path::new("/data/saved/1/site.rgis");
+        let said = |kept: Option<&Path>, open| write_back_failure("site.rgis", "code:unwritable", kept, open);
+        assert_eq!(
+            said(None, true),
+            "site.rgis wasn't saved where it was opened from: the file can't be written to. The file wasn't changed: Save again to choose where to save it."
+        );
+        assert!(said(None, false).ends_with("The file wasn't changed.") && !said(None, false).contains("Save again"));
+        assert!(said(Some(kept), true).contains("may be damaged") && said(Some(kept), true).contains("Save again"));
+        assert!(said(Some(kept), true).ends_with("kept at /data/saved/1/site.rgis."));
+        assert!(said(Some(kept), false).contains("may be damaged") && !said(Some(kept), false).contains("Save again"));
+        let busy = write_back_failure("site.rgis", "code:busy", None, true);
+        assert_eq!(busy, "site.rgis wasn't saved: another file is being chosen or saved. Save again once it is done.");
+        assert_eq!(
+            write_back_failure("site.rgis", "code:busy", None, false),
+            "site.rgis wasn't saved: another file is being chosen or saved."
+        );
+        for (code, worded) in [
+            ("code:busy", "another file is being chosen or saved"),
+            ("code:storage", "the app's storage can't be written to"),
+            ("code:stalled", "the file took no more bytes"),
+            ("code:short", "the file doesn't hold all of the project after writing it"),
+            ("code:unfinished", "the app ended before it was written"),
+            ("Permission denied", "Permission denied"),
+        ] {
+            assert_eq!(write_back_reason(code), worded);
+        }
+    }
+
     #[test]
     fn a_worker_refused_before_reading_retires_its_dxf_answer() {
         let inbox = Inbox::default();
@@ -756,5 +1224,61 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(reading.load(Ordering::Relaxed), 0);
         assert_eq!(*inbox.lock().unwrap(), vec![(crate::mark("dxf:7"), Vec::<u8>::new())]);
+    }
+
+    /// A script picked for Load… over the pane's limit is refused before it is read, naming it; one
+    /// within it reaches the inbox marked for the pane.
+    #[test]
+    fn a_script_over_the_limit_is_refused_before_it_is_read() {
+        let dir = std::env::temp_dir().join(format!("rustgis-mobile-script-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (big, small) = (dir.join("big.txt"), dir.join("small.txt"));
+        std::fs::write(&big, vec![b'#'; rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES + 1]).unwrap();
+        std::fs::write(&small, "map.zoomFull").unwrap();
+        let (inbox, problems) = (Inbox::default(), Problems::default());
+        let files = vec![("big.txt".to_string(), big), ("small.txt".to_string(), small)];
+        read_batch("script", files, &inbox, &problems, &mut 0);
+        let said = problems.lock().unwrap();
+        assert!(matches!(said.as_slice(), [Problem::ScriptTooLarge { name }] if name == "big.txt"));
+        let names: Vec<String> = inbox.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, [format!("{}small.txt", rustgis_ui_egui::SCRIPT_PICK)]);
+        // The copies are gone, read or not, and their folder with them (`remove_copy`).
+        assert!(!dir.exists());
+    }
+
+    /// An image picked for a marker over the marker's limit is refused before it is read; one
+    /// within it reaches the inbox marked for the marker, and a pick with nothing read ends the
+    /// marker's wait.
+    #[test]
+    fn a_marker_image_over_the_limit_is_refused_before_it_is_read() {
+        let dir = std::env::temp_dir().join(format!("rustgis-mobile-marker-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (big, small) = (dir.join("big.png"), dir.join("small.png"));
+        std::fs::write(&big, vec![0; rustgis_ui_egui::MARKER_FILE_MAX_BYTES + 1]).unwrap();
+        std::fs::write(&small, b"png").unwrap();
+        let (inbox, problems) = (Inbox::default(), Problems::default());
+        let files = vec![("big.png".to_string(), big), ("small.png".to_string(), small)];
+        read_batch("marker:1", files, &inbox, &problems, &mut 0);
+        assert!(matches!(problems.lock().unwrap().as_slice(), [Problem::MarkerTooLarge]));
+        let names: Vec<String> = inbox.lock().unwrap().iter().map(|(n, _)| n.clone()).collect();
+        assert_eq!(names, [format!("{}1:small.png", rustgis_ui_egui::MARKER_PICK)]);
+        // Only the large one: nothing read, so the request is answered empty and stops waiting.
+        std::fs::create_dir_all(&dir).unwrap();
+        let big = dir.join("big2.png");
+        std::fs::write(&big, vec![0u8; rustgis_ui_egui::MARKER_FILE_MAX_BYTES + 1]).unwrap();
+        let inbox = Inbox::default();
+        read_batch("marker:2", vec![("big2.png".to_string(), big)], &inbox, &problems, &mut 0);
+        assert_eq!(*inbox.lock().unwrap(), vec![(format!("{}2:", rustgis_ui_egui::MARKER_PICK), Vec::<u8>::new())]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A marker's request ended with no file (a cancelled picker) is answered empty with its
+    /// mark, so the marker stops waiting; a request nothing waits on gets no answer.
+    #[test]
+    fn an_ended_marker_request_is_answered_empty() {
+        let inbox = Inbox::default();
+        answer_ended(&inbox, Some("marker:3".into()));
+        answer_ended(&inbox, Some("data".into()));
+        assert_eq!(*inbox.lock().unwrap(), vec![(format!("{}3:", rustgis_ui_egui::MARKER_PICK), Vec::<u8>::new())]);
     }
 }

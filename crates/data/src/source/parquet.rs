@@ -12,7 +12,8 @@
 //! downloaded whole instead.
 
 use super::remote::{self, Remote};
-use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp_limit, in_request};
+use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp_limit};
+use crate::raster::Crs;
 use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, wkb};
 use bytes::Bytes;
 use parquet::basic::{ConvertedType, Encoding, LogicalType, Type as Physical};
@@ -36,10 +37,23 @@ const MAX_GROUP_ROWS: usize = if cfg!(target_arch = "wasm32") { 1 << 21 } else {
 /// Conservative decoded-column budget for one group scanned without native view bounds.
 const MAX_SCAN_BYTES: u64 = if cfg!(target_arch = "wasm32") { 64 << 20 } else { 256 << 20 };
 
+/// What a GeoParquet source's reads are attributed to ([`ParquetSource::attribute`]).
+#[derive(Clone, Debug)]
+enum Attributed {
+    /// The file read, observed as it is at each read.
+    File(std::path::PathBuf),
+    /// A conversion's original, as it was when the conversion was opened. Conversions run only
+    /// on the desktop.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    Original(Arc<Vec<crate::provenance::Fingerprint>>),
+}
+
 /// A GeoParquet file.
 pub struct ParquetSource {
-    /// The local input attributed to reads; a conversion names its source, never its cache.
-    path: Option<std::path::PathBuf>,
+    /// The local input attributed to reads: the file itself, observed again at each read, or a
+    /// conversion's source (never its cache) as it was when the conversion was opened, since a
+    /// source changed since isn't what the conversion holds.
+    path: Option<Attributed>,
     info: SourceInfo,
     reader: Arc<dyn FileReader>,
     /// Leaf column index of the geometry.
@@ -69,8 +83,17 @@ impl ParquetSource {
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
         let file = crate::provenance::open(path)?;
         let mut source = Self::new(Arc::new(SerializedFileReader::new(file).map_err(err)?), name, None)?;
-        source.path = Some(path.to_path_buf());
+        source.path = Some(Attributed::File(path.to_path_buf()));
         Ok(source)
+    }
+
+    /// Records the input this reads: the file as it is now, or a conversion's original as it was.
+    fn attribute(&self) {
+        match &self.path {
+            Some(Attributed::File(path)) => crate::provenance::path(path),
+            Some(Attributed::Original(seen)) => crate::provenance::record(seen.iter().cloned()),
+            None => {}
+        }
     }
 
     /// Opens a conversion while retaining its original local input for later reads and traversals.
@@ -83,18 +106,11 @@ impl ParquetSource {
         workspace: Option<Arc<super::duckdb::ReloadWorkspace>>,
     ) -> Result<Self> {
         let mut source = crate::provenance::without(|| Self::open_path(path, name))?;
-        source.path = original.map(Path::to_path_buf);
-        if let Some(path) = &source.path {
-            crate::provenance::path(path);
-        }
+        source.path =
+            original.map(|original| Attributed::Original(Arc::new(crate::provenance::snapshot(|| crate::provenance::duckdb(original)).1)));
+        source.attribute();
         source._workspace = workspace;
         Ok(source)
-    }
-
-    /// Opens a private conversion, keeping its files alive for every shared reader.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_owned_path(path: &Path, name: &str, workspace: Arc<super::duckdb::ReloadWorkspace>) -> Result<Self> {
-        Self::open_converted_path(path, name, None, Some(workspace))
     }
 
     pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self> {
@@ -207,7 +223,7 @@ impl ParquetSource {
         if schema.column(geom_col).physical_type() != Physical::BYTE_ARRAY {
             return Err(DataError::Format(format!("geometry column '{primary}' is not binary")));
         }
-        let mut notes = Vec::new();
+        let mut notes = crate::loss::Notes::new();
         let crs = col_meta.and_then(|c| c.get("crs"));
         let code = crs_code(crs);
         // Another body's system is said, or refused when its coordinates aren't longitude/latitude.
@@ -219,7 +235,10 @@ impl ParquetSource {
             notes.push(format!("its coordinate system: {note}"));
         } else if code.is_none() && crs.is_some_and(|c| !c.is_null() && !is_crs84(c)) {
             // A coordinate system given without an EPSG code (and not OGC:CRS84) can't be converted.
-            notes.push("its coordinate system has no EPSG code; read as longitude/latitude".into());
+            notes.push(crate::loss::Note::loss(
+                crate::loss::LossCode::AssumedCrs,
+                "its coordinate system has no EPSG code; read as longitude/latitude",
+            ));
         }
         let reproject = Reproject::from_epsg(code, &mut notes);
         let covering = find_covering(md, col_meta, &primary);
@@ -331,7 +350,7 @@ impl ParquetSource {
             match src.peek_zm() {
                 Some(true) => src.info.drop_zm(None),
                 Some(false) => {}
-                None => src.info.notes.push("couldn't tell whether it has Z or M values, which RustGIS doesn't keep".into()),
+                None => src.info.notes.push("couldn't tell whether it has Z or M values, which RustGIS doesn't keep"),
             }
         }
         if src.info.geometry_type == GeometryType::None {
@@ -470,17 +489,60 @@ impl FeatureSource for ParquetSource {
         &self.info
     }
 
+    /// From every row group's statistics of the field's column, which the footer holds: no byte of
+    /// the data is read. A row group without a statistics object, or whose statistics give no
+    /// bounds while it has values, or bounds that aren't finite and in order, leaves the range
+    /// unknown (`None`); one whose statistics count only nulls adds nothing. The field is named exactly
+    /// as the source lists it.
+    fn field_range(&self, field: &str) -> Option<(f64, f64)> {
+        let i = self.info.fields.iter().position(|f| f.name == field && f.ty.is_numeric())?;
+        let col = *self.field_cols.get(i)?;
+        let md = self.reader.metadata();
+        let desc = md.file_metadata().schema_descr().column(col);
+        // Unsigned integers are ordered as unsigned in the statistics, not as the values are read.
+        if matches!(desc.logical_type_ref(), Some(LogicalType::Integer(t)) if !t.is_signed)
+            || matches!(
+                desc.converted_type(),
+                ConvertedType::UINT_8 | ConvertedType::UINT_16 | ConvertedType::UINT_32 | ConvertedType::UINT_64
+            )
+        {
+            return None;
+        }
+        let scale = decimal_scale(&desc).map_or(1.0, |s| 10f64.powi(-s));
+        let (lo, hi) = (0..md.num_row_groups()).try_fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), g| {
+            let rg = md.row_group(g);
+            let s = rg.columns().get(col)?.statistics()?;
+            match (number_stat(s, false), number_stat(s, true)) {
+                (Some(a), Some(b)) => {
+                    let (a, b) = (a * scale, b * scale);
+                    (a.is_finite() && b.is_finite() && a <= b).then(|| (lo.min(a), hi.max(b)))
+                }
+                // A row group of nulls only has no bounds.
+                _ if s.null_count_opt() == Some(u64::try_from(rg.num_rows()).ok()?) => Some((lo, hi)),
+                _ => None,
+            }
+        })?;
+        (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
+    }
+
+    fn reads_own_box(&self) -> bool {
+        true
+    }
+
+    /// Its own system, in which it gives its features as the file holds them.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.reproject.crs()
+    }
+
     /// Keeps rows with null geometry in whole reads; they have no location to match an extent.
     /// Unbounded spatial scans bound retained row masks and refuse groups over the decoded-column
     /// budget before decoding, count rows and check Cancel between them. They decode every selected group's geometry
     /// and fields before sampling matches; a refused view therefore scans the selected file.
     fn read(&self, req: &Request) -> Result<Batch> {
-        if let Some(path) = &self.path {
-            crate::provenance::path(path);
-        }
+        self.attribute();
         let limit = clamp_limit(req.limit);
         let md = self.reader.metadata();
-        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = self.reproject.request_box(req);
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
             return Err(super::unbounded_count());
@@ -646,7 +708,7 @@ impl FeatureSource for ParquetSource {
                 // Null geometry is valid; malformed non-null WKB is skipped and counted.
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {
-                        let Some(geometry) = wkb::decode(bytes).and_then(|g| self.reproject.geometry(g)) else {
+                        let Some(geometry) = wkb::decode(bytes).and_then(|g| self.reproject.place(g, req)) else {
                             skipped += 1;
                             continue;
                         };
@@ -654,17 +716,28 @@ impl FeatureSource for ParquetSource {
                     }
                     None => None,
                 };
-                let matches_extent = geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, req));
+                let matches_extent = geometry.as_ref().map_or(req.extent.is_none(), |g| g.inside);
                 if !matches_extent || (late && !sample.wants()) {
                     continue;
                 }
+                let geometry = geometry.map(|p| p.geometry);
                 let values =
                     attrs.iter().enumerate().map(|(field, col)| col.value(k, field, &mut unread_dates, &mut rounded_dates)).collect();
                 sample.keep(Feature { id: base.saturating_add(r as u64 + 1), geometry, attrs: values });
             }
         }
         let matched = (if late { sample.seen() } else { matched }).saturating_mul(thinned as u64);
-        Ok(Batch { matched, complete: sample.complete() && thinned == 1, skipped, features: sample.items, unread_dates, rounded_dates })
+        Ok(Batch {
+            matched,
+            complete: sample.complete() && thinned == 1,
+            skipped,
+            features: sample.items,
+            unread_dates,
+            rounded_dates,
+            null_text: Vec::new(),
+            notes: Default::default(),
+            not_utf8: Vec::new(),
+        })
     }
 
     fn remote(&self) -> Option<Arc<Remote>> {
@@ -683,14 +756,12 @@ impl FeatureSource for ParquetSource {
     /// Checks Cancel between groups and scanned rows; each group's column decoding finishes
     /// before the next check. An unbounded view also checks the decoded-column budget first.
     fn visit_chunks(&self, extent: Option<Extent>, bytes: usize, visit: &mut dyn FnMut(Vec<Feature>) -> Result<()>) -> Result<Batch> {
-        if let Some(path) = &self.path {
-            crate::provenance::path(path);
-        }
+        self.attribute();
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         if self.remote.is_some() {
             return Err(DataError::Unsupported("a whole GeoParquet by its web address read a chunk at a time".into()));
         }
-        let req = Request { extent, limit: usize::MAX };
+        let req = Request { extent, limit: usize::MAX, own: None };
         let md = self.reader.metadata();
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let mut out = Batch { complete: true, ..Batch::default() };
@@ -746,7 +817,7 @@ impl FeatureSource for ParquetSource {
                 crate::progress::step(1)?;
                 let geometry = match geoms.get(k).and_then(|b| b.as_deref()) {
                     Some(bytes) => {
-                        let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.geometry(geom)) else {
+                        let Some(geometry) = wkb::decode(bytes).and_then(|geom| self.reproject.place(geom, &req)) else {
                             out.skipped += 1;
                             continue;
                         };
@@ -754,9 +825,10 @@ impl FeatureSource for ParquetSource {
                     }
                     None => None,
                 };
-                if !geometry.as_ref().map_or(req.extent.is_none(), |g| in_request(g, &req)) {
+                if !geometry.as_ref().map_or(req.extent.is_none(), |g| g.inside) {
                     continue;
                 }
+                let geometry = geometry.map(|p| p.geometry);
                 let values = attrs
                     .iter()
                     .enumerate()
@@ -1035,6 +1107,23 @@ fn stat(s: Option<&Statistics>, max: bool) -> Option<f64> {
     }
 }
 
+/// A numeric column's smallest or largest value in a row group's statistics.
+fn number_stat(s: &Statistics, max: bool) -> Option<f64> {
+    match s {
+        Statistics::Int32(v) => (if max { v.max_opt() } else { v.min_opt() }).map(|x| f64::from(*x)),
+        // Past 2^53, the next double out, so the bound still holds every value.
+        Statistics::Int64(v) => (if max { v.max_opt() } else { v.min_opt() }).map(|&x| {
+            let y = x as f64;
+            match (y as i128).cmp(&i128::from(x)) {
+                std::cmp::Ordering::Less if max => y.next_up(),
+                std::cmp::Ordering::Greater if !max => y.next_down(),
+                _ => y,
+            }
+        }),
+        _ => stat(Some(s), max),
+    }
+}
+
 /// A row group's bounding box from its covering statistics.
 fn group_extent(md: &ParquetMetaData, g: usize, c: [usize; 4]) -> Option<Extent> {
     let rg = md.row_groups().get(g)?;
@@ -1253,10 +1342,13 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
     let desc = rg.metadata().column(col).column_descr_ptr();
     let max_def = desc.max_def_level();
     let scale = decimal_scale(&desc).map(|s| 10f64.powi(-s));
+    // The column's kind, worked out once rather than for each value.
+    let clock = clock_kind(&desc);
+    let temporal = matches!(field_type(&desc), Some(FieldType::Date | FieldType::DateTime));
     let mut flags = Vec::new();
     let mut int = |v: Option<i64>| {
         flags.push(0u8);
-        if let Some(unit) = clock_kind(&desc) {
+        if let Some(unit) = clock {
             return v
                 .map(|n| {
                     let value = clock_value(n, unit);
@@ -1269,7 +1361,7 @@ fn read_values(rg: &dyn RowGroupReader, col: usize, take: &[bool]) -> Result<Col
                 })
                 .unwrap_or_default();
         }
-        if matches!(field_type(&desc), Some(FieldType::Date | FieldType::DateTime)) {
+        if temporal {
             return v
                 .map(|i| {
                     let (value, rounded) = temporal_value(&desc, i);
@@ -1563,7 +1655,35 @@ fn wkb_type_name(g: &crate::Geometry) -> &'static str {
 /// `bbox` covering column so readers can skip rows and row groups by extent. A table without
 /// geometry is written as plain Parquet.
 pub fn write(ds: &crate::Dataset) -> Result<Vec<u8>> {
-    write_features(ds.geometry_type, &ds.fields, Vec::new(), &mut |add| add(&ds.features)).map(|(bytes, _, _)| bytes)
+    write_in(ds, Crs::LonLat)
+}
+
+/// As [`write`], for a dataset whose coordinates are in `crs`, which the geometry column's `crs`
+/// says ([`projjson`]); refused for a system it can't say.
+pub fn write_in(ds: &crate::Dataset, crs: Crs) -> Result<Vec<u8>> {
+    write_features(ds.geometry_type, &ds.fields, crs, Vec::new(), &mut |add| add(&ds.features)).map(|(bytes, _, _)| bytes)
+}
+
+/// The GeoParquet `crs` (PROJJSON) of a system other than longitude/latitude, which GeoParquet
+/// takes when a column has none. Only a system with an EPSG code: its PROJJSON carries the code,
+/// which every release of RustGIS reads ([`crs_code`]), where one without would be read as
+/// longitude/latitude. `None` for one without a code, or one terrio-crs can't write.
+pub(crate) fn projjson(crs: Crs) -> Option<serde_json::Value> {
+    let code = u32::from(crs.epsg());
+    if code == 0 || crs == Crs::LonLat {
+        return None;
+    }
+    let text = terrio_crs::SpatialRef::from_epsg(code).ok()?.to_projjson().ok()?;
+    let value: serde_json::Value = serde_json::from_str(&text).ok()?;
+    (crs_code(Some(&value)) == Some(code)).then_some(value)
+}
+
+/// Why a GeoParquet can't be written in `crs` ([`projjson`] has none for it).
+pub(crate) fn projjson_refusal(crs: Crs) -> String {
+    match crs.epsg() {
+        0 => "it has no EPSG code; give the system as an EPSG code".to_string(),
+        code => format!("RustGIS can't write a PROJJSON definition of EPSG:{code}"),
+    }
 }
 
 /// An Integer column's value, `None` for one it can't hold: a whole float fits; a fraction, a
@@ -1611,19 +1731,27 @@ impl DateLayout {
             }
         }
     }
-    /// Counts each representation change and names its fields for the user-facing export notice.
-    fn notes(&self, fields: &[Field], target: &str) -> Vec<String> {
+    /// Counts each representation change and names its fields for the user-facing export notice,
+    /// each after `target: ` (nothing before it when `target` is empty: the caller adds the path).
+    /// An offset left out is a value lost; ISO text keeps the value.
+    fn notes(&self, fields: &[Field], target: &str) -> Vec<crate::loss::Note> {
         let target: String = target.chars().map(crate::io::dbf_notice_char).collect();
+        let target = if target.is_empty() { String::new() } else { format!("{target}: ") };
         let mut notes = Vec::new();
         let utc: Vec<usize> = self.offsets.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&2) { n } else { 0 }).collect();
         let text: Vec<usize> = self.counts.iter().enumerate().map(|(k, &n)| if self.modes.get(k) == Some(&3) { n } else { 0 }).collect();
-        for (counts, what) in [
-            (&utc, "date-times were written in UTC without their original offsets"),
-            (&text, "date-times were written as ISO text because their column mixes zoned and unzoned values"),
+        for (counts, what, lost) in [
+            (&utc, "date-times were written in UTC without their original offsets", true),
+            (&text, "date-times were written as ISO text because their column mixes zoned and unzoned values", false),
         ] {
             let n: usize = counts.iter().sum();
             if n > 0 {
-                notes.push(format!("{target}: {n} {what}, in {}", crate::io::named_fields(fields, counts)));
+                let text = format!("{target}{n} {what}, in {}", crate::io::named_fields(fields, counts));
+                notes.push(if lost {
+                    crate::loss::Note::loss(crate::loss::LossCode::DroppedValue, text)
+                } else {
+                    crate::loss::Note::plain(text)
+                });
             }
         }
         notes
@@ -1667,7 +1795,7 @@ fn unfit(ty: FieldType, value: &Value) -> bool {
 /// The notice for values a GeoParquet export wrote as null because their column's type couldn't
 /// hold them, given the count per field (as `write_features` returns); `None` when there are
 /// none. Names the first five fields.
-pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<String> {
+pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<crate::loss::Note> {
     let total = counts.iter().fold(0usize, |a, n| a.saturating_add(*n));
     if total == 0 {
         return None;
@@ -1682,12 +1810,15 @@ pub fn unfit_note(fields: &[Field], counts: &[usize], target: &str) -> Option<St
         format!("{total} values couldn't be written as their columns' types and were")
     };
     let target: String = target.chars().map(crate::io::dbf_notice_char).collect();
-    Some(format!("{target}: {what} written as null, in {}{more}", list.join(", ")))
+    Some(crate::loss::Note::loss(
+        crate::loss::LossCode::DroppedValue,
+        format!("{target}: {what} written as null, in {}{more}", list.join(", ")),
+    ))
 }
 
 /// Export notices for the whole of `ds`: unfit values and timestamp representation changes.
 /// Cancellation omits notices; the following writer's check returns the cancellation error.
-pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
+pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<crate::loss::Note> {
     let mut counts = vec![0usize; ds.fields.len()];
     let mut layout = DateLayout::default();
     for chunk in ds.features.chunks(BATCH) {
@@ -1702,9 +1833,18 @@ pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
             }
         }
     }
-    let mut notes: Vec<String> = unfit_note(&ds.fields, &counts, target).into_iter().collect();
-    notes.extend(layout.notes(&ds.fields, target));
-    if notes.is_empty() { None } else { Some(notes.join("; ")) }
+    // One notice: the values written as null, then how date-times are written; coded when either
+    // loses a value.
+    let said: Vec<crate::loss::Note> =
+        unfit_note(&ds.fields, &counts, target).into_iter().chain(layout.notes(&ds.fields, target)).collect();
+    let loss = said.iter().find_map(|n| n.loss);
+    (!said.is_empty()).then(|| {
+        let text = said.iter().map(|n| n.text.as_str()).collect::<Vec<_>>().join("; ");
+        match loss {
+            Some(code) => crate::loss::Note::loss(code, text),
+            None => crate::loss::Note::plain(text),
+        }
+    })
 }
 
 /// Writes GeoParquet to `out`: the features `feed` hands to the function it is given, a run at
@@ -1714,12 +1854,15 @@ pub fn values_note(ds: &crate::Dataset, target: &str) -> Option<String> {
 /// metadata gives are gathered as the rows go and written with the footer.
 /// Timestamp columns require replaying the feed before writing, to select one Parquet timezone
 /// flag per column without buffering the source. That pass checks Cancel but counts no writes.
+/// Returns the writer, the values each field couldn't hold, and the notes on date-times, which
+/// name no file: the caller says the path.
 pub(crate) fn write_features<W: std::io::Write + Send>(
     geometry_type: GeometryType,
     fields: &[Field],
+    crs: Crs,
     out: W,
     feed: &mut dyn FnMut(&mut dyn FnMut(&[Feature]) -> Result<()>) -> Result<()>,
-) -> Result<(W, Vec<usize>, Vec<String>)> {
+) -> Result<(W, Vec<usize>, Vec<crate::loss::Note>)> {
     use parquet::basic::{Compression, Encoding, Repetition, ZstdLevel};
     use parquet::data_type::{BoolType, ByteArray, ByteArrayType, DoubleType, Int32Type, Int64Type};
     use parquet::file::metadata::KeyValue;
@@ -1738,6 +1881,14 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
         })?;
     }
     let has_geom = geometry_type != GeometryType::None;
+    // Before anything is written: a system the file couldn't say would be read as degrees.
+    let crs_json = match crs {
+        Crs::LonLat => None,
+        _ if !has_geom => None,
+        other => Some(
+            projjson(other).ok_or_else(|| DataError::Unsupported(format!(".parquet in {}: {}", other.label(), projjson_refusal(other))))?,
+        ),
+    };
     let geom_name = free_name(fields, "geometry");
     let bbox_name = free_name(fields, "bbox");
     let prim = |name: &str, t: Physical, rep: Repetition, logical: Option<LogicalType>| {
@@ -1895,8 +2046,12 @@ pub(crate) fn write_features<W: std::io::Write + Send>(
         if !e.is_empty() {
             col["bbox"] = serde_json::json!([e.min_x, e.min_y, e.max_x, e.max_y]);
         }
+        if let Some(c) = crs_json {
+            col["crs"] = c;
+        }
         let geo = serde_json::json!({"version": "1.1.0", "primary_column": geom_name, "columns": {geom_name.clone(): col}});
         w.append_key_value_metadata(KeyValue::new("geo".to_string(), geo.to_string()));
     }
-    Ok((w.into_inner().map_err(err)?, unfit_counts, layout.notes(fields, "GeoParquet")))
+    // Without a target: the caller says the path the export is written to.
+    Ok((w.into_inner().map_err(err)?, unfit_counts, layout.notes(fields, "")))
 }

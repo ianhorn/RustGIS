@@ -18,13 +18,15 @@ A phone opens in the touch interface: the map, with a bar of four large buttons 
 
 | Button | What it does |
 | --- | --- |
-| **Layers** | Shows and hides layers, zooms to one, and makes one the active layer |
+| **Layers** | Shows and hides layers, zooms to one, makes one the active layer, and switches between the project's maps and layouts |
 | **Add Data** | Opens files with the system's picker (Android's Files, iOS's document picker) |
 | **Capture** | Adds and edits features at the cross in the middle of the map |
-| **More** | Full Extent, the project, Undo and Redo, the position, tracks and the rest |
+| **More** | Full Extent, Undo and Redo, the project, the position, tracks and the rest |
 
-Each button opens a sheet that rises over the map. **Use the Desktop Interface**, in the More
-sheet, brings back the ribbon and panes until the app is started again.
+Each button opens a sheet that rises over the map. To close it, tap its **×**, swipe down on its
+heading, tap the map above it, or use Android's Back. Pinch the map to zoom. **Use the Desktop
+Interface**, in the More sheet, brings back the ribbon and panes; **Touch Interface**, on the View
+tab (or Use the Touch Interface in Command Search), returns to the phone's interface.
 
 ## Opening data
 
@@ -38,6 +40,19 @@ are never removed by themselves. **Remove Unused Copies**, in the More sheet, fi
 project in the window doesn't use, says how many there are and how much room they take, and
 removes them once you agree. A copy still being made is kept.
 
+A project (`.rgis`) opened with **Open Project** is different: **Save** writes it back to the file
+it was opened from, where the system lets the app write there (the device's storage, and storage
+apps that allow it). **Save As** asks where, and **Save** then writes to the file chosen. Where the
+app may not write the original (a read-only file, a field package, a project recovered after a
+restart), **Save** asks where, as Save As does.
+
+On an iPhone the project is written whole beside the original and then put in its place, so a
+failed save leaves the original as it was. Android has no way to swap a file in like that: the app
+first keeps a complete copy of the project in its own storage, then writes over the original. If
+that write fails partway, the original may be damaged; the message says so and names the copy,
+and the next **Save** asks where to save. If the app is ended while it writes, the next start says so
+in the same way.
+
 !!! warning
     Remove Unused Copies looks only at the project in the window. A copy that another project
     saved on the phone uses counts as unused, and removing it breaks that project. Open the project
@@ -46,6 +61,18 @@ removes them once you agree. A copy still being made is kept.
 Formats read through GDAL, DuckDB databases and the GeoLibre tools need programs a phone can't
 run: the app says so where they would appear. Convert such data on a computer first. Database
 connections (PostGIS, MySQL, SQL Server) work on a phone too, as they need no program.
+
+## Memory
+
+A phone gives an app much less memory than a computer, and ends one that takes too much. RustGIS
+plans each job from what the system allows and has free at the time (see
+[the limits](analysis.md#analysis-workflows)), so a raster that opens whole on a computer can open
+at a lower resolution on a phone, and a tool's output can be refused there. RustGIS says so either
+way; a refused tool says what to change, such as giving a larger cell size or a smaller extent.
+
+When the system warns that memory is short, RustGIS drops the map tiles and drawings it keeps to
+draw faster, and says so once. Layers, results and Undo history are kept. Tiles from the web are
+downloaded again when the map needs them, so offline they stay blank until there is a network.
 
 ## Capturing features
 
@@ -76,7 +103,11 @@ The form has a field for each of the layer's attributes, and follows the layer's
 - A date field has a calendar button, with **Today** and, for a date and time, **Now**. Both are
   in UTC.
 
-While you type in a field, the sheet stays above the soft keyboard.
+While you type in a field, the sheet stays above the soft keyboard. On Android, tapping a text or
+number field opens Android's own text box above the keyboard, so paste, suggestions, glide typing
+and dictation work there. The form shows the value as you type. **Done**, the keyboard's Done key,
+Back or a tap outside the box closes it. Text copied in RustGIS goes on Android's clipboard too,
+where other apps can paste it.
 
 ### Photos
 
@@ -96,7 +127,9 @@ marked with a green ring, when adding and editing alike.
 **Edit**, beside **Add** at the top of the Capture sheet, changes shapes already on the map, again
 at the cross:
 
-- **Pick Feature at Cross** picks the feature under the cross and draws its vertices.
+- **Pick Feature at Cross** picks the feature under the cross and draws its vertices. A feature
+  with a place that can't be given in longitude/latitude can't be reshaped here: a notice names it
+  and the pick ends.
 - For a line or polygon, **Pick Vertex at Cross** picks the nearest vertex. Then **Move Here**
   moves it to the cross, **Add After** adds a vertex there after it, and **Delete Vertex** removes
   it.
@@ -143,23 +176,112 @@ field package carries the archives its map draws from. Tile layers from the web 
 A field package (`.rgisfield`) carries a map to the phone and its edits back.
 
 1. **On the computer**, with the map in view, **Data › Offline › Package for the Field** makes
-   the package: a project of that map, the features in view, and the MBTiles and PMTiles
-   archives its tile layers use. The package records the area it was made from in your project,
-   so save the project after packaging. Raster layers are left out, and the package says so.
+   the package: a project of that map, the features in view, the MBTiles and PMTiles archives its
+   tile layers use, and the photos its loaded layers' features name (pictures named by their full
+   path, while they fit the package; the notice counts any left out). A layer read in place keeps
+   its photos at home: the notice counts them for a layer copied for reference, and names a layer
+   left out whole. The package records the area it was made from in your project,
+   so save the project after packaging. A layer read in place from a supported local file is
+   copied within the area while it fits the package budget. The copy is for reference, and
+   Bring Back skips edits to it. The sender gets a notice about anything left behind, including
+   rasters and streamed layers that could not be copied.
 2. **On the phone**, open the package with **Open Project** (or **Add Data**). It is unpacked into
-   a folder of its own and its map opens.
+   a folder of its own and its map opens. Any notices about what stayed behind appear as it opens.
 3. **In the field**, capture and edit as above.
 4. **Back from the field**, **Send Field Package**, in the More sheet, saves the map as a field
    package again, with the photos its features name, wherever you choose (a cloud drive, email,
    a USB connection to the computer).
 5. **On the computer**, in the project the package was made from, **Data › Offline › Bring Back**
-   reads it. New and changed features update the map, deleted ones are removed, and the photos go
-   in a folder beside the project. A feature also changed on the computer takes the field's
-   version, and the summary names it; **Undo** brings the computer's versions back.
+   reads it and applies what changed on the phone: features added there are added, features
+   deleted there are removed, and the attributes and shapes changed there are changed. The photos
+   go in a folder beside the project. Nothing else is compared, so a field added on the computer
+   meanwhile, or another phone's edits, are left as they are. When one phone deletes a feature
+   another phone edited, the order the packages come back in decides: the edit first keeps the
+   feature, the deletion first drops the edit, and either way the notice names the feature.
 
-Give one package to one phone at a time, and make a new package after each Bring Back: a second
-phone's edits to the same package, brought back after the first's, would undo the first's where
-they differ. A package for an area the project doesn't have is refused.
+When a phone opens a package made on the computer, it keeps a copy of the rows the package gave it
+in the app's own folder (`field bases`), found by the package's identity, so it is still found after
+the field project is saved and opened again, or recovered. It writes the copy in the background once
+the map is open, with progress and **Cancel** in the status bar; cancelled, no copy is kept, and
+opening the package again starts a fresh one. A returned package opened on another device keeps no
+copy. Once **Send Field Package** has written the return, the copy is removed and the package is
+marked as sent in that folder: a package comes back once, so opening it again, even after a restart,
+keeps no copy and says so; make a new one for more edits. If the return file is lost after **Send
+Field Package**, sending again goes back as a whole map, which the computer may refuse once another
+package of the area has come back, so keep the return file until the computer has it. The copy of a
+package opened but never sent stays in that folder until it is removed by hand. **Send Field Package** compares the map with that copy and sends
+the list of changes with the map. A package opened on a device that doesn't keep its rows (the
+browser, or a field project copied to another device) goes back as a whole map, and the phone says
+so: Bring Back then compares the map with the area as it was last synced, and refuses it if the area
+has been brought back or synced since the package was made. A package made before packages carried
+that return check has none: it comes back with a notice, and can undo or repeat what came home
+since.
+
+Where a change meets one made on the computer since the package was made:
+
+- An attribute or shape changed in both places takes the phone's value. The summary names the
+  features; **Undo** brings the computer's versions back.
+- A feature deleted on the phone but changed on the computer is kept, and named. So is one given a
+  value on the computer in a field added there since the package was made.
+- A feature changed on the phone but deleted on the computer stays deleted, and is named.
+- These protections need the list of changes. A package that goes back as a whole map applies the
+  phone's deletions even where the computer changed the feature, and names those features.
+- A change to an attribute the computer's layer no longer has, or has with another type, refuses
+  the whole return and changes nothing: add the field back, then Bring Back again. So does a field
+  removed on the phone that the computer's layer still has, as its values in the field aren't
+  known.
+- A feature of a computer's layer held in its own coordinate system with a place that can't be
+  given in longitude/latitude (one far past where that system reaches) stays as stored when it
+  lies outside the area when the area is synced (**Sync**, or a package that goes back as a whole
+  map); one the area holds can't be compared with the phone's, and the sync is refused, naming it.
+  Send Field Package can't list the changes of a layer holding such a feature the package gave:
+  the package goes back as a whole map, and the phone says why, naming it. Bring Back of a list of changes refuses
+  only for such a feature that the list changes, naming it: one of the computer's features that
+  the list edits or deletes, or one of the package's features that it adds or edits. The others
+  stay as stored. A change that would keep among the conflicts a version with such a place
+  refuses it too, naming the feature, as conflicts are kept in longitude/latitude.
+
+Each of these keeps the version that lost on the offline area: the computer's values and shape
+the phone's replaced, the phone's edits to a feature deleted on the computer, the computer's feature
+a whole-map return deleted, and a deletion the computer's change beat. **Data › Offline ›
+Conflicts** lists them by area. **Show** selects a feature the map still has and zooms to it, and
+**Dismiss** forgets one once it has been dealt with (Undo brings it back). They are saved with the
+project until dismissed, and Undo of the Bring Back takes them away with it. From a script, the
+command line or Python, `offline.conflicts` lists them with the project's `state`, and `offline.dismissConflicts` dismisses
+them by index with that state, refusing a list read before the project changed.
+
+A photo the package took from the computer isn't sent back: the feature names the file it was taken
+from again, and nothing is copied. A return opened on another device and sent again from there does
+carry it; Bring Back then keeps the computer's file where it still holds the same photo.
+
+Of the photos taken in the field, a return with its list of changes brings back only those of features
+the phone added, or whose photos it changed. A photo of a feature whose photos it left alone is left
+out, and the summary says how many.
+
+A return that goes back as a whole map brings back every photo it carries, except a photo that only
+layers copied for reference or added in the field name: those layers' edits stay in the field, and so
+do their photos.
+
+Bring Back refuses a package while the area's offline map is open with edits not synced yet, as
+renewing the area would replace them: **Sync** the area first. Syncing moves the area on, so a
+package that goes back as a whole map and was made before the sync can no longer be brought back:
+make a new package and redo that phone's edits on it. A package that goes back with its list of
+changes isn't affected. Bring Back also refuses a package made on the computer to go out, which is
+not a return.
+
+Give each phone a package of its own: several packages of one area can be out at once, and each
+whose phone kept its rows comes back with only its own changes. A package that goes back as a whole
+map is refused once another package of the same area has come back, or the area has been synced.
+Make one from the area's offline map with **Package for the Field** again. A package comes back
+once: the same package returned again, from the same phone or from a copy on a second one, is
+refused and changes nothing. A feature added on the phone is given an id above every id its package
+gave, and one added on the computer an id above every id the area's packages gave, so neither is
+taken for a feature a package holds. A feature added on the phone keeps its id when that is above
+every id the computer's layer has or keeps; otherwise it takes the next free one above them, and the
+summary says how many did. A package made before packages had an identity of their own comes back as
+a whole map, as described above; one made before packages carried a return check comes back with a
+notice and no such protection: it can undo or repeat what came home since. A package for an area the
+project doesn't have is refused.
 
 ### Origin identities and older field copies
 
@@ -172,6 +294,11 @@ newly created area and identities too.
 Saving a project with these identities declares the `field-origin` capability, even when the
 offline area has never been sent as a field package. Earlier RustGIS releases that do not
 support this capability refuse the saved project rather than discard its return association.
+A project whose area has been packaged also declares `field-generation`, for the return check
+of a whole-map return, so a release without it can't save the project and then accept any copy.
+A field package's identity, and the packages an area has brought back, declare `field-package`:
+an older release refuses such a package or project rather than lose them and then apply a
+package's changes twice.
 
 A field copy made before these identities were introduced still opens, and Send Field Package
 preserves its edits and photos as an unverified legacy return. Ordinary Bring Back refuses to
@@ -209,6 +336,13 @@ after packaging; legacy recovery cannot change that association.
   download code that adds to what it does.
 - **Choosing a folder** is not possible with the phone's picker; the app says so where one is
   asked for.
-- **Preferences, saved passwords and autosave** are not available on a phone yet.
+- **Recovery** keeps a copy of completed edits in the app's private storage. On the next launch,
+  the app offers to recover unsaved work if a complete copy is available. The first edit submits
+  a copy immediately. Edits made within two seconds of a submission are grouped into another copy
+  due at the end of that interval. When the exit hook runs, it submits any waiting edit and gives
+  the writer up to two seconds to finish. The system can stop the app without running that hook.
+  If a copy is still waiting or being written when the process ends, recovery uses the most recent
+  completed copy, if one exists. Recovered field packages can still be sent back with their photos.
+- **Preferences and saved passwords** are not available on a phone yet.
 - **HTTPS** on Android is checked against a bundled list of trusted roots rather than the
   device's own, and the app says so once. An iPhone or iPad uses the device's own.

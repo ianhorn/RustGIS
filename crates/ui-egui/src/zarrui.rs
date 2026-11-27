@@ -41,6 +41,9 @@ pub struct State {
     /// The store's root: a web address or a folder, as connected.
     root: String,
     web: bool,
+    /// The store's address came from a document read from the internet (a Search Open Data
+    /// result): its files are fetched only from there ([`connect_within`]).
+    public: bool,
     store: Option<zarr::Store>,
     /// `raster.zarrInfo`'s answer: variables, dimensions and their labels.
     info: Option<Value>,
@@ -114,7 +117,13 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     {
         let slot: Answer = Slot::default();
         let land = slot.clone();
-        cache::download(&format!("{}/{k}", st.root), Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)));
+        let url = format!("{}/{k}", st.root);
+        let done: cache::Done = Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r));
+        if st.public {
+            cache::download_public(&url, done)
+        } else {
+            cache::download(&url, done)
+        }
         st.waiting.push((k, slot));
     }
     if !st.waiting.is_empty() || !st.queue.is_empty() {
@@ -165,7 +174,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                 // What a typed system says, when the slice is in it, as for a folder's slice.
                 let note = (!typed.is_empty()).then(|| zarr::typed_crs_note(store, &sel.variable, &r, &typed)).flatten();
                 if let Some(note) = note
-                    && !r.lost.contains(&note)
+                    && !r.lost.says(&note)
                 {
                     r.lost.push(note);
                 }
@@ -191,7 +200,7 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
                             let added =
                                 app.session.active_layer.and_then(|id| app.session.map().layer(id)).map_or(name, |l| l.name.clone());
                             for loss in lost {
-                                app.session.notify(i18n::fmt("{layer}: {notice}", &[("layer", &added), ("notice", &loss)]), false);
+                                app.session.say(loss.map_text(|t| i18n::fmt("{layer}: {notice}", &[("layer", &added), ("notice", &t)])));
                             }
                             app.map.invalidate();
                         }
@@ -204,7 +213,15 @@ pub fn poll(app: &mut RustGisApp, ctx: &egui::Context) {
     }
 }
 
+/// Connects to the store at the dialog's address, the user's own: its files are fetched wherever
+/// its name points.
 pub(crate) fn connect(app: &mut RustGisApp) {
+    connect_within(app, false);
+}
+
+/// [`connect`], to a store a document read from the internet named when `public`: its files are
+/// fetched only from there, however its name resolves.
+pub(crate) fn connect_within(app: &mut RustGisApp, public: bool) {
     let st = &mut app.ui.zarr;
     let a = st.address.trim().trim_end_matches('/').to_string();
     st.error = None;
@@ -219,6 +236,9 @@ pub(crate) fn connect(app: &mut RustGisApp) {
     st.web = lower.starts_with("http://") || lower.starts_with("https://");
     if st.web {
         let keys = zarr::METADATA_KEYS.iter().map(|k| k.to_string()).collect();
+        // Set with the batch it is for, so a connect that starts none leaves a batch under way as
+        // it was.
+        st.public = public;
         st.fetch(keys, Phase::Meta);
         return;
     }
@@ -442,10 +462,64 @@ mod tests {
     use super::*;
     use rustgis_engine::{Project, Session};
 
-    /// The dialog refuses a slice whose geographic system cannot survive its GeoTIFF handoff;
-    /// supported non-WGS84 geographic systems retain their datum through `ran`.
+    /// A store a document read from the internet named (a Search Open Data result) has its files
+    /// fetched only from there; one the user names, wherever its name points.
     #[test]
-    fn a_geographic_slice_keeps_its_system_or_is_refused_before_handoff() {
+    fn a_store_a_document_named_is_read_only_from_the_internet() {
+        use rustgis_engine::render::rustgis_tiles::{
+            address::{Origin, Reach},
+            cache,
+        };
+        for public in [true, false] {
+            let _turn = crate::fetching::turn();
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = asked.clone();
+            cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                log.lock().unwrap().push(ceiling);
+                let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling).unwrap();
+                done(Ok(cache::Fetched { bytes: b"{}".to_vec(), origin }));
+            });
+            let mut app = RustGisApp::new(Session::new(Project::default()));
+            app.ui.zarr.address = format!("https://store-{public}.example/data.zarr");
+            connect_within(&mut app, public);
+            poll(&mut app, &egui::Context::default());
+            let asked = asked.lock().unwrap().clone();
+            let want = if public { Reach::Public } else { Reach::Local };
+            assert!(!asked.is_empty() && asked.iter().all(|c| *c == want), "{asked:?}");
+        }
+    }
+
+    /// A connect that starts no batch (a blank address) leaves the reach of a batch under way as it
+    /// was: a store a document named stays read only from the internet.
+    #[test]
+    fn a_connect_that_starts_nothing_leaves_a_batch_under_way_as_it_was() {
+        use rustgis_engine::render::rustgis_tiles::{
+            address::{Origin, Reach},
+            cache,
+        };
+        let _turn = crate::fetching::turn();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            log.lock().unwrap().push(ceiling);
+            let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling).unwrap();
+            done(Ok(cache::Fetched { bytes: b"{}".to_vec(), origin }));
+        });
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        app.ui.zarr.address = "https://store-batch.example/data.zarr".into();
+        connect_within(&mut app, true);
+        // Another connect, with nothing to connect to, before the batch is fetched.
+        app.ui.zarr.address = String::new();
+        connect(&mut app);
+        poll(&mut app, &egui::Context::default());
+        let asked = asked.lock().unwrap().clone();
+        assert!(!asked.is_empty() && asked.iter().all(|c| *c == Reach::Public), "{asked:?}");
+    }
+
+    /// A slice keeps its geographic system through its GeoTIFF handoff: another body's (an ESRI PE
+    /// citation in the keys), and the Earth's other datums, retain their datum through `ran`.
+    #[test]
+    fn a_geographic_slice_keeps_its_system_through_handoff() {
         let coords = |dim: &str| {
             json!({
                 "zarr_format": 3, "node_type": "array", "shape": [2], "data_type": "float64",
@@ -482,16 +556,14 @@ mod tests {
             ]);
             st.phase = Phase::Read(Box::new((plan, sel, "geographic".into())));
             poll(&mut app, &egui::Context::default());
-            if let Some(expected) = expected {
-                assert_eq!(app.ui.zarr.error, None, "{def}");
-                let layer = app.session.map().layers.first().unwrap();
-                let raster = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
-                assert_eq!(raster.crs, expected, "{def}");
-                assert_eq!(raster.bands[0].data, [1.0, 2.0, 3.0, 4.0], "{def}");
-            } else {
-                let error = app.ui.zarr.error.as_deref().unwrap();
-                assert!(error.contains("can't be kept in a project") && error.contains("no layer was added"), "{error}");
-                assert!(app.session.map().layers.is_empty());
+            assert_eq!(app.ui.zarr.error, None, "{def}");
+            let layer = app.session.map().layers.first().unwrap();
+            let raster = layer.raster.as_ref().unwrap().data.as_ref().unwrap();
+            assert_eq!(raster.bands[0].data, [1.0, 2.0, 3.0, 4.0], "{def}");
+            match expected {
+                Some(expected) => assert_eq!(raster.crs, expected, "{def}"),
+                // Mars by its sphere: kept as another body's longitude/latitude.
+                None => assert!(raster.crs.is_planetary() && raster.crs.is_geographic(), "{def}: {:?}", raster.crs),
             }
         }
     }

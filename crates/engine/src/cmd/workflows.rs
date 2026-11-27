@@ -37,7 +37,9 @@ pub fn commands() -> Vec<C> {
             let (_, g, _) = model_graph(s, p)?;
             note_passed_graph(s, p);
             let problems = crate::model::validate(s, &g);
-            Ok(json!({"ok": problems.is_empty(), "problems": problems}))
+            // What the model does that it may not mean, which doesn't keep it from running.
+            let warnings = crate::model::warnings(&g);
+            Ok(json!({"ok": problems.is_empty(), "problems": problems, "warnings": warnings}))
         }).roles(&[crate::ParamRole { key: "graph", role: crate::Role::ModelGraph }]).effects(crate::policy::Effects::NONE)
         .view()
         .params(r#"{"name"?: model (default: the last), "graph"?: graph}"#),
@@ -80,6 +82,7 @@ pub fn commands() -> Vec<C> {
             r#"{"layer": polygons, "count"?: points per polygon, "seed"?: number, "field"?: numeric field (count per polygon from it, scaled by "rate"), "rate"?: number, "name"?: output}"#,
         ),
         C::new("data.profile", "Data Engineering", "Analyze › Workflows", |s, p| {
+            // All resident rows: completeness profiling is independent of map filters/selection.
             let ds = feature_ds(s, p)?;
             let rows: Vec<Value> = network::profile_fields(ds)
                 .into_iter()
@@ -92,8 +95,8 @@ pub fn commands() -> Vec<C> {
         C::new("data.explore", "Exploratory Analysis", "Analyze › Workflows", explore).roles(&[]).effects(crate::policy::Effects::NONE)
             .view()
             .params(r#"{"layer"?, "fields"?: [numeric fields], "bins"?: number}"#),
-        C::new("data.similar", "Embeddings", "Analyze › Workflows", similar).roles(&[]).effects(crate::policy::Effects::NONE)
-            .params(r#"{"layer"?, "row"?: number (the selected feature when omitted), "fields"?: [numeric fields], "count"?: number, "select"?: bool}"#),
+        C::new("data.similar", "Embeddings", "Analyze › Workflows", super::similar::run).roles(&[]).effects(crate::policy::Effects::NONE)
+            .params(r#"{"layer"?, "row"?: number (zero-based whole number; selected feature when omitted or null), "fields"?: [numeric fields], "count"?: number (whole number 1 to 1000; default 10), "select"?: bool}"#),
         C::new("data.convert", "Data Interop", "Analyze › Workflows", convert).roles(&[]).effects(crate::policy::Effects::NONE.with(crate::policy::Effect::Files))
             .view()
             .params(r#"{"layer"?, "format": "geojson"|"csv"|"kml"|"gpx"|"wkt", "path"?: file (the text is returned without one), "nameField"?: field}"#),
@@ -109,12 +112,242 @@ fn feature_ds<'a>(s: &'a Session, p: &Value) -> Result<&'a Dataset, String> {
     Ok(&l.dataset)
 }
 
-fn raster_of(s: &Session, name: &str) -> Result<std::sync::Arc<Raster>, String> {
-    s.map()
-        .layer_by_name(name)
-        .and_then(|l| l.raster.as_ref())
-        .and_then(|r| r.data.clone())
-        .ok_or_else(|| format!("no raster layer '{name}'"))
+/// The raster layer named `name`, as a command that makes a raster reads it ([`Input`]).
+fn raster_of(s: &Session, name: &str) -> Result<Input, String> {
+    Input::of(s, name)
+}
+
+/// A raster layer a command that makes a raster reads ([`IN_BACKGROUND`]): the raster the layer
+/// holds, which the command's start checks its parameters against, and for a layer read in place
+/// from a file on this computer ([`rustgis_map::raster::RasterLayer::tiled`]), that file, read
+/// again as the work runs ([`Input::read`]). Such a layer holds only the small overview the map
+/// draws from zoomed out; the file has the same bands, extent and coordinate system, but more
+/// pixels (#2761).
+#[derive(Clone)]
+pub(crate) struct Input {
+    held: std::sync::Arc<Raster>,
+    /// The layer's name and its file, for one read in place from a file on this computer.
+    file: Option<(String, String)>,
+}
+
+impl Input {
+    /// The raster layer named `name`.
+    pub(crate) fn of(input: &impl super::InputSource, name: &str) -> Result<Input, String> {
+        let context = input.input_context();
+        let rl = context.map().layer_by_name(name).and_then(|l| Some((l, l.raster.as_ref()?)));
+        let (l, rl) = rl.ok_or_else(|| format!("no raster layer '{name}'"))?;
+        let held = rl.data.clone().ok_or_else(|| format!("no raster layer '{name}'"))?;
+        let file = rl.path.clone().filter(|_| rl.tiled).map(|path| (l.name.clone(), path));
+        Ok(Input { held, file })
+    }
+
+    /// The raster the layer holds: for one read in place from a file, its overview, with the
+    /// file's bands, extent and system but not its size. Checked as the command starts.
+    pub(crate) fn held(&self) -> &Raster {
+        &self.held
+    }
+
+    /// The layer's name and its file, for a layer read in place from a file on this computer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn file(&self) -> Option<(&str, &str)> {
+        self.file.as_ref().map(|(name, path)| (name.as_str(), path.as_str()))
+    }
+
+    /// The raster the work reads: within a run ([`reading_files`]), a layer read in place from a
+    /// file on this computer is read again from it, at the finest level the run can hold (the
+    /// full image when it fits), once for the run however many inputs name it; otherwise, and for
+    /// any other layer, the raster the layer holds.
+    pub(crate) fn read(&self) -> Result<Read, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((name, path)) = &self.file
+            && RUN_READS.with(|r| r.borrow().is_some())
+        {
+            let kept = RUN_READS.with(|r| {
+                r.borrow().as_ref().and_then(|read| read.iter().find(|k| k.path.as_ref() == Some(path)).and_then(|k| k.kept.clone()))
+            });
+            let (raster, count) = match kept {
+                Some(k) => k,
+                None => {
+                    let (raster, count) = super::gp::read_tiled(name, path)?;
+                    let note = super::gp::ReadNote::of(name, &raster);
+                    RUN_READS.with(|r| {
+                        if let Some(read) = r.borrow_mut().as_mut() {
+                            read.push(RunRead { path: Some(path.clone()), kept: Some((raster.clone(), count.clone())), note });
+                        }
+                    });
+                    (raster, count)
+                }
+            };
+            return Ok(Read { raster, _count: Some(count), place: None });
+        }
+        // The browser has no files to read by path: none is read in place from one there.
+        #[cfg(target_arch = "wasm32")]
+        let _ = &self.file;
+        Ok(Read {
+            raster: self.held.clone(),
+            _count: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            place: None,
+        })
+    }
+
+    /// The raster the work reads, for work that uses only `part` of it: within a run, a layer read
+    /// in place from a GeoTIFF on this computer reads only that part of its file, out to whole
+    /// pixels, at the finest level whose part fits `1 / share` of what the run can hold, decoding
+    /// only the strips or tiles that hold it (`rustgis_data::raster::read_path_part`), with where
+    /// it lies in the grid read ([`Read::place`]). A part isn't kept for the run's other inputs,
+    /// and the run says what it says of it only once the work uses it ([`Read::used`]). A file
+    /// that can't be read by part, or that is no longer the one the layer was read from, and any
+    /// other layer, give [`Input::read`].
+    pub(crate) fn read_part(&self, part: rustgis_data::raster::Part, share: usize) -> Result<Read, String> {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some((name, path)) = &self.file
+            && RUN_READS.with(|r| r.borrow().is_some())
+            && let Some((read, count)) = super::gp::read_tiled_part(name, path, part, share, &self.held)?
+        {
+            let rustgis_data::raster::PartRead { raster, at, grid, bounds, full } = read;
+            let note = super::gp::ReadNote::of_part(name, &raster, (grid.1, grid.2), full);
+            return Ok(Read { raster: std::sync::Arc::new(raster), _count: Some(count), place: Some(Place { at, grid, bounds, note }) });
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = (part, share);
+        self.read()
+    }
+}
+
+/// A raster a command's work reads ([`Input::read`]), counted in
+/// [`rustgis_data::memory::held`] while it is held when it was read from its file.
+pub(crate) struct Read {
+    raster: std::sync::Arc<Raster>,
+    _count: Option<std::sync::Arc<rustgis_data::memory::Holding>>,
+    /// For a part of a file ([`Input::read_part`]), where it lies in the grid it was read from.
+    #[cfg(not(target_arch = "wasm32"))]
+    place: Option<Place>,
+}
+
+/// Where a part of a raster file lies in the grid it was read from ([`Read::place`]), and what
+/// the run says of it once the work uses it ([`Read::used`]).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) struct Place {
+    /// The part's first column and row in the grid.
+    pub(crate) at: (u32, u32),
+    /// The grid, whole: its transform, columns and rows.
+    pub(crate) grid: (rustgis_data::raster::GeoTransform, u32, u32),
+    /// The grid's longitude/latitude bounds.
+    pub(crate) bounds: rustgis_geom::Extent,
+    note: super::gp::ReadNote,
+}
+
+impl Read {
+    /// Where the raster lies in the grid it was read from, for a part of a file
+    /// ([`Input::read_part`]); `None` for a raster read whole.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn place(&self) -> Option<&Place> {
+        self.place.as_ref()
+    }
+
+    /// Says, once the run's raster is added, what is said of a part of a file the work went on to
+    /// use (read at a coarser level, values rounded as it was read): a part it put aside for the
+    /// whole file says nothing. A raster read whole says its own as it is read.
+    pub(crate) fn used(&self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        if let Some(place) = &self.place {
+            RUN_READS.with(|r| {
+                if let Some(read) = r.borrow_mut().as_mut() {
+                    read.push(RunRead { path: None, kept: None, note: place.note.clone() });
+                }
+            });
+        }
+    }
+}
+
+impl std::ops::Deref for Read {
+    type Target = Raster;
+    fn deref(&self) -> &Raster {
+        &self.raster
+    }
+}
+
+/// A raster file read in place that a run read ([`RUN_READS`]): its path (`None` for a part of it,
+/// [`Input::read_part`], which no other input takes), the raster read and its count in
+/// [`rustgis_data::memory::held`], kept for the run's other inputs naming the file (not a part's),
+/// and what the run says of it.
+#[cfg(not(target_arch = "wasm32"))]
+struct RunRead {
+    path: Option<String>,
+    kept: Option<(std::sync::Arc<Raster>, std::sync::Arc<rustgis_data::memory::Holding>)>,
+    note: super::gp::ReadNote,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+thread_local! {
+    /// The raster files read in place that a run's work read on this thread ([`Input::read`]),
+    /// each by its path with its layer's name and its count, kept while the run reads
+    /// ([`reading_files`]); `None` otherwise.
+    static RUN_READS: std::cell::RefCell<Option<Vec<RunRead>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// [`RUN_READS`] for one run while it lives: put back as it was before when the run ends
+/// ([`RunReads::end`]), or as it unwinds from a panic, so nothing a run read is kept, or read
+/// from its file, past it.
+#[cfg(not(target_arch = "wasm32"))]
+struct RunReads(Option<Option<Vec<RunRead>>>);
+
+#[cfg(not(target_arch = "wasm32"))]
+impl RunReads {
+    fn start() -> RunReads {
+        RunReads(Some(RUN_READS.with(|r| r.borrow_mut().replace(Vec::new()))))
+    }
+
+    /// What the run read, [`RUN_READS`] put back as it was.
+    fn end(&mut self) -> Vec<RunRead> {
+        let outer = self.0.take().flatten();
+        RUN_READS.with(|r| std::mem::replace(&mut *r.borrow_mut(), outer)).unwrap_or_default()
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for RunReads {
+    fn drop(&mut self) {
+        if self.0.is_some() {
+            self.end();
+        }
+    }
+}
+
+/// Runs `work` (command `name`'s) so the raster layers read in place it reads are read from their
+/// file ([`Input::read`]), each file read once for the run, and adds to what is said once its
+/// raster is added each that was read from an overview, or with values rounded.
+pub(crate) fn reading_files(name: &str, work: impl FnOnce() -> Result<Made, String>) -> Result<Made, String> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = name;
+        work()
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let mut run = RunReads::start();
+        let made = work();
+        let read = run.end();
+        let made = made?;
+        let read: Vec<super::gp::ReadNote> = read.into_iter().map(|r| r.note).collect();
+        let notes: Vec<String> = super::gp::tiled_read_notes(&read, "its").into_iter().map(|n| format!("{name}: {n}")).collect();
+        if notes.is_empty() {
+            return Ok(made);
+        }
+        let then = made.then;
+        Ok(Made {
+            then: Some(Box::new(move |s: &mut Session, v: &mut Value| {
+                for note in notes {
+                    s.notify(note, false);
+                }
+                if let Some(then) = then {
+                    then(s, v);
+                }
+            })),
+            ..made
+        })
+    }
 }
 
 fn band_of(p: &Value, r: &Raster) -> Result<usize, String> {
@@ -140,6 +373,31 @@ pub struct Made {
     /// Made on another thread: the command's name and the map it was started on.
     ran: Option<(&'static str, u64)>,
     pub(crate) continuation: Option<crate::policy::Continuation>,
+    /// The file the work wrote, put in its place as the raster is added: a run cancelled or
+    /// abandoned before then leaves the file there as it was.
+    staged: Option<(rustgis_data::io::StagedWrite, Vec<String>)>,
+}
+
+impl Made {
+    /// With `extra` added to the command's answer.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn with_extra(mut self, extra: Value) -> Made {
+        self.extra = Some(extra);
+        self
+    }
+
+    /// The layer it adds, to style.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn layer_mut(&mut self) -> &mut rustgis_map::RasterLayer {
+        &mut self.layer
+    }
+
+    /// With `file` to commit as it is added; `said`, what the run had to say, goes with the
+    /// error when it can't be (its `then` doesn't run).
+    pub(crate) fn committing(mut self, file: rustgis_data::io::StagedWrite, said: Vec<String>) -> Made {
+        self.staged = Some((file, said));
+        self
+    }
 }
 
 /// A workflow's work once its inputs are read: it reads nothing more of the session, so it runs on
@@ -154,7 +412,7 @@ pub(crate) type Then = Box<dyn FnOnce(&mut Session, &mut Value) + Send>;
 pub(crate) fn made(raster: Raster, extra: Option<Value>) -> Result<Made, String> {
     let bytes = rustgis_data::raster::geotiff::write_all(&raster).map_err(|e| e.to_string())?;
     let name = raster.name.clone();
-    let layer = rustgis_map::RasterLayer::from_bytes(raster, format!("{name}.tif"), bytes);
+    let layer = rustgis_map::RasterLayer::from_written(raster, format!("{name}.tif"), bytes);
     Ok(made_layer(name, layer, extra, None))
 }
 
@@ -167,13 +425,25 @@ pub(crate) fn made_then(raster: Raster, extra: Option<Value>, then: Option<Then>
 
 /// A layer made (styled, say), to be added as `name`.
 pub(crate) fn made_layer(name: String, layer: rustgis_map::RasterLayer, extra: Option<Value>, then: Option<Then>) -> Made {
-    Made { name, layer, extra, then, ran: None, continuation: None, inputs: Vec::new() }
+    Made { name, layer, extra, then, ran: None, continuation: None, inputs: Vec::new(), staged: None }
 }
 
 /// Adds a made raster as a layer: the command's answer is the layer's (its id, size and bands) and
 /// what the command says besides (`extra`), and what it does then.
 pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
-    let Made { name, layer, extra, then, inputs, .. } = m;
+    let Made { name, layer, extra, then, inputs, staged, .. } = m;
+    let layer = match staged {
+        Some((file, said)) => {
+            let dest = file.destination().to_path_buf();
+            let path = dest.display().to_string();
+            file.commit()
+                .map_err(|e| if said.is_empty() { format!("{path}: {e}") } else { format!("{path}: {e} ({})", said.join("; ")) })?;
+            #[cfg(not(target_arch = "wasm32"))]
+            let layer = installed(layer, &dest);
+            layer
+        }
+        None => layer,
+    };
     rustgis_data::provenance::record(inputs);
     let mut v = super::raster::add_raster(s, &name, layer)?;
     if let (Some(Value::Object(more)), Some(o)) = (extra, v.as_object_mut()) {
@@ -183,6 +453,19 @@ pub(crate) fn add_made(s: &mut Session, m: Made) -> CmdResult {
         then(s, &mut v);
     }
     Ok(v)
+}
+
+/// `layer`, made to read the file just installed at `dest`: one read in place pairs its reads of
+/// the file with the file as installed, as one added from it does, so a command can read it at
+/// once.
+#[cfg(not(target_arch = "wasm32"))]
+fn installed(mut layer: rustgis_map::RasterLayer, dest: &std::path::Path) -> rustgis_map::RasterLayer {
+    if layer.tiled
+        && let (Some(revision), Some(held)) = (rustgis_data::raster::FileRevision::of(dest), layer.data.as_mut())
+    {
+        std::sync::Arc::make_mut(held).set_source_revision(revision);
+    }
+    layer
 }
 
 /// What the remaps of a raster function, a chain or a suitability met: their ranges that match
@@ -234,6 +517,8 @@ pub(crate) const IN_BACKGROUND: &[(&str, &str, Start)] = &[
     ("stac.addBands", "Add STAC Bands", super::stac_bands::bands_work),
     ("stac.addIndex", "Add STAC Index", super::stac_bands::index_work),
     ("raster.process", "Process", super::imagery::process_work),
+    ("raster.rasterize", "Polygons to Raster", super::imagery::rasterize_work),
+    ("raster.mosaic", "Mosaic Rasters", super::imagery::mosaic_rasters_work),
     ("imagery.mosaic", "Build Mosaic", super::imagery::mosaic_work),
     ("dl.classify", "Deep Learning", super::deeplearning::classify_work),
     ("embeddings.similarity", "Satellite Embedding Similarity", super::embeddings::similarity_work),
@@ -266,7 +551,7 @@ pub(crate) fn made_or_ran(s: &mut Session, p: &Value, command: &str) -> CmdResul
     let made = work(s, p)?;
     // Where a person at a terminal can stop it with Ctrl-C: no work cap, as on the app's thread.
     let control = if s.stoppable { rustgis_analysis::control::Control::stoppable() } else { rustgis_analysis::control::Control::new() };
-    let made = rustgis_analysis::run_under(name, &control, made)?;
+    let made = rustgis_analysis::run_under(name, &control, || reading_files(name, made))?;
     s.check_continuation(&owner)?;
     add_made(s, made)
 }
@@ -299,7 +584,9 @@ impl RasterRun {
         let still = std::sync::Arc::new(move || current.check().is_ok()) as crate::render::rustgis_tiles::cache::Still;
         // A bug in the work, as one in a tool, must not take the app down.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            crate::render::rustgis_tiles::cache::with_still(still, || rustgis_analysis::run_under(name, control, work))
+            crate::render::rustgis_tiles::cache::with_still(still, || {
+                rustgis_analysis::run_under(name, control, || reading_files(name, work))
+            })
         }))
         .unwrap_or_else(|_| Err(format!("{name} failed unexpectedly")))
         .map(|m| Made {
@@ -433,6 +720,8 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
     // Both read before either is set, so a bad one changes nothing and says nothing; a cell size
     // given with a system is in its units.
     let mut note = None;
+    // A cell size another system had, which a new one doesn't take (in that system's units).
+    let mut dropped = None;
     let projected = match p.get("crs") {
         None => s.project.gp_env.projected,
         Some(Value::Null) => None,
@@ -446,6 +735,13 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         }
         Some(_) => return Err("crs is a projected coordinate system (such as \"EPSG:32616\"), or null".into()),
     };
+    // Any change of system, to another or to none, drops the old one's cell size.
+    if let Some(old) = s.project.gp_env.projected
+        && let Some(cell) = old.cell_size
+        && projected.is_none_or(|g| g.crs != old.crs)
+    {
+        dropped = Some((old.crs, cell, projected.is_none()));
+    }
     let size = match p.get("cellSize") {
         None => None,
         Some(Value::Null) => Some(None),
@@ -456,6 +752,23 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
     }
     if let Some(note) = note {
         s.notify(format!("Environments: its coordinate system: {note}"), false);
+    }
+    // Said (#2639): always when the system is cleared; on a change of system, unless this call
+    // gives the new one its own cell size.
+    match (dropped, size) {
+        (Some((crs, cell, true)), _) => s.notify(
+            format!("Environments: the cell size {cell} in {}'s units was dropped with that system", crs.label()),
+            false,
+        ),
+        // (`cellSize: null` gives the new one none, so it is said too.)
+        (Some((crs, cell, false)), None | Some(None)) => s.notify(
+            format!(
+                "Environments: the cell size {cell} was in {}'s units, so it was dropped with that system: give cellSize for the new one, or each run picks its own",
+                crs.label()
+            ),
+            false,
+        ),
+        _ => {}
     }
     s.project.gp_env.projected = projected;
     if let Some(size) = size {
@@ -475,7 +788,17 @@ fn environments(s: &mut Session, p: &Value) -> CmdResult {
         "densityCells": rustgis_analysis::max_density_cells(),
         "bufferBytes": rustgis_analysis::max_buffer_bytes(),
         "threadScratchBytes": rustgis_analysis::scratch_budget(),
+        "undoBytes": s.undo_memory.limit,
+        // What the limits follow: the computer, a container's limit, or RUSTGIS_MEMORY_BYTES.
+        "memorySource": rustgis_data::memory::source(),
+        // What the process holds (layers, tables, rasters, Undo history, copies being made), as of
+        // the last command: past half the memory, the limits that follow it plan for less (#2431).
+        "heldBytes": rustgis_data::memory::held(),
+        // What the computer has free now (null: not known, or RUSTGIS_MEMORY_BYTES is set): the
+        // limits plan for no more than this, less what is kept for drawing (#2431).
+        "freeBytes": rustgis_data::memory::available(),
         "projectBytes": crate::project::max_bytes(),
+        "fileBytes": rustgis_data::io::max_bytes(),
         // The threads one piece of work uses now, and the cores they come from (#1562).
         "threads": rustgis_data::threads::max(),
         "cores": rustgis_data::threads::cores(),
@@ -733,7 +1056,9 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
     s.project.models.push(Model { name: name.clone(), steps, graph });
     notify_graph_dropped(s, dropped);
     let kept = name.chars().count() - if i > 1 { format!(" {i}").chars().count() } else { 0 };
-    if kept < length {
+    // Said here, and in the result (`"cut"`), so a caller doesn't say it again.
+    let cut = kept < length;
+    if cut {
         s.notify(
             format!("ModelBuilder: a model has that name already, so the name given is cut to {kept} characters to fit \" {i}\""),
             false,
@@ -760,7 +1085,11 @@ fn new_model(s: &mut Session, p: &Value) -> CmdResult {
             false,
         );
     }
-    Ok(json!({"model": name, "steps": n}))
+    let mut answer = json!({"model": name, "steps": n});
+    if cut {
+        answer["cut"] = json!(true);
+    }
+    Ok(answer)
 }
 
 /// The model a command names (or the last one), or the graph it passes: its name, graph and
@@ -809,9 +1138,16 @@ const SCRIPT_AHEAD: &str = "script.run";
 pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> super::reads::ReadWork {
     let name = if command == SCRIPT_AHEAD { "Run Script" } else { "Run Model" };
     let (project, trusted) = (s.project.clone(), s.trusted_models.clone());
+    let readers = s.undo_memory.readers();
+    let retained = readers.retain(crate::undo_memory::allocations(&project));
     // The copy follows the extensions turned on or off here (#1752).
     let extensions = s.extensions().clone();
     let (view_size, active_layer, opened, p) = (s.view_size, s.active_layer, s.opened, p.clone());
+    let selection_intent = s.selection_intent;
+    let (selection_sequence, similar_selected) = (s.selection_sequence.clone(), s.similar_selected);
+    // Reserve before the worker starts: its inner reads belong to this admission, even when
+    // a newer UI request arrives while this script waits in the queue.
+    let selection_admission = s.selection_admission.clone().unwrap_or_else(|| (s.selection_epoch(), Default::default()));
     // What its tools ask of servers and files goes in this session's Diagnostics, as when they
     // run here: the run here takes their results and asks nothing.
     let requests = s.diagnostics.capture();
@@ -823,44 +1159,54 @@ pub(crate) fn ahead_on_copy(s: &Session, command: &'static str, p: &Value) -> su
         copy.view_size = view_size;
         copy.active_layer = active_layer;
         copy.opened = opened;
+        copy.selection_intent = selection_intent;
+        copy.selection_sequence = selection_sequence;
+        copy.selection_admission = Some(selection_admission);
+        copy.similar_selected = similar_selected;
+        // The copy shares this session's rows, which this session already counts in what the
+        // process holds (#2431): it neither measures nor adds them again.
+        copy.undo_memory.memory = None;
+        copy.undo_memory.use_readers(readers);
         copy.sync_policy_generation();
         copy.tools_ahead = Some(super::gp::Ahead::Recording(Vec::new()));
         copy.files_ahead = Some(super::gp::FilesAhead::Recording(Vec::new()));
+        copy.grids_ahead = Some(crate::image_grid::Ahead::Recording(Vec::new()));
         copy.zones_ahead = Some(super::imagery::ZonesAhead::Recording(Vec::new()));
         let _ = copy.run(command, &p);
-        super::gp::ran_ahead(&mut copy)
+        let mut ran = super::gp::ran_ahead(&mut copy);
+        ran.retained = Some(retained);
+        ran
     })
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Prepares a native script's replayable prefix. Every table write must fit within that prefix;
-/// otherwise refuse before any line runs, so a desktop table edit never falls back to the frame.
-/// Restricted callers keep their existing authority and must dispatch table writes individually.
+/// Prepares a native script's replayable prefix. Grid queries and table writes must fit within it;
+/// otherwise refuse before any line runs, so neither header reads nor table edits reach the UI thread.
+/// Restricted callers keep their existing authority and dispatch those operations individually.
 pub(crate) fn script_ahead(s: &Session, p: &Value, native: bool) -> Result<Option<super::reads::ReadWork>, String> {
     let Some(script) = ps(p, "script") else { return Ok(None) };
     let Ok(lines) = script_commands(script) else { return Ok(None) };
     let table = |id: &str, p: &Value| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null());
-    if lines.iter().any(|(_, id, p)| table(id, p)) {
+    if lines.iter().any(|(_, id, p)| table(id, p) || id == "raster.imageGrid") {
         if !native {
             return Err(
-                "this script cannot prepare table writes under its current permissions: run the table edit commands directly".into()
+                "this script cannot prepare queries or table writes under its current permissions: run those commands directly".into()
             );
         }
-        check_table_prefix(s, &lines)?;
+        check_prepared_prefix(s, &lines)?;
     }
     let Some((_, id, params)) = lines.first() else { return Ok(None) };
     Ok((native && runs_on_a_copy(s, id, params)).then(|| ahead_on_copy(s, SCRIPT_AHEAD, p)))
 }
 
 #[cfg(not(target_arch = "wasm32"))]
-/// Refuses an unrecordable prefix before any live line can run ahead of a table write. Inspect
+/// Refuses an unrecordable prefix before live lines can precede a grid query or table write. Inspect
 /// model tool metadata too: their command id alone does not reveal file-producing or plugin steps.
 /// Recheck at landing, since a named model may have changed while the script worker ran.
-fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
-    let Some(last) = lines
-        .iter()
-        .rposition(|(_, id, p)| super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
-    else {
+fn check_prepared_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(), String> {
+    let Some(last) = lines.iter().rposition(|(_, id, p)| {
+        id == "raster.imageGrid" || (super::edit::table_edit_in_background(id).is_some() && p.get("table").is_some_and(|t| !t.is_null()))
+    }) else {
         return Ok(());
     };
     let recordable_tool = |id: &str| {
@@ -881,7 +1227,7 @@ fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(
         };
         if !nested || !runs_on_a_copy(s, id, p) {
             return Err(format!(
-                "line {n} ({id}) cannot be prepared before the table writes: run the setup and table writes as separate scripts"
+                "line {n} ({id}) cannot be prepared before the queries or table writes: run the setup and prepared commands as separate scripts"
             ));
         }
     }
@@ -891,10 +1237,11 @@ fn check_table_prefix(s: &Session, lines: &[(usize, String, Value)]) -> Result<(
 #[cfg(not(target_arch = "wasm32"))]
 /// The commands a script's line may run on a copy of the session ([`runs_on_a_copy`]): those
 /// whose results are taken (a tool, a model, a batch) and those that change only what the taking compares
-/// by value (a selection, a layer's name or query, the environment, the projection). A line that
-/// makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
+/// by value (a selection, a layer's name or query, topology rules, the environment, the projection).
+/// A line that makes rows of its own (a layer edit, a layer from a selection) isn't one. Table edits are the
 /// exception: their rows are recorded and taken, so later tools retain their shared input.
 pub(crate) const ON_A_COPY: &[&str] = &[
+    "project.coordinateSystem",
     "edit.enable",
     "edit.setValue",
     "edit.addFeature",
@@ -908,6 +1255,9 @@ pub(crate) const ON_A_COPY: &[&str] = &[
     "gp.spatialJoin",
     "gp.zonalStats",
     "gp.env",
+    "data.similar",
+    "topology.rules",
+    "topology.validate",
     "select.all",
     "select.atPoint",
     "select.byAttributes",
@@ -931,6 +1281,9 @@ pub(crate) const ON_A_COPY: &[&str] = &[
 /// other line stops the copy there, Add Data and Load All among them (they would read their
 /// files and servers twice).
 fn runs_on_a_copy(s: &Session, id: &str, params: &Value) -> bool {
+    if id == "raster.imageGrid" {
+        return true; // Header results are recorded on the worker and consumed once at landing.
+    }
     if super::edit::table_edit_in_background(id).is_some() {
         return params.get("table").is_some_and(|t| !t.is_null()) && params.get("layer").is_none_or(Value::is_null);
     }
@@ -1044,13 +1397,36 @@ fn run_steps(s: &mut Session, model: Model) -> CmdResult {
             st.tool
         ));
     }
+    // The parameters the steps ignore are said once for the run, as a graph's run says them
+    // (#2307). A failed run's error carries them, as its notices go back with its changes.
+    let mut ignored = Vec::new();
+    let res = run_step_list(s, &model, &mut ignored);
+    let said = crate::model::ignored_summary(&ignored);
+    match res {
+        Err(e) if !said.is_empty() => Err(format!("{e}; {said}")),
+        res => {
+            if !said.is_empty() {
+                s.warn(said);
+            }
+            res
+        }
+    }
+}
+
+/// Runs each of a model's steps in order ([`run_steps`]), collecting into `ignored` what each
+/// step's tool ignores ([`super::gp::ignored_params`]).
+fn run_step_list(s: &mut Session, model: &Model, ignored: &mut Vec<String>) -> CmdResult {
     let mut outputs: Vec<String> = Vec::new();
     let mut ran = Vec::new();
     for (i, st) in model.steps.iter().enumerate() {
         let mut params = st.params.clone();
         wire(&mut params, &outputs, i, 0)?;
         let before = s.project.gp_history.len();
-        let r = super::gp::run_tool(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
+        let r = super::gp::run_step(s, &st.tool, &params).map_err(|e| format!("step {} ({}): {e}", i + 1, st.tool))?;
+        // Said once for the run; a failing step's error names its own keys already.
+        if let Some(said) = rustgis_analysis::resolve_published(&st.tool).and_then(|r| super::gp::ignored_params(r.spec(), &params)) {
+            ignored.push(said);
+        }
         // A step that made no layer leaves nothing for a later %n to use.
         let out =
             (s.project.gp_history.len() > before).then(|| s.project.gp_history.last().and_then(|h| h.outputs.first().cloned())).flatten();
@@ -1079,7 +1455,9 @@ fn wire(v: &mut Value, outputs: &[String], step: usize, depth: usize) -> Result<
 /// Runs a script of commands, one per line (`id {json}`), stopping at the first error. Scripts
 /// typed in the Script pane or passed on the command line are the user's own, so they may use
 /// any command, files included; notebooks vet cells that came from files before running them.
-/// The whole script is one undo step.
+/// The whole script is one undo step, none when no line changed what undo restores
+/// ([`Session::shared_step`]): its lines only read the project, moved the view, wrote files
+/// elsewhere, left a request, or said they changed nothing.
 pub(crate) fn run_script(s: &mut Session, p: &Value) -> CmdResult {
     #[cfg(not(target_arch = "wasm32"))]
     if let Some(ran) = super::reads::take::<super::gp::RanAheads>(s, SCRIPT_AHEAD) {
@@ -1096,7 +1474,7 @@ fn run_script_here(s: &mut Session, p: &Value, prepared: bool) -> CmdResult {
     let lines = script_commands(script)?;
     #[cfg(not(target_arch = "wasm32"))]
     if prepared {
-        check_table_prefix(s, &lines)?;
+        check_prepared_prefix(s, &lines)?;
     }
     let mut out = Vec::new();
     for (n, id, params) in lines {
@@ -1137,6 +1515,9 @@ fn run_script_here(s: &mut Session, p: &Value, prepared: bool) -> CmdResult {
         let r = r.map_err(|e| format!("line {n}: {id}: {e}"))?;
         out.push(json!({"line": n, "command": id, "result": r}));
     }
+    // An undo step only when a line edited ([`Session::shared_step`]); run inside a task, the
+    // task's account, earlier steps included, decides.
+    s.request_only = !s.shared_steps.edited;
     Ok(json!({"ran": out}))
 }
 
@@ -1176,23 +1557,79 @@ pub fn script_commands(script: &str) -> Result<Vec<(usize, String, Value)>, Stri
     Ok(out)
 }
 
+/// Where in `script` a run stopped, from its `error`: the line (1-based) and, when that line's JSON
+/// doesn't read, the column of its error in the line (1-based, in characters, as an editor counts).
+/// `None` for an error that names no line of `script`. The Script pane marks the line and goes to
+/// it (#2815). It reads the `line {n}` that `run_script`'s and [`script_commands`]' stops at a line
+/// start with, rather than the run returning the line apart, which would change the error type
+/// every caller of a command shares; `a_scripts_error_says_where_it_stopped` pins the stops that start
+/// with a line (except the `check_prepared_prefix` refusal) and the line cap.
+/// Of the stops of a run of a script's lines, three name no line, so they leave no mark: the line
+/// cap, `NOT_AHEAD`, and the refusal of a script that can't prepare its queries or table writes
+/// under its permissions. The refusal of `check_prepared_prefix`, from a run ahead or the run that
+/// uses it, does name its line and is marked like any other stop.
+pub fn script_error_at(script: &str, error: &str) -> Option<(usize, Option<usize>)> {
+    let rest = error.strip_prefix("line ")?;
+    let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+    if !rest[digits..].starts_with([':', ' ']) {
+        return None;
+    }
+    let n: usize = rest[..digits].parse().ok()?;
+    let line = script.lines().nth(n.checked_sub(1)?)?;
+    Some((n, json_error_column(line)))
+}
+
+/// The column (1-based, in characters) where `line`'s JSON stops reading, read as
+/// [`crate::script_line`] reads it; `None` when it reads or there is none. serde counts its column
+/// in bytes from the JSON's start.
+fn json_error_column(line: &str) -> Option<usize> {
+    let (_, json, start) = crate::parameters::script_parts(line);
+    if json.is_empty() {
+        return None;
+    }
+    let e = serde_json::from_str::<Value>(json).err()?;
+    let mut at = (start + e.column().saturating_sub(1)).min(line.len());
+    while !line.is_char_boundary(at) {
+        at -= 1;
+    }
+    Some(line[..at].chars().count() + 1)
+}
+
 /// One raster function's output pixels on `r`'s grid, or a resample's on `target`'s (from
 /// [`resample_target`]). A remap adds its ranges that match nothing to `remaps`, and whether it
 /// left any cell with a value.
-fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, remaps: &mut Remaps) -> Result<Vec<f32>, String> {
+/// `ground`, for `r` a part of a larger raster read a block at a time, is the whole's: a function
+/// over a cell's neighbours measures its cells as on the whole (`rasterops::slope_on`).
+fn apply_function(
+    r: &Raster,
+    p: &Value,
+    target: Option<&Raster>,
+    remaps: &mut Remaps,
+    ground: Option<&rustgis_geom::Extent>,
+) -> Result<Vec<f32>, String> {
     let band = band_of(p, r)?;
     let zf = f(p, "zFactor").unwrap_or(1.0).clamp(0.0001, 100_000.0);
     match ps(p, "function").ok_or("function is required")? {
         "slope" => match p.get("units") {
-            None => rasterops::slope(r, band, zf),
-            Some(Value::String(units)) if units == "degrees" => rasterops::slope(r, band, zf),
-            Some(Value::String(units)) if units == "percent" => rasterops::slope_percent(r, band, zf),
+            None => rasterops::slope_on(r, band, zf, ground),
+            Some(Value::String(units)) if units == "degrees" => rasterops::slope_on(r, band, zf, ground),
+            // A part read with a margin: its cells past Float32's range are counted where they're
+            // kept ([`super::in_blocks::Shape::overflow`]).
+            Some(Value::String(units)) if units == "percent" && ground.is_some() => {
+                rasterops::slope_percent_cells_on(r, band, zf, ground).map(|(p, _)| p)
+            }
+            Some(Value::String(units)) if units == "percent" => rasterops::slope_percent_on(r, band, zf, ground),
             _ => Err("slope units must be degrees or percent".into()),
         },
-        "aspect" => rasterops::aspect(r, band),
-        "hillshade" => {
-            rasterops::hillshade(r, band, f(p, "azimuth").unwrap_or(315.0), f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0), zf)
-        }
+        "aspect" => rasterops::aspect_on(r, band, ground),
+        "hillshade" => rasterops::hillshade_on(
+            r,
+            band,
+            f(p, "azimuth").unwrap_or(315.0),
+            f(p, "altitude").unwrap_or(45.0).clamp(0.0, 90.0),
+            zf,
+            ground,
+        ),
         "ndvi" => {
             let (nir, red) = (p.get("nir").and_then(Value::as_u64).unwrap_or(4), p.get("red").and_then(Value::as_u64).unwrap_or(3));
             rasterops::band_math(r, &format!("(b{nir} - b{red}) / (b{nir} + b{red})"))
@@ -1229,12 +1666,19 @@ fn apply_function(r: &Raster, p: &Value, target: Option<&Raster>, remaps: &mut R
     }
 }
 
-/// The raster a resample step (`p`) takes the grid of: none for another function.
-fn resample_target(s: &Session, p: &Value) -> Result<Option<std::sync::Arc<Raster>>, String> {
+/// The raster a resample step (`p`) takes the grid of: none for another function. Its size is
+/// checked as it is read ([`read_target`]).
+fn resample_target(s: &Session, p: &Value) -> Result<Option<Input>, String> {
     if ps(p, "function") != Some("resample") {
         return Ok(None);
     }
-    let t = raster_of(s, resample_target_name(p)?.ok_or("target (a raster to match) is required")?)?;
+    Ok(Some(raster_of(s, resample_target_name(p)?.ok_or("target (a raster to match) is required")?)?))
+}
+
+/// A resample's target ([`resample_target`]) read for the work, refused past this computer's cells.
+fn read_target(t: Option<&Input>) -> Result<Option<Read>, String> {
+    let Some(t) = t else { return Ok(None) };
+    let t = t.read()?;
     if t.width as usize * t.height as usize > rasterops::max_pixels() {
         return Err(format!("the target grid is larger than this computer's {} cells", rasterops::max_pixels()));
     }
@@ -1249,7 +1693,7 @@ fn raster_function(s: &mut Session, p: &Value) -> CmdResult {
 fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     let src = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
     let target = resample_target(s, p)?;
-    let name = out_name(p, format!("{}_{}", src.name, ps(p, "function").unwrap_or("")))?;
+    let name = out_name(p, format!("{}_{}", src.held().name, ps(p, "function").unwrap_or("")))?;
     let defaults = s.raster_defaults.clone();
     let mut p = p.clone();
     // Read here, on the command's thread, where an unreadable value is said (#1600); only a remap
@@ -1257,9 +1701,33 @@ fn function_work(s: &Session, p: &Value) -> Result<Work, String> {
     if matches!(ps(&p, "function"), Some("remap" | "threshold")) {
         super::settle_bool(&mut p, "keep");
     }
+    // A file too large to read whole at its full size: a block at a time, with the cells around
+    // each that a function over a cell's neighbours reads (#2865).
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(halo) = ps(&p, "function").and_then(super::in_blocks::function_halo)
+        && let Some(blocks) = super::in_blocks::plan(s, &src, &name)?
+    {
+        let shape = function_shape(&p);
+        return Ok(Box::new(move || {
+            let met = std::cell::RefCell::new(BlockRemaps::default());
+            let made = blocks.with_halo(halo).run(
+                |block, ground| {
+                    let mut remaps = Remaps::default();
+                    let pixels = apply_function(block, &p, None, &mut remaps, Some(ground))?;
+                    met.borrow_mut().add(remaps);
+                    Ok(pixels)
+                },
+                shape,
+            )?;
+            let made = also(made, met.into_inner().met().then());
+            Ok(if is_hillshade(&p) { hillshade_look(made, &defaults) } else { made })
+        }));
+    }
     Ok(Box::new(move || {
+        let src = src.read()?;
+        let target = read_target(target.as_ref())?;
         let mut remaps = Remaps::default();
-        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps)?;
+        let pixels = apply_function(&src, &p, target.as_deref(), &mut remaps, None)?;
         // Only a resample takes another raster's grid.
         let raster = derive_function(target.as_deref().unwrap_or(&src), &name, &p, pixels)?;
         if is_hillshade(&p) { made_hillshade(raster, &defaults) } else { made_then(raster, None, Some(remaps.then())) }
@@ -1273,12 +1741,34 @@ fn derive_function(r: &Raster, name: &str, p: &Value, pixels: Vec<f32>) -> Resul
         return rasterops::derive_hillshade(r, name, pixels);
     }
     let mut out = rasterops::derive(r, name, vec![pixels])?;
-    if ps(p, "function") == Some("slope")
-        && let Some(band) = out.bands.first_mut()
-    {
-        band.name = if ps(p, "units") == Some("percent") { "Slope (percent)" } else { "Slope (degrees)" }.into();
+    if let (Some(name), Some(band)) = (function_band(p), out.bands.first_mut()) {
+        band.name = name;
     }
     Ok(out)
+}
+
+/// What a raster function step `p` makes, as a raster made a block at a time holds it: its band's
+/// name, a hillshade's bytes, a threshold's classes and a remap's (not one that keeps the cells it
+/// doesn't match, which keep their measures), and a percent slope's cells past Float32's range
+/// counted.
+#[cfg(not(target_arch = "wasm32"))]
+fn function_shape(p: &Value) -> super::in_blocks::Shape {
+    super::in_blocks::Shape {
+        band: function_band(p),
+        bytes: is_hillshade(p),
+        classes: match ps(p, "function") {
+            Some("threshold") => true,
+            Some("remap") => !b(p, "keep").unwrap_or(false),
+            _ => false,
+        },
+        overflow: (ps(p, "function") == Some("slope") && ps(p, "units") == Some("percent")).then_some(rasterops::PERCENT_OVERFLOW),
+    }
+}
+
+/// The name a raster function step `p` gives its band: a slope's says its unit; none otherwise.
+fn function_band(p: &Value) -> Option<String> {
+    (ps(p, "function") == Some("slope"))
+        .then(|| if ps(p, "units") == Some("percent") { "Slope (percent)" } else { "Slope (degrees)" }.to_string())
 }
 
 /// Whether raster function step `p` is a hillshade, whose pixels are bytes
@@ -1291,12 +1781,67 @@ fn is_hillshade(p: &Value) -> bool {
 /// shades it holds: as whole numbers, 16 or fewer (a gentle slope) would otherwise be drawn as
 /// classes (Unique Values).
 fn made_hillshade(raster: Raster, defaults: &rustgis_map::RasterDefaults) -> Result<Made, String> {
-    let mut m = made(raster, None)?;
+    Ok(hillshade_look(made(raster, None)?, defaults))
+}
+
+/// A hillshade made, drawn as one: stretched in grey, as the raster defaults have it.
+fn hillshade_look(mut m: Made, defaults: &rustgis_map::RasterDefaults) -> Made {
     let style = &mut m.layer.style;
     style.renderer = rustgis_map::RasterRenderer::Stretch { band: 0, ramp: defaults.ramp.clone(), invert: defaults.invert };
     style.stretch = defaults.stretch;
     style.resampling = defaults.resampling;
-    Ok(m)
+    m
+}
+
+/// `m`, doing `then` too once it is added, after what it did already.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn also(mut m: Made, then: Then) -> Made {
+    let before = m.then.take();
+    m.then = Some(Box::new(move |s: &mut Session, v: &mut Value| {
+        if let Some(before) = before {
+            before(s, v);
+        }
+        then(s, v);
+    }));
+    m
+}
+
+/// What the remaps of a function made a block at a time met ([`Remaps`]), gathered block by
+/// block: the ranges that match nothing (a low end not below its high end, the same in every
+/// block), and a remap leaving no cell with a value only when it leaves none in every block.
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Default)]
+struct BlockRemaps {
+    /// The ranges that match nothing, as every block so far found them; `None` before the first.
+    empty: Option<Vec<(String, f64, f64)>>,
+    /// Whether every block so far was left with no value, and the raster it was said of.
+    emptied: Option<Option<String>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl BlockRemaps {
+    /// Adds what one block's remaps met.
+    fn add(&mut self, r: Remaps) {
+        self.empty = Some(match self.empty.take() {
+            None => r.empty,
+            Some(mut e) => {
+                // Looked up by their bits, so a remap of many ranges isn't compared range by range.
+                let key = |(name, lo, hi): &(String, f64, f64)| (name.clone(), lo.to_bits(), hi.to_bits());
+                let here: std::collections::HashSet<_> = r.empty.iter().map(key).collect();
+                e.retain(|x| here.contains(&key(x)));
+                e
+            }
+        });
+        self.emptied = Some(match self.emptied.take() {
+            None => r.emptied,
+            Some(all) => all.and(r.emptied),
+        });
+    }
+
+    /// What every block's remaps met together.
+    fn met(self) -> Remaps {
+        Remaps { empty: self.empty.unwrap_or_default(), emptied: self.emptied.flatten() }
+    }
 }
 
 /// Runs raster functions one after another, each on the previous one's output.
@@ -1324,17 +1869,58 @@ fn function_chain_work(s: &Session, p: &Value) -> Result<Work, String> {
         .collect::<Result<_, _>>()?;
     let named = Some(out_name(p, String::new())?).filter(|n| !n.is_empty());
     let defaults = s.raster_defaults.clone();
+    // A file too large to read whole at its full size: a block at a time (#2865), with the cells
+    // around each that its steps over a cell's neighbours read, one each; a chain that can't be
+    // made so ([`super::in_blocks::chain_halo`]) reads the file as before.
+    #[cfg(not(target_arch = "wasm32"))]
+    if let Some(halo) = super::in_blocks::chain_halo(&steps) {
+        let names: Vec<String> = steps.iter().map(func).collect();
+        let out = named.clone().unwrap_or_else(|| format!("{}_{}", src.held().name, names.join("_")));
+        if let Some(blocks) = super::in_blocks::plan(s, &src, &out)? {
+            let last = steps.last().cloned().unwrap_or_default();
+            let shape = function_shape(&last);
+            return Ok(Box::new(move || {
+                let met = std::cell::RefCell::new(BlockRemaps::default());
+                let made = blocks.with_halo(halo).run(
+                    |block, ground| {
+                        let mut remaps = Remaps::default();
+                        let mut cur: Option<Raster> = None;
+                        for (i, st) in steps.iter().enumerate() {
+                            let input = cur.as_ref().unwrap_or(block);
+                            let pixels = apply_function(input, st, None, &mut remaps, Some(ground))
+                                .map_err(|e| format!("step {} ({}): {e}", i + 1, func(st)))?;
+                            cur = Some(derive_function(input, &input.name, st, pixels)?);
+                        }
+                        met.borrow_mut().add(remaps);
+                        let cur = cur.ok_or("the chain made no raster")?;
+                        Ok(cur.bands.into_iter().next().map(|b| b.data).unwrap_or_default())
+                    },
+                    shape,
+                )?;
+                let made = also(made, met.into_inner().met().then());
+                Ok(if is_hillshade(&last) { hillshade_look(made, &defaults) } else { made })
+            }));
+        }
+    }
     Ok(Box::new(move || {
-        let mut cur: Raster = (*src).clone();
+        let src = src.read()?;
+        // Each step's output, the next step's input; the first step reads the raster itself, not
+        // a copy of it.
+        let mut cur: Option<Raster> = None;
         let mut names = Vec::new();
         let mut remaps = Remaps::default();
         for (i, (st, target)) in steps.iter().zip(&targets).enumerate() {
             let f = func(st);
-            let pixels = apply_function(&cur, st, target.as_deref(), &mut remaps).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            let target = read_target(target.as_ref()).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
+            let input = cur.as_ref().unwrap_or(&src);
+            let pixels =
+                apply_function(input, st, target.as_deref(), &mut remaps, None).map_err(|e| format!("step {} ({f}): {e}", i + 1))?;
             // Only a resample takes another raster's grid; otherwise the grid is the current one.
-            cur = derive_function(target.as_deref().unwrap_or(&cur), &cur.name, st, pixels)?;
+            let next = derive_function(target.as_deref().unwrap_or(input), &input.name, st, pixels)?;
+            cur = Some(next);
             names.push(f);
         }
+        let mut cur = cur.ok_or("the chain made no raster")?;
         cur.name = named.unwrap_or_else(|| format!("{}_{}", cur.name, names.join("_")));
         // A chain that ends in a hillshade is drawn as one.
         let mut m = match steps.last() {
@@ -1361,7 +1947,7 @@ fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     let mut criteria = Vec::new();
     for c in crit {
         let r = raster_of(s, criterion_layer(c)?)?;
-        let band = band_of(c, &r)?;
+        let band = band_of(c, r.held())?;
         let ranges: Vec<(f64, f64, f64)> = c
             .get("ranges")
             .and_then(Value::as_array)
@@ -1379,10 +1965,12 @@ fn suitability_work(s: &Session, p: &Value) -> Result<Work, String> {
     }
     let name = out_name(p, "Suitability".into())?;
     Ok(Box::new(move || {
+        let first = first.read()?;
         let mut scored = Vec::new();
         let mut empty = Vec::new();
         for (r, band, ranges, weight) in &criteria {
-            let on_grid = rasterops::resample_to(r, *band, &first)?;
+            let r = r.read()?;
+            let on_grid = rasterops::resample_to(&r, *band, &first)?;
             let remap = rasterops::remap(&rasterops::derive(&first, &r.name, vec![on_grid])?, 0, ranges, false)?;
             empty.extend(remap.empty.into_iter().map(|(lo, hi)| (r.name.clone(), lo, hi)));
             scored.push((remap.cells, *weight));
@@ -1406,46 +1994,11 @@ fn viewshed(s: &mut Session, p: &Value) -> CmdResult {
 fn viewshed_work(s: &Session, p: &Value) -> Result<Work, String> {
     let dem = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
-    let band = band_of(p, &dem)?;
-    let (cx, cy) = dem.cell_size_m();
-    // The whole raster by default, however large: its diagonal reaches every cell from any
-    // observer, and only the raster's cells are worked out. A radius given past the diagonal
-    // covers the same cells, so it is taken as the diagonal: nothing is left out.
-    let diagonal = (cx * dem.width as f64).hypot(cy * dem.height as f64).max(1.0);
-    let radius = match p.get("radius") {
-        None | Some(Value::Null) => diagonal,
-        Some(v) => {
-            f(p, "radius").filter(|r| *r > 0.0).ok_or_else(|| format!("radius must be a number of metres above 0, not {v}"))?.min(diagonal)
-        }
-    };
-    // A raster around the whole Earth (in longitude/latitude) has its east and west edges side
-    // by side, but rays don't cross from one to the other: said when the radius reaches an edge.
-    // (Within half a cell of 360°: a cell size stored rounded falls a little short.)
-    let pw = dem.transform.pixel_width.abs();
-    let round_the_earth = dem.crs.is_geographic() && pw * f64::from(dem.width) >= 360.0 - pw / 2.0;
-    let (oc, or) = dem.pixel_at(at).unwrap_or((0, 0));
-    let (w, h) = (i64::from(dem.width), i64::from(dem.height));
-    let (near, far) = (oc.min(w - 1 - oc), oc.max(w - 1 - oc));
-    // Only when the way across the edge is shorter than the way through the raster: the cell
-    // just across the near edge is `near + 1` cells away across it and `far` through the raster,
-    // and with no shorter way (the observer within a cell of the middle column) every cell is
-    // worked out as near as it is.
-    let seam = round_the_earth && near + 1 < far && (near as f64 + 1.0) * cx <= radius;
-    // The ground just across the edge is the far edge's column, reached only through the raster:
-    // worked out the long way round in the rows where the radius reaches it (cell centres, as the
-    // viewshed measures them). The rows with ground across the edge within the radius are those
-    // where it reaches a cell one past the near edge. All of them are worked out when the radius
-    // reaches the far column in the farthest of those rows, none when it doesn't reach the far
-    // column even on the observer's row.
-    let reaches = |dc: i64, dr: i64| (dc as f64 * cx).hypot(dr as f64 * cy) <= radius;
-    // The rows are walked only on a raster round the Earth, at most its height.
-    let last_row = if seam { (0..=or.max(h - 1 - or)).take_while(|dr| reaches(near + 1, *dr)).last().unwrap_or(0) } else { 0 };
-    let across = if !reaches(far, 0) {
-        "left out of the viewshed"
-    } else if reaches(far, last_row) {
-        "worked out the long way round"
-    } else {
-        "worked out the long way round near the observer's row and left out farther from it"
+    let band = band_of(p, dem.held())?;
+    // A radius given is checked here; the raster's own reach is taken as the work reads it.
+    let given = match p.get("radius") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(f(p, "radius").filter(|r| *r > 0.0).ok_or_else(|| format!("radius must be a number of metres above 0, not {v}"))?),
     };
     // Refused, naming it, when it isn't a height a viewshed takes: never another one used.
     let height = match p.get("height") {
@@ -1462,9 +2015,45 @@ fn viewshed_work(s: &Session, p: &Value) -> Result<Work, String> {
         }
         Some(other) => return Err(format!("heights must be \"nearest\" or \"bilinear\", not {other}")),
     };
-    let name = out_name(p, format!("{}_viewshed", dem.name))?;
-    let dem_name = dem.name.clone();
+    let name = out_name(p, format!("{}_viewshed", dem.held().name))?;
+    let dem_name = dem.held().name.clone();
     Ok(Box::new(move || {
+        let dem = dem.read()?;
+        let (cx, cy) = dem.cell_size_m();
+        // The whole raster by default, however large: its diagonal reaches every cell from any
+        // observer, and only the raster's cells are worked out. A radius given past the diagonal
+        // covers the same cells, so it is taken as the diagonal: nothing is left out.
+        let diagonal = (cx * dem.width as f64).hypot(cy * dem.height as f64).max(1.0);
+        let radius = given.map_or(diagonal, |r| r.min(diagonal));
+        // A raster around the whole Earth (in longitude/latitude) has its east and west edges side
+        // by side, but rays don't cross from one to the other: said when the radius reaches an edge.
+        // (Within half a cell of 360°: a cell size stored rounded falls a little short.)
+        let pw = dem.transform.pixel_width.abs();
+        let round_the_earth = dem.crs.is_geographic() && pw * f64::from(dem.width) >= 360.0 - pw / 2.0;
+        let (oc, or) = dem.pixel_at(at).unwrap_or((0, 0));
+        let (w, h) = (i64::from(dem.width), i64::from(dem.height));
+        let (near, far) = (oc.min(w - 1 - oc), oc.max(w - 1 - oc));
+        // Only when the way across the edge is shorter than the way through the raster: the cell
+        // just across the near edge is `near + 1` cells away across it and `far` through the raster,
+        // and with no shorter way (the observer within a cell of the middle column) every cell is
+        // worked out as near as it is.
+        let seam = round_the_earth && near + 1 < far && (near as f64 + 1.0) * cx <= radius;
+        // The ground just across the edge is the far edge's column, reached only through the raster:
+        // worked out the long way round in the rows where the radius reaches it (cell centres, as the
+        // viewshed measures them). The rows with ground across the edge within the radius are those
+        // where it reaches a cell one past the near edge. All of them are worked out when the radius
+        // reaches the far column in the farthest of those rows, none when it doesn't reach the far
+        // column even on the observer's row.
+        let reaches = |dc: i64, dr: i64| (dc as f64 * cx).hypot(dr as f64 * cy) <= radius;
+        // The rows are walked only on a raster round the Earth, at most its height.
+        let last_row = if seam { (0..=or.max(h - 1 - or)).take_while(|dr| reaches(near + 1, *dr)).last().unwrap_or(0) } else { 0 };
+        let across = if !reaches(far, 0) {
+            "left out of the viewshed"
+        } else if reaches(far, last_row) {
+            "worked out the long way round"
+        } else {
+            "worked out the long way round near the observer's row and left out farther from it"
+        };
         let vs = rasterops::viewshed(&dem, band, at, height, radius, heights)?;
         let seen = vs.cells.iter().filter(|v| **v == 1.0).count();
         let (through_gaps, read_nearest) = (vs.through_gaps, vs.read_nearest);
@@ -1504,8 +2093,11 @@ fn viewshed_work(s: &Session, p: &Value) -> Result<Work, String> {
     }))
 }
 
+/// `analysis.lineOfSight`: the line from `from` to `to` over the elevation raster's held pixels,
+/// split where it turns visible or hidden, with its profile. On the app's thread, so a layer read
+/// in place from a file is read from the overview it holds.
 fn line_of_sight(s: &mut Session, p: &Value) -> CmdResult {
-    let dem = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?;
+    let dem = raster_of(s, ps(p, "layer").ok_or("layer is required")?)?.held;
     let name = out_name(p, "Line of Sight".into())?;
     let (a, b2) = (point(p, "from")?, point(p, "to")?);
     let band = band_of(p, &dem)?;
@@ -1554,8 +2146,24 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     // Features without a place or a number are left out, and said (by kind, with a count).
     let (mut no_point, mut no_value) = (0usize, 0usize);
     let mut pts: Vec<(Coord, f64)> = Vec::with_capacity(ds.features.len());
+    // The run's system: the layer's own projected one it holds its coordinates in, as the
+    // interpolation tools take it (`rustgis_analysis::works_in`), its places taken as they are; else
+    // longitude/latitude, each place given there (one that can't be has no place). There a point
+    // is converted alone; any other shape is converted first, so its label point (a polygon's
+    // centroid) is the one it has in longitude/latitude. A shape with a place that can't be
+    // converted gives its label point in its own system, converted, as long as that converts.
+    let work = Some(ds.coord_crs()).filter(|c| rustgis_analysis::works_in(*c)).unwrap_or(Crs::LonLat);
+    let to = if work == Crs::LonLat { Some(ds.lonlat_conversion()?) } else { None };
+    let place = |g: &Geometry| match (&to, g) {
+        (None, g) => g.label_point(),
+        (Some(to), Geometry::Point(c)) => to.point(*c),
+        (Some(to), g) => match Dataset::converted_to_lonlat(to, g) {
+            Some(g) => g.label_point(),
+            None => g.label_point().and_then(|c| to.point(c)),
+        },
+    };
     for (r, ft) in ds.features.iter().enumerate() {
-        let Some(c) = ft.geometry.as_ref().and_then(|g| g.label_point()).filter(|c| c.is_finite()) else {
+        let Some(c) = ft.geometry.as_ref().and_then(place).filter(|c| c.is_finite()) else {
             no_point += 1;
             continue;
         };
@@ -1566,14 +2174,14 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
         pts.push((c, v));
     }
     let (layer_name, field_name) = (ds.name.clone(), field.to_string());
-    // The system: the one given, else the environment's, else the projected one the layer was read
-    // in, else degrees.
+    // The system: the one given, else the environment's, else the projected one the layer holds its
+    // coordinates in, else the one it was read in, else degrees.
     let env = &s.project.gp_env;
     // An empty `crs` is none given, as `null` is: the environment's system still applies.
     let given = p.get("crs").is_some_and(|v| !v.is_null() && v.as_str().is_none_or(|t| !t.trim().is_empty()));
     let (crs, crs_note) = match env.projected {
         Some(g) if !given => (g.crs, None),
-        _ => rustgis_analysis::raster_crs(ds, p, "Geostatistical Wizard")?,
+        _ => rustgis_analysis::raster_crs_in(ds, work, s.project.coordinate_system, p, "Geostatistical Wizard")?,
     };
     let crs_note = rustgis_analysis::in_its_units(p, crs, crs_note, &Extent::EMPTY, &[], &["cellSize"]);
     let env_extent = env.extent;
@@ -1603,7 +2211,7 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     let neighbors = p.get("neighbors").and_then(Value::as_u64).unwrap_or(12).max(1) as usize;
     Ok(Box::new(move || {
         // Off the window's thread: the points, and the grid they set, in the system.
-        let (pts, beyond_note) = rustgis_analysis::points_in(crs, pts)?;
+        let (pts, beyond_note) = rustgis_analysis::points_from(work, crs, pts)?;
         let e = match env_extent {
             Some(e) if crs == Crs::LonLat => e,
             Some(e) => {
@@ -1670,7 +2278,8 @@ fn interpolate_work(s: &Session, p: &Value) -> Result<Work, String> {
     }))
 }
 
-/// Creates a route layer and reports invalid source segments omitted from its network.
+/// Routes over the query-visible resident network, independently of selection. Invalid
+/// source segments and unreadable-query fallback are reported after a successful route.
 fn route(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -1679,8 +2288,24 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     }
     let name = out_name(p, format!("Route on {}", l.name))?;
     let cost = ps(p, "costField").map(|n| l.dataset.field_index(n).ok_or_else(|| format!("no field named '{n}'"))).transpose()?;
-    let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
-    let r = network::shortest_route(
+    let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::Query, None)?;
+    let query_notice = resolved.query_error.map(|error| {
+        crate::notice_text::NoticeText::format(
+            "1 layer with an unreadable definition query; reading without that query: {layer}: {error}",
+            [("layer", l.name.clone().into()), ("error", error.into())],
+        )
+    });
+    let rows: Vec<usize> = match resolved.rows {
+        rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+        rustgis_map::rows::Rows::Subset(rows) => rows,
+    };
+    // The network in longitude/latitude, as `from` and `to` are, whatever system the layer holds
+    // its coordinates in: each line given there as its graph is built, which is kept for the
+    // layer's rows, so routes over a held network reuse it as they do over one in
+    // longitude/latitude. A line with a place that can't be given there is left out of it, its
+    // segments counted with those with invalid coordinates, rather than the route refused.
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let r = network::shortest_route_held(
         &l.dataset,
         &rows,
         point(p, "from")?,
@@ -1692,16 +2317,31 @@ fn route(s: &mut Session, p: &Value) -> CmdResult {
     let mut ds =
         Dataset::new(name, GeometryType::Polyline, vec![Field::new("length_km", FieldType::Double), Field::new("cost", FieldType::Double)]);
     ds.push(Some(Geometry::Line(vec![r.path.clone()])), vec![Attr::Float(r.length_m / 1000.0), Attr::Float(r.cost)]);
+    hold_as(s, &mut ds, system)?;
     let nid = super::layer::add_dataset(s, ds);
+    if let Some(notice) = query_notice {
+        s.notify_text(notice, false);
+    }
     if r.skipped_segments > 0 {
-        s.notify(
+        s.say(rustgis_data::loss::Note::loss(
+            rustgis_data::loss::LossCode::DroppedGeometry,
             format!("{source_name}: {} segments with invalid coordinates were omitted from the route network", r.skipped_segments),
+        ));
+    }
+    if r.overflowing > 0 {
+        s.notify(
+            format!(
+                "{source_name}: {} line(s) cost so much that a segment's cost is past the largest number, and were closed in the route network",
+                r.overflowing
+            ),
             false,
         );
     }
     Ok(json!({"layer": nid, "lengthKm": r.length_m / 1000.0, "cost": r.cost, "segments": r.rows.len()}))
 }
 
+/// Searches query-visible resident rows independently of selection, replacing selection only
+/// when requested. Unreadable-query fallbacks are counted after a successful search.
 fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let at = Coord::new(f(p, "lon").ok_or("lon is required")?, f(p, "lat").ok_or("lat is required")?);
     if !(at.x.is_finite() && at.y.abs() <= 90.0) {
@@ -1714,11 +2354,27 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
     let mut found: Vec<(u32, Vec<usize>)> = Vec::new();
     let mut bounded = Vec::new();
     let mut invalid = Vec::new();
+    let mut query_errors = Vec::new();
+    let mut query_error_count = 0;
     for l in s.map().layers.iter().filter(|l| s.map().shows(l) && !l.is_raster() && !l.graphics) {
         if only.as_ref().is_some_and(|o| !o.contains(&l.name.to_ascii_lowercase())) {
             continue;
         }
-        let rows: Vec<usize> = l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect();
+        let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::Query, None)?;
+        if let Some(error) = resolved.query_error {
+            query_error_count += 1;
+            // NoticeText::list nests entries; keep its depth independent of the layer count.
+            if query_errors.len() < 5 {
+                query_errors.push(crate::notice_text::NoticeText::format(
+                    "{layer}: {error}",
+                    [("layer", l.name.clone().into()), ("error", error.into())],
+                ));
+            }
+        }
+        let rows: Vec<usize> = match resolved.rows {
+            rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+            rustgis_map::rows::Rows::Subset(rows) => rows,
+        };
         let report = network::within_report(&l.dataset, &rows, at, radius);
         let (near, n) = (report.rows, report.bounded);
         invalid.push((l.name.clone(), report.invalid_latitudes, report.missing_coordinates));
@@ -1748,9 +2404,25 @@ fn neighborhood(s: &mut Session, p: &Value) -> CmdResult {
             super::select::set(s, id, rows, super::select::Mode::Add);
         }
     }
+    if query_error_count > 0 {
+        use crate::notice_text::NoticeText;
+        let key = if query_error_count == 1 {
+            "{count} layer with an unreadable definition query; reading without that query: {layers}"
+        } else {
+            "{count} layers with unreadable definition queries; reading without those queries: {layers}"
+        };
+        let more = query_error_count - query_errors.len();
+        let mut layers = NoticeText::list(query_errors);
+        if more > 0 {
+            layers = NoticeText::format("{layers}; {count} more layers", [("layers", layers), ("count", more.to_string().into())]);
+        }
+        s.notify_text(NoticeText::format(key, [("count", query_error_count.to_string().into()), ("layers", layers)]), false);
+    }
     Ok(json!({"radiusKm": radius / 1000.0, "layers": out}))
 }
 
+/// Generate points in resident polygons kept by the selection and definition query. An
+/// unreadable saved query leaves those polygons unfiltered and is reported once.
 fn simulate(s: &mut Session, p: &Value) -> CmdResult {
     let id = s.layer_id(p)?;
     let l = s.map().layer(id).ok_or("no such layer")?;
@@ -1758,12 +2430,34 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         return Err("points are simulated inside polygons".into());
     }
     let name = out_name(p, format!("{}_simulated", l.name))?;
-    // The selected polygons, or every visible one.
-    let rows: Vec<usize> = if l.selection.is_empty() {
-        l.visible_rows().iter().enumerate().filter(|(_, v)| **v).map(|(i, _)| i).collect()
-    } else {
-        l.selection.clone()
+    let resolved = l.resolve_rows(&l.dataset, rustgis_map::rows::Policy::SelectionAndQuery, None)?;
+    let query_notice = resolved.query_error.map(|error| {
+        crate::notice_text::NoticeText::format(
+            "1 layer with an unreadable definition query; reading without that query: {layer}: {error}",
+            [("layer", l.name.clone().into()), ("error", error.into())],
+        )
+    });
+    let rows: Vec<usize> = match resolved.rows {
+        rustgis_map::rows::Rows::All => (0..l.dataset.features.len()).collect(),
+        rustgis_map::rows::Rows::Subset(rows) => rows,
     };
+    // Placed in the polygons' own coordinates when their layer holds them in a projected system,
+    // spread evenly there (#2032 C2e-5), as the analysis tools work in it
+    // ([`rustgis_analysis::works_in`]); else in longitude/latitude, then held in the layer's
+    // system, as the polygons are.
+    let system = (l.dataset.coord_crs(), l.dataset.crs);
+    let own = rustgis_analysis::works_in(system.0);
+    // A polygon with a place that can't be given in longitude/latitude gets no points, and is
+    // said, rather than the run refused.
+    let polygons = if own { std::borrow::Cow::Borrowed(&l.dataset) } else { l.dataset.in_lonlat_leaving_out()?.0 };
+    let unplaced = rows
+        .iter()
+        .filter(|&&r| {
+            l.dataset.features.row(r).is_some_and(|f| f.geometry().is_some())
+                && polygons.features.row(r).is_some_and(|f| f.geometry().is_none())
+        })
+        .count();
+    let source = l.name.clone();
     let seed = f(p, "seed").map_or(42, |v| v.max(0.0) as u64);
     let pts: Vec<(usize, Coord)> = match ps(p, "field") {
         Some(fname) => {
@@ -1773,7 +2467,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             let mut out = Vec::new();
             for r in &rows {
                 let n = (l.dataset.value(*r, fi).as_f64().unwrap_or(0.0) * rate).round().clamp(0.0, 100_000.0) as usize;
-                out.extend(network::random_points(&l.dataset, &[*r], n, seed.wrapping_add(*r as u64)));
+                out.extend(network::random_points(&polygons, &[*r], n, seed.wrapping_add(*r as u64)));
                 if out.len() > 1_000_000 {
                     return Err("that would make more than a million points; lower the rate".into());
                 }
@@ -1785,7 +2479,7 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
             if rows.len().saturating_mul(per) > 1_000_000 {
                 return Err("that would make more than a million points; lower the count".into());
             }
-            network::random_points(&l.dataset, &rows, per, seed)
+            network::random_points(&polygons, &rows, per, seed)
         }
     };
     let mut ds = Dataset::new(name, GeometryType::Point, vec![Field::new("polygon", FieldType::Integer)]);
@@ -1793,11 +2487,70 @@ fn simulate(s: &mut Session, p: &Value) -> CmdResult {
         ds.push(Some(Geometry::Point(*c)), vec![Attr::Int(*r as i64)]);
     }
     let n = ds.features.len();
+    // A cancel stops the sampling with the points made so far: none of them is added.
+    rustgis_data::progress::check().map_err(|e| e.to_string())?;
+    if own {
+        (ds.held_in, ds.crs) = system;
+    } else {
+        hold_as(s, &mut ds, system)?;
+    }
+    if let Some(notice) = query_notice {
+        s.notify_text(notice, false);
+    }
+    if unplaced > 0 {
+        s.say(rustgis_data::loss::Note::loss(
+            rustgis_data::loss::LossCode::DroppedFeature,
+            format!(
+                "{}: {unplaced} polygon(s) of {source} have a place that can't be given in longitude/latitude, so no points are simulated in them",
+                ds.name
+            ),
+        ));
+    }
     let nid = super::layer::add_dataset(s, ds);
     Ok(json!({"layer": nid, "points": n}))
 }
 
-fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
+/// Holds `ds`, a layer made in longitude/latitude from another, as that layer is
+/// ([`Dataset::hold_as`]; `system` is its [`Dataset::coord_crs`] and [`Dataset::crs`]), or in the
+/// project's system ([`made_in`]), and says so when it can't be: it stays in longitude/latitude
+/// then, as it was made. A cancel stops the command, which adds nothing.
+pub(crate) fn hold_as(
+    s: &mut Session,
+    ds: &mut Dataset,
+    system: (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+) -> Result<(), String> {
+    let (held, crs) = made_in(s, system);
+    match ds.hold_as(held, crs) {
+        Err(e) if matches!(rustgis_data::DataError::of_conversion(e.clone()), rustgis_data::DataError::Cancelled) => Err(e),
+        Err(e) => {
+            // Its refusal starts with the layer's name, named once here.
+            let why = e.strip_prefix(&format!("{}: ", ds.name)).unwrap_or(&e);
+            let whose = if held == system.0 { String::new() } else { "the project's ".to_string() };
+            s.notify(format!("{}: kept in longitude/latitude, as it was made, not in {whose}{}: {why}", ds.name, held.label()), false);
+            Ok(())
+        }
+        Ok(()) => Ok(()),
+    }
+}
+
+/// The system a layer made in longitude/latitude from another, held in `system` (its
+/// [`Dataset::coord_crs`] and [`Dataset::crs`]), is held in: the other's, unless that is one tools
+/// don't work in ([`rustgis_analysis::works_in`]: longitude/latitude, Web Mercator, a geographic
+/// one) and the project has a system of its own (#2032 C3a), which it then takes, as a tool's
+/// output does. A geocentric project system holds no map coordinates, so it is passed over.
+pub(crate) fn made_in(
+    s: &Session,
+    system: (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>),
+) -> (rustgis_data::raster::Crs, Option<rustgis_data::raster::Crs>) {
+    use rustgis_data::raster::Crs;
+    match s.project.coordinate_system.filter(|c| *c != Crs::LonLat && !c.is_geocentric()) {
+        Some(p) if !rustgis_analysis::works_in(system.0) => (p, Some(p)),
+        _ => system,
+    }
+}
+
+/// Numeric fields requested by name, or all numeric fields when omitted; invalid names fail.
+pub(super) fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     match p.get("fields").and_then(Value::as_array) {
         Some(a) => a
             .iter()
@@ -1812,7 +2565,7 @@ fn numeric_fields(ds: &Dataset, p: &Value) -> Result<Vec<usize>, String> {
     }
 }
 
-/// Histograms of numeric fields and their correlation matrix.
+/// Histograms and correlations over All resident rows, independent of map filters/selection.
 fn explore(s: &mut Session, p: &Value) -> CmdResult {
     let ds = feature_ds(s, p)?;
     let fields = numeric_fields(ds, p)?;
@@ -1855,51 +2608,35 @@ fn explore(s: &mut Session, p: &Value) -> CmdResult {
     )
 }
 
-fn similar(s: &mut Session, p: &Value) -> CmdResult {
-    let id = s.layer_id(p)?;
-    let l = s.map().layer(id).ok_or("no such layer")?;
-    let row = match p.get("row").and_then(Value::as_u64) {
-        Some(r) => r as usize,
-        None => *l.selection.first().ok_or("select a feature (or give row)")?,
-    };
-    if row >= l.dataset.features.len() {
-        return Err("no such row".into());
-    }
-    let fields = numeric_fields(&l.dataset, p)?;
-    if fields.is_empty() {
-        return Err("the layer has no numeric fields to compare".into());
-    }
-    let n = p.get("count").and_then(Value::as_u64).unwrap_or(10).clamp(1, 1000) as usize;
-    let found = network::similar(&l.dataset, row, &fields, n);
-    let rows: Vec<Value> = found.iter().map(|(r, d)| json!({"row": r, "distance": d})).collect();
-    if b(p, "select").unwrap_or(true) {
-        let mut sel: Vec<usize> = found.iter().map(|x| x.0).collect();
-        sel.push(row);
-        super::select::set(s, id, sel, super::select::Mode::New);
-    }
-    Ok(json!({"similar": rows}))
-}
-
 /// Converts text on the caller's thread for scripts and browser downloads. A streamed layer
 /// needs a file path so its full source can be read off the desktop frame, rather than returning
 /// only its loaded view. File conversions use the shared export lifecycle.
 fn convert(s: &mut Session, p: &Value) -> CmdResult {
+    use std::borrow::Cow;
+
     if ps(p, "path").is_some() {
         return super::exports::write_here(s, p, "data.convert");
     }
     let id = s.layer_id(p)?;
-    if s.map().layer(id).is_some_and(|l| l.is_streamed()) {
+    let layer = s.map().layer(id).ok_or("no such layer")?;
+    if layer.is_streamed() {
         return Err("a streamed layer needs a path to convert its whole source; text conversion would contain only the loaded view".into());
     }
-    let construction_notes = s.constructions.export_notes(s.map().instance_id(), s.map().layer(id).ok_or("no such layer")?)?;
-    let ds = feature_ds(s, p)?;
-    let (text, notes) = converted(ds, p)?;
+    let construction_notes = s.constructions.export_notes(s.map().instance_id(), layer)?;
+    let mut ds = Cow::Borrowed(feature_ds(s, p)?);
+    let report = rustgis_data::export::filter_dataset(&mut ds, layer.definition_query.as_deref()).map_err(|e| e.to_string())?;
+    let (text, notes) = converted(&ds, p)?;
     let null_numbers = rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, conversion_format(p)?);
     let target = ds.name.clone();
+    let query_note = super::share::query_export_note(&target, &layer.name, &report);
+    drop(ds);
     for note in notes.into_iter().chain(construction_notes) {
-        s.notify(note, false);
+        s.say(note);
     }
     super::share::notify_null_numbers(s, &target, null_numbers);
+    if let Some(note) = query_note {
+        s.notify_text(note, false);
+    }
     Ok(json!({"text": text}))
 }
 
@@ -1907,6 +2644,8 @@ fn convert(s: &mut Session, p: &Value) -> CmdResult {
 /// GeoJSON and CSV use the chunk writer; KML, GPX and WKT read whole within the existing memory
 /// limits, then check Cancel between features (one geometry's serialization is indivisible).
 pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Work, String> {
+    use std::borrow::Cow;
+
     feature_ds(s, p)?;
     let id = s.layer_id(p)?;
     let layer = s.map().layer(id).ok_or("no such layer")?.clone();
@@ -1918,56 +2657,77 @@ pub(crate) fn convert_work(s: &Session, p: &Value) -> Result<super::exports::Wor
         let construction_notes = constructions.export_notes(map, &layer)?;
         let format = conversion_format(&params)?;
         let chunks = if layer.is_streamed() && matches!(format, "geojson" | "csv") { layer.chunk_export()? } else { None };
-        let (mut notes, null_numbers) = if let Some((source, ds)) = chunks {
-            let result = rustgis_data::export::write_source_as_in(
+        let query = layer.definition_query.as_deref();
+        let (mut notes, null_numbers, query_report) = if let Some((source, ds)) = chunks {
+            let result = rustgis_data::export::write_source_as_filtered(
                 source.as_ref(),
                 &ds,
                 std::path::Path::new(&path),
                 rustgis_data::raster::Crs::LonLat,
                 format,
+                query,
             )
             .map_err(|e| e.to_string())?;
-            let mut notes = rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
+            let mut notes: rustgis_data::loss::Notes =
+                rustgis_data::export_notes([(&ds, layer.extent())], &path, rustgis_data::raster::Crs::LonLat);
             if format == "csv" {
-                notes.extend(result.csv.notes(&path));
+                notes.extend(result.csv.notes(&ds.fields, &path));
+                notes.extend(result.csv.coordinates_note(&ds.fields, &path));
+                notes.extend(result.text.notes(&ds.fields, &path));
             }
             if result.skipped > 0 {
-                notes.push(format!("{path}: {} rows couldn't be read and were left out", result.skipped));
+                notes.push(super::whole::unread_note(&path, result.skipped));
             }
+            notes.extend(rustgis_data::io::unplaced_export_note(&path, &ds.name, result.unplaced, rustgis_data::raster::Crs::LonLat));
             notes.extend(
                 rustgis_data::source::unread_dates_note(&ds.fields, &result.unread_dates)
-                    .map(|n| format!("{path}: {}: {n}, so they're empty in the export", ds.name)),
+                    .map(|n| n.map_text(|n| format!("{path}: {}: {n} (empty in the export)", ds.name))),
             );
             notes.extend(
                 rustgis_data::source::rounded_dates_note(&ds.fields, &result.rounded_dates)
-                    .map(|n| format!("{path}: {}: {n} when read for the export", ds.name)),
+                    .map(|n| n.map_text(|n| format!("{path}: {}: {n} when read for the export", ds.name))),
             );
-            (notes, result.null_numbers)
+            notes.extend(
+                rustgis_data::source::null_text_note(&ds.fields, &result.null_text)
+                    .map(|n| n.map_text(|n| format!("{path}: {}: {n} (empty in the export)", ds.name))),
+            );
+            notes.extend(
+                result.read_notes.iter().map(|n| n.clone().map_text(|t| format!("{path}: {}: {t} when read for the export", ds.name))),
+            );
+            notes.extend(
+                rustgis_data::source::not_utf8_note(&ds.fields, &result.not_utf8, result.not_utf8_in)
+                    .map(|n| n.prefixed(&format!("{path}: {}", ds.name))),
+            );
+            (notes, result.null_numbers, result.query)
         } else {
-            let (whole, unreadable) = if layer.is_streamed() {
-                layer.load_all_counted().map(|(ds, n)| (Some(ds), n))?
+            let (mut ds, unreadable) = if layer.is_streamed() {
+                let (ds, unreadable) = layer.load_all_counted()?;
+                (Cow::Owned(ds), unreadable)
             } else {
-                (None, rustgis_map::Unreadable::default())
+                (Cow::Borrowed(&layer.dataset), rustgis_map::Unreadable::default())
             };
-            let ds = whole.as_ref().unwrap_or(&layer.dataset);
+            let report = rustgis_data::export::filter_dataset(&mut ds, query).map_err(|e| e.to_string())?;
             rustgis_data::progress::begin(ds.features.len());
-            let (text, mut notes) = converted(ds, &params)?;
-            super::share::coalesce_read_zm(&mut notes, &path, ds, &unreadable);
+            let (text, notes) = converted(&ds, &params)?;
+            let mut notes: rustgis_data::loss::Notes = notes;
+            super::share::coalesce_read_zm(&mut notes, &path, &ds, &unreadable);
             rustgis_data::io::write_atomic(std::path::Path::new(&path), text.as_bytes()).map_err(|e| format!("{path}: {e}"))?;
             if unreadable.rows > 0 {
-                notes.push(format!("{path}: {} rows couldn't be read and were left out", unreadable.rows));
+                notes.push(super::whole::unread_note(&path, unreadable.rows));
             }
             notes.extend(super::share::read_notes(&path, &ds.name, &unreadable));
-            (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format))
+            (notes, rustgis_data::export::numbers_written_as_null(&ds.features, &ds.fields, format), report)
         };
         let bytes = std::fs::metadata(&path).map_err(|e| format!("{path}: {e}"))?.len();
         notes.extend(construction_notes);
         notes.push(format!("Exported {path}"));
         let target = path.clone();
-        let refused_notes = super::share::null_numbers_note(&target, null_numbers).map(|n| n.english()).into_iter().collect();
-        let then = (null_numbers > 0).then(|| {
+        let query_note = super::share::query_export_note(&target, &layer.name, &query_report);
+        let refused_notes = super::share::null_numbers_note(&target, null_numbers).iter().chain(&query_note).map(|n| n.english()).collect();
+        let then = (null_numbers > 0 || query_note.is_some()).then(|| {
             Box::new(move |s: &mut Session, _: &mut Value| {
                 super::share::notify_null_numbers(s, &target, null_numbers);
+                super::share::notify_written_query(s, query_note);
                 Ok(())
             }) as super::exports::Then
         });
@@ -1995,26 +2755,34 @@ fn conversion_format(p: &Value) -> Result<&str, String> {
 }
 
 /// Serializes a complete dataset and collects its loss notices for delivery after success.
-fn converted(ds: &Dataset, p: &Value) -> Result<(String, Vec<String>), String> {
+fn converted(ds: &Dataset, p: &Value) -> Result<(String, rustgis_data::loss::Notes), String> {
     let name_field =
         ps(p, "nameField").and_then(|n| ds.field_index(n)).or_else(|| ds.fields.iter().position(|f| f.name.eq_ignore_ascii_case("name")));
     let format = conversion_format(p)?;
+    // Every format here is longitude/latitude, whatever system the layer holds its coordinates
+    // in: the text and what it loses are read from the copy there. A feature with a place that
+    // can't be given there is written without its geometry, and said.
+    let (lonlat, unplaced) = ds.in_lonlat_leaving_out()?;
     let text = match format {
-        "geojson" => rustgis_data::io::to_geojson_text(ds).map_err(|e| e.to_string())?,
-        "csv" => rustgis_data::io::to_csv(ds).map_err(|e| e.to_string())?,
-        "kml" => rustgis_data::interop::to_kml(ds, name_field).map_err(|e| e.to_string())?,
-        "gpx" => rustgis_data::interop::to_gpx(ds, name_field).map_err(|e| e.to_string())?,
-        _ => rustgis_data::interop::to_wkt_csv(ds).map_err(|e| e.to_string())?,
+        "geojson" => rustgis_data::io::to_geojson_text(&lonlat).map_err(|e| e.to_string())?,
+        "csv" => rustgis_data::io::to_csv(&lonlat).map_err(|e| e.to_string())?,
+        "kml" => rustgis_data::interop::to_kml(&lonlat, name_field).map_err(|e| e.to_string())?,
+        "gpx" => rustgis_data::interop::to_gpx(&lonlat, name_field).map_err(|e| e.to_string())?,
+        _ => rustgis_data::interop::to_wkt_csv(&lonlat).map_err(|e| e.to_string())?,
     };
-    // Every format here is longitude/latitude.
     let target = ps(p, "path").unwrap_or(&ds.name);
-    let mut notes = rustgis_data::export_notes([(ds, ds.extent())], target, rustgis_data::raster::Crs::LonLat);
-    // CSV holds a point a row, GPX a name for each feature and no areas.
-    notes.extend(rustgis_data::io::export_losses_notes(ds, format, name_field, target));
-    // KML and GPX hold features with geometry only.
+    let mut notes = rustgis_data::export_notes([(ds, ds.lonlat_extent())], target, rustgis_data::raster::Crs::LonLat);
+    notes.extend(rustgis_data::unplaced_note(target, &ds.name, unplaced));
+    // CSV holds a point a row, GPX a name for each feature and no areas; reading text back, CSV reads blanks as null and KML and GPX trim it.
+    notes.extend(rustgis_data::io::export_losses_notes(&lonlat, format, name_field, target).map_err(|e| e.to_string())?);
+    // KML and GPX hold features with geometry only: counted in what is written, so a feature
+    // whose geometry is left out above is counted as left out too.
     if let ext @ ("kml" | "gpx") = format {
-        let without =
-            if ext == "gpx" { rustgis_data::io::gpx_left_out(ds) } else { ds.features.iter().filter(|f| f.geometry.is_none()).count() };
+        let without = if ext == "gpx" {
+            rustgis_data::io::gpx_left_out(&lonlat)
+        } else {
+            lonlat.features.iter().filter(|f| f.geometry.is_none()).count()
+        };
         notes.extend(rustgis_data::io::left_out_note(target, ext, without));
     }
     Ok((text, notes))

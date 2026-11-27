@@ -477,11 +477,13 @@ impl eframe::App for App {
 
 #[cfg(target_os = "macos")]
 impl App {
-    /// The menu bar: built once the app runs, again for a new language or shortcut; its items
+    /// The menu bar: built once the app runs, again for a new language, shortcut or extension
+    /// choice; its items
     /// greyed out as their commands are; the commands chosen from it run, unless a dialog (Save
     /// changes?) has the keys, as the keymap's do.
     fn menus(&mut self, ctx: &egui::Context) {
-        // The shortcuts shown can only change with the language or the keymap.
+        // The items and shortcuts shown can only change with the language, the keymap or the
+        // extensions that are on.
         let seen = (self.0.chosen_lang(), self.0.shortcuts_fingerprint());
         if self.2.seen != Some(seen) {
             self.2.seen = Some(seen);
@@ -595,6 +597,8 @@ fn main() -> eframe::Result {
         println!("rustgis {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    // Datum grids: RustGIS's own folder, then those PROJ uses on this computer (#2032 A4).
+    rustgis_engine::data::raster::crs::use_grid_folders();
     // What an earlier session left, before this one can write a new log.
     let crashed = crash::take_previous(prefs::dir());
     // Whether it closed cleanly: if not, the Start With project isn't opened (it may be what
@@ -738,12 +742,13 @@ fn main() -> eframe::Result {
     let result = eframe::run_native(
         "RustGIS",
         options,
-        Box::new(move |_cc| {
+        Box::new(move |cc| {
+            app.enable_native_font_downloads(&cc.egui_ctx);
             // The menu's choices wake the app: egui draws only on events.
             #[cfg(target_os = "macos")]
-            menu::listen(menus.chosen.clone(), _cc.egui_ctx.clone());
+            menu::listen(menus.chosen.clone(), cc.egui_ctx.clone());
             #[cfg(target_os = "macos")]
-            document_inbox.set_context(&_cc.egui_ctx);
+            document_inbox.set_context(&cc.egui_ctx);
             Ok(Box::new(App(
                 app,
                 held,
@@ -757,6 +762,7 @@ fn main() -> eframe::Result {
     result
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::{backends, crash, flag, prefs, running};
@@ -929,11 +935,11 @@ mod tests {
         }
         assert!(!ctx.has_requested_repaint(), "clean preferences keep the window idle");
         // A full disk: said once, not for every setting that follows.
-        prefs::saved(Err("could not save preferences: no space left".into()));
-        prefs::saved(Err("could not save preferences: no space left".into()));
+        prefs::saved(Err("no space left".into()));
+        prefs::saved(Err("no space left".into()));
         frame();
         assert!(ctx.has_requested_repaint(), "the pending failure requests its delivery frame");
-        assert_eq!(prefs::take_notices(), [Notice::NotSaved("could not save preferences: no space left".into())]);
+        assert_eq!(prefs::take_notices(), [Notice::NotSaved("no space left".into())]);
         for _ in 0..4 {
             frame();
         }
@@ -947,8 +953,8 @@ mod tests {
         assert!(prefs::take_notices().is_empty(), "equivalent recovery outcomes stay quiet");
         // Once a save works, the next failure is news again.
         prefs::saved(Ok(None));
-        prefs::saved(Err("could not save preferences: read-only".into()));
-        assert_eq!(prefs::take_notices(), [Notice::NotSaved("could not save preferences: read-only".into())]);
+        prefs::saved(Err("read-only".into()));
+        assert_eq!(prefs::take_notices(), [Notice::NotSaved("read-only".into())]);
         prefs::saved(Ok(None));
         // A malformed file set aside says where it went.
         let bad = std::path::PathBuf::from("prefs.json.bad");
@@ -957,7 +963,7 @@ mod tests {
         let text = prefs::text(&Notice::SetAside(bad));
         assert!(text.contains("prefs.json.bad"), "{text}");
         // Both a failed replacement and an unconfirmed final flush give an accurate notice.
-        for error in ["could not save preferences: read-only", "preferences were replaced, but their durability could not be confirmed"] {
+        for error in ["read-only", "preferences were replaced, but their durability could not be confirmed"] {
             let text = prefs::text(&Notice::NotSaved(error.into()));
             assert!(text.contains("Settings could not be saved reliably") && text.contains(error), "{text}");
             assert!(!text.contains("changes last only until"), "{text}");

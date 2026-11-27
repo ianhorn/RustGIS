@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::rc::Rc;
 
 use rustgis_ui_egui::rustgis_engine::{data::diagnostics::Capture, sources::message_with_address};
-use rustgis_ui_egui::{Inbox, RustGisApp, Services, Slot};
+use rustgis_ui_egui::{FindChords, Inbox, RustGisApp, Services, Slot};
 
 use crate::parts::Notes;
 use wasm_bindgen::JsCast as _;
@@ -57,6 +57,11 @@ const DATA_EXTS: &[&str] = &[
     "tif",
     "tiff",
     "asc",
+    "grb",
+    "grib",
+    "grb2",
+    "grib2",
+    // SRTM height tiles and DTED are added below (`ELEVATION_EXTENSIONS`).
 ];
 const CANVAS_ID: &str = "rustgis_canvas";
 const LOADING_ID: &str = "rustgis_loading";
@@ -105,6 +110,7 @@ pub fn start() {
         let dirty = Rc::new(Cell::new(false));
         // Inside another page (`?embed`) the page holds the work, so leaving it doesn't ask.
         let embedded = flag(&query(), "embed");
+        let preview = shared_preview();
         if !embedded && let Err(e) = guard_unload(dirty.clone()) {
             log::error!("no unsaved-changes guard: {e}");
         }
@@ -135,6 +141,7 @@ pub fn start() {
                         notes.clone(),
                         cc.egui_ctx.clone(),
                         embedded,
+                        preview,
                     ));
                     app.embedded = embedded;
                     // Settings › Start-up, unless `?blank`, `?projection=EPSG:3010` (a preset id,
@@ -257,6 +264,15 @@ pub fn start() {
                     } else {
                         crate::embed::notify_skipped_startup_links(&mut app.session, &q, embedded);
                     }
+                    if preview {
+                        app.session.notify(
+                            rustgis_ui_egui::tl!(
+                                "This is a pull request preview. Previews share the browser's storage with each other, so this one saves nothing there: settings, AI provider keys and addresses, and plugin settings last until the page closes."
+                            )
+                            .to_string(),
+                            false,
+                        );
+                    }
                     let embed = if embedded {
                         match Embed::listen(cc.egui_ctx.clone()) {
                             Ok(e) => Some(e),
@@ -328,13 +344,14 @@ struct WebShell {
     embed: Option<Embed>,
     /// The app's Ctrl (⌘) shortcuts, kept current for [`keep_app_shortcuts`].
     taken: TakenKeys,
-    /// [`RustGisApp::shortcuts_fingerprint`] when `taken` was last filled.
-    taken_print: Option<u64>,
+    /// [`RustGisApp::shortcuts_fingerprint`] and [`RustGisApp::script_find_keys`] when `taken`
+    /// was last filled.
+    taken_print: Option<(u64, FindChords)>,
 }
 
-/// The app's Ctrl (⌘) shortcuts as (Alt, Shift, key): [`RustGisApp::command_keys`], shared with
-/// the page's key listener.
-type TakenKeys = Rc<RefCell<Vec<(bool, bool, egui::Key)>>>;
+/// The app's Ctrl (⌘) shortcuts as (Alt, Shift, key), [`RustGisApp::command_keys`], and the Script
+/// box's find chords, [`RustGisApp::script_find_keys`], shared with the page's key listener.
+type TakenKeys = Rc<RefCell<(Vec<(bool, bool, egui::Key)>, FindChords)>>;
 
 /// The link to the page that embeds the app (`?embed`; see `embed.rs`).
 struct Embed {
@@ -435,6 +452,20 @@ impl Embed {
     }
 }
 
+impl WebShell {
+    /// Keeps the key listener's shortcuts current: the shortcuts can be changed in the app, and
+    /// the Script box takes its find chords only while it has the focus. Rebuilt only when one of
+    /// them changed.
+    fn follow_keys(&mut self, ctx: &egui::Context) {
+        let find = self.app.script_find_keys(ctx);
+        let print = (self.app.shortcuts_fingerprint(), find);
+        if self.taken_print.as_ref() != Some(&print) {
+            *self.taken.borrow_mut() = (self.app.command_keys(), print.1.clone());
+            self.taken_print = Some(print);
+        }
+    }
+}
+
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         // The GPU map backend draws inside egui's wgpu pass; hand over the render state.
@@ -466,24 +497,34 @@ impl eframe::App for WebShell {
         }
         self.app.logic(ctx);
         self.dirty.set(self.app.session.dirty());
-        // The shortcuts can be changed in the app: the key listener follows, rebuilt only when
-        // the keymap changed.
-        let print = self.app.shortcuts_fingerprint();
-        if self.taken_print != Some(print) {
-            self.taken_print = Some(print);
-            *self.taken.borrow_mut() = self.app.command_keys();
-        }
+        self.follow_keys(ctx);
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.app.ui(ui);
+        // The pass may have moved the focus into the Script box, or out of it: a key pressed
+        // before the next frame's `logic` is judged by where the focus is now.
+        self.follow_keys(ui.ctx());
     }
 }
 
 /// Reads files picked or dropped together into the inbox, all at once, each Shapefile's loose
 /// parts zipped into one (`gather_shapefiles`) so it opens as a layer; `mark` starts each name.
-async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, notes: Notes) {
+async fn read_together(mut files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, notes: Notes) {
     let mut read = Vec::new();
+    // The assistant's pictures: no more are read than a message takes, and those left out, or
+    // too large, are said once each kind.
+    let pictures = mark == rustgis_ui_egui::ASSISTANT_PICK;
+    let most = rustgis_ui_egui::rustgis_assistant::attach::MAX_PER_MESSAGE;
+    if pictures && files.len() > most {
+        let names: Vec<String> = files.drain(most..).map(|f| f.name()).collect();
+        let text = rustgis_ui_egui::i18n::fmt(
+            "{names} weren't attached: a message takes at most {n} pictures",
+            &[("names", &names.join(", ")), ("n", &most.to_string())],
+        );
+        notes.lock().unwrap_or_else(|e| e.into_inner()).push((text, true));
+    }
+    let mut too_large = Vec::new();
     for file in files {
         let name = file.name();
         let shortcut = mark == rustgis_ui_egui::SHORTCUT_PICK || (mark.is_empty() && name.to_ascii_lowercase().ends_with(".rgisshortcuts"));
@@ -494,16 +535,54 @@ async fn read_together(files: Vec<web_sys::File>, mark: &str, inbox: &Inbox, not
                 .push((rustgis_ui_egui::tl!("Shortcut file exceeds the size limit.").into(), true));
             continue;
         }
+        if mark == rustgis_ui_egui::SCRIPT_PICK && file.size() > rustgis_ui_egui::SCRIPT_FILE_MAX_BYTES as f64 {
+            let text = rustgis_ui_egui::i18n::fmt("{file} is larger than 1 MB", &[("file", &name)]);
+            notes.lock().unwrap_or_else(|e| e.into_inner()).push((text, true));
+            continue;
+        }
+        if pictures && file.size() > rustgis_ui_egui::ASSISTANT_FILE_MAX_BYTES as f64 {
+            too_large.push(name);
+            continue;
+        }
+        if mark.starts_with(rustgis_ui_egui::MARKER_PICK) && file.size() > rustgis_ui_egui::MARKER_FILE_MAX_BYTES as f64 {
+            notes.lock().unwrap_or_else(|e| e.into_inner()).push((rustgis_ui_egui::marker_file_too_large().into(), true));
+            continue;
+        }
         if let Some(bytes) = crate::parts::read_file(file, notes.clone()).await {
             read.push((name, bytes));
-        } else if mark.starts_with(rustgis_ui_egui::DXF_PICK) {
-            // A failed read completes this request just like cancelling its picker.
-            inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.to_string(), Vec::new()));
         }
+    }
+    if let Some(first) = too_large.first() {
+        let why = rustgis_ui_egui::rustgis_assistant::attach::too_large(first.clone());
+        let text = if too_large.len() == 1 {
+            rustgis_ui_egui::i18n::note(&why)
+        } else {
+            // In logical order inside the count's message, which is put in display form once.
+            let first = rustgis_ui_egui::i18n::note_raw(&why);
+            rustgis_ui_egui::i18n::fmt(
+                "{n} pictures weren't attached, such as {first}",
+                &[("n", &too_large.len().to_string()), ("first", &first)],
+            )
+        };
+        notes.lock().unwrap_or_else(|e| e.into_inner()).push((text, true));
+    }
+    // A request something waits on (Import DXF, a marker's «Image…») with nothing read, its
+    // picker cancelled or its file refused or unread, is answered empty: it stops waiting.
+    if (mark.starts_with(rustgis_ui_egui::DXF_PICK) || mark.starts_with(rustgis_ui_egui::MARKER_PICK)) && read.is_empty() {
+        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.to_string(), Vec::new()));
     }
     let (read, problems) = rustgis_ui_egui::rustgis_engine::data::io::gather_shapefiles(read);
     notes.lock().unwrap_or_else(|e| e.into_inner()).extend(problems.into_iter().map(|p| (p, true)));
     inbox.lock().unwrap_or_else(|e| e.into_inner()).extend(read.into_iter().map(|(name, bytes)| (format!("{mark}{name}"), bytes)));
+}
+
+/// A pull request preview (`<meta name="rustgis-preview">`, added by the workflow that publishes
+/// it). Every preview shares one origin with every other, whose pages are unreviewed code: what
+/// one saves in the browser, another can read or change. A preview therefore keeps its settings
+/// in memory for the visit (`embed::visit_prefs`) and reads nothing saved there; `index.html`
+/// clears what earlier previews left and installs no service worker.
+fn shared_preview() -> bool {
+    web_sys::window().and_then(|w| w.document()).and_then(|d| d.query_selector("meta[name=\"rustgis-preview\"]").ok().flatten()).is_some()
 }
 
 fn storage() -> Option<web_sys::Storage> {
@@ -511,8 +590,9 @@ fn storage() -> Option<web_sys::Storage> {
 }
 
 /// Where plugins keep what they remember (`host.settings`, `host.setSettings`): one localStorage
-/// entry per plugin, `rustgis.plugin-settings.<id>`; embedded, memory for the visit (as the
-/// preferences are: the page that embeds the app must not read what the user saved on the site).
+/// entry per plugin, `rustgis.plugin-settings.<id>`; embedded or in a pull request preview, memory
+/// for the visit (as the preferences are: the page that embeds the app must not read what the user
+/// saved on the site, and another preview must not read or change what this one saved).
 /// A failure is reported to the plugin as a fixed text: what the browser's exception holds could
 /// include what was being saved.
 fn plugin_settings_storage(embedded: bool) -> rustgis_ui_egui::rustgis_engine::plugins::settings::BrowserStorage {
@@ -670,7 +750,7 @@ async fn fetch_reached(
     let mut diagnostics = RequestDiagnostics::with_capture(url, "GET", capture);
     diagnostics.omit_statuses(omit);
     let answer = async {
-        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, logins};
+        use rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::{address, cache, copernicus, logins};
         let (promise, abort, range, tail, max, url, bound, authenticated) = crate::request::prepare_and_send(
             &still,
             || async {
@@ -686,25 +766,38 @@ async fn fetch_reached(
                 let prepared = cache::prepare_get(url)?;
                 let url = prepared.url.as_str();
                 let destination = check_destination(url, ceiling)?;
+                // A connection's own ArcGIS token (already in the login's address) outranks the portal
+                // sign-in: with one applied, the sign-in's token is neither renewed nor added.
+                let target = logins::inherit(bound, url);
+                let bare = prepared.bare();
+                let mut login = if bare { None } else { logins::apply(&target).map_err(str::to_string)? };
+                let explicit = login.as_ref().is_some_and(|applied| applied.arcgis);
                 // An ArcGIS sign-in's token, for the portal and the servers it covers, renewed first when it
                 // is about to expire. It goes as the request's `token` parameter, not a header: ArcGIS's
                 // query endpoints answer the header's CORS preflight with an error.
-                if !prepared.signed {
+                if !bare && !explicit {
                     crate::arcgis::renew_if_due(url, still.clone()).await;
+                    crate::copernicus::renew_if_due(url, still.clone()).await;
                     cache::check_still(&still)?;
+                    // The renewal suspended this request: its login is looked at once more.
+                    login = logins::apply(&target).map_err(str::to_string)?;
                 }
-                let target = logins::inherit(bound, url);
-                let login = if prepared.signed { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let login_url = login.as_ref().map_or(url, |applied| applied.url.as_str());
-                let arcgis =
-                    if prepared.signed { None } else { rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url) };
+                let arcgis = if bare || explicit {
+                    None
+                } else {
+                    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_auth::with_token(login_url)
+                };
+                // A Copernicus Data Space sign-in's token goes to its data hosts only, as on the
+                // desktop; the request then refuses any redirect, so it never leaves them.
+                let copernicus = if prepared.signed || login.is_some() { None } else { copernicus::authorization(url) };
                 // Only the request carries credentials: messages and cache keys keep the original address.
                 let request = arcgis.as_deref().unwrap_or(login_url);
                 // URL parsing in a browser can normalize a numeric or escaped hostname. Judge
                 // that actual destination against the already checked, prepared address.
                 let normalized = web_sys::Url::new(request).map_err(|_| "not a valid request address")?;
                 address::check_reach(&normalized.href(), ceiling)?;
-                let authenticated = prepared.signed || arcgis.is_some() || login.is_some();
+                let authenticated = prepared.signed || arcgis.is_some() || login.is_some() || copernicus.is_some();
                 let err = |e: wasm_bindgen::JsValue| {
                     if authenticated { "the browser couldn't process the authenticated request".to_string() } else { format!("{e:?}") }
                 };
@@ -720,7 +813,7 @@ async fn fetch_reached(
                 if let Some(a) = &abort {
                     init.set_signal(Some(&a.signal()));
                 }
-                if asked.is_some() || !prepared.headers.is_empty() || login_header.is_some() {
+                if asked.is_some() || !prepared.headers.is_empty() || login_header.is_some() || copernicus.is_some() {
                     let headers = web_sys::Headers::new().map_err(err)?;
                     if let Some(r) = &asked {
                         headers.set("Range", r).map_err(err)?;
@@ -733,13 +826,17 @@ async fn fetch_reached(
                     if let Some((name, value)) = login_header {
                         headers.set(name, value).map_err(err)?;
                     }
+                    if let Some(auth) = &copernicus {
+                        headers.set("Authorization", auth).map_err(err)?;
+                    }
                     init.set_headers(&headers);
                 }
                 // Fetch hides a manual redirect's Location, so the app cannot check its next
                 // destination. Refuse it instead of letting the browser follow it unchecked.
                 init.set_redirect(if authenticated { web_sys::RequestRedirect::Error } else { web_sys::RequestRedirect::Manual });
                 // A credential-bearing address goes nowhere else: no referrer from it, no cookies with it.
-                if arcgis.is_some() || login.is_some() {
+                // An anonymous request sends no cookies either.
+                if arcgis.is_some() || login.is_some() || copernicus.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -777,6 +874,10 @@ async fn fetch_reached(
                 .map_err(err)?;
             diagnostics.answered(resp.status());
             check_redirect(&resp)?;
+            // A data host refusing the request (or the token): say what to do.
+            if resp.status() == 401 && copernicus::is_data_host(&url) {
+                return Err(copernicus::refused_message(&url));
+            }
             if !resp.ok() {
                 return Err(refused(&resp));
             }
@@ -880,7 +981,7 @@ async fn post_json(
                 }
                 let destination = check_destination(&prepared.url, ceiling)?;
                 let target = logins::inherit(url, &destination);
-                let login = logins::apply(&target).map_err(str::to_string)?;
+                let login = if prepared.anonymous { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let request = match &login {
                     Some(applied) => check_destination(&applied.url, ceiling)?,
                     None => destination,
@@ -903,7 +1004,8 @@ async fn post_json(
                 }
                 init.set_headers(&headers);
                 init.set_body(&wasm_bindgen::JsValue::from_str(body));
-                if login.is_some() {
+                // No referrer from a credential-bearing address; an anonymous request sends no cookies.
+                if login.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -974,7 +1076,7 @@ async fn head(
                 }
                 let destination = check_destination(&prepared.url, ceiling)?;
                 let target = logins::inherit(bound, &destination);
-                let login = logins::apply(&target).map_err(str::to_string)?;
+                let login = if prepared.anonymous { None } else { logins::apply(&target).map_err(str::to_string)? };
                 let request = match &login {
                     Some(applied) => check_destination(&applied.url, ceiling)?,
                     None => destination.clone(),
@@ -998,7 +1100,8 @@ async fn head(
                     }
                     init.set_headers(&headers);
                 }
-                if login.is_some() {
+                // No referrer from a credential-bearing address; an anonymous request sends no cookies.
+                if login.is_some() || prepared.anonymous {
                     init.set_referrer_policy(web_sys::ReferrerPolicy::NoReferrer);
                     init.set_credentials(web_sys::RequestCredentials::Omit);
                 }
@@ -1128,7 +1231,10 @@ fn clipboard() -> Option<web_sys::Clipboard> {
 
 /// The browser's services. Embedded, settings live in memory for the visit: the page that embeds
 /// the app must not read what the user saved on the site.
-fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool) -> Services {
+/// `?embed` and a pull request preview never touch browser storage: embedded, preferences aren't
+/// kept (the page that embeds the app holds the work) and plugin settings last for the visit; in a
+/// preview, both last for the visit.
+fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, embedded: bool, preview: bool) -> Services {
     // Map tiles come through the browser's fetch (the app repaints when they arrive).
     rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::set_fetcher_with_origin(|url, ceiling, done, omit| {
         wasm_bindgen_futures::spawn_local(crate::request::handoff(
@@ -1163,28 +1269,38 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             done,
         ));
     });
+    // So are the token requests of ArcGIS connections made from a user and password.
+    rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::arcgis_token::set_generator(crate::arcgis::generate_token);
     let open_inbox = inbox.clone();
     let font_ctx = ctx.clone();
     let (gl_list_ctx, gl_run_ctx) = (ctx.clone(), ctx.clone());
     let font_sink = font_inbox.clone();
     let fetch_ctx = ctx.clone();
     let http_ctx = ctx.clone();
-    let (load_pref, save_pref) = crate::embed::pref_pair(
-        embedded,
-        |key: &str| storage().and_then(|s| s.get_item(&format!("rustgis.{key}")).ok().flatten()),
-        |key: &str, value: &str| {
-            if let Some(s) = storage() {
-                let _ = s.set_item(&format!("rustgis.{key}"), value);
-            }
-        },
-    );
+    let (load_pref, save_pref) = if preview && !embedded {
+        crate::embed::visit_prefs()
+    } else {
+        crate::embed::pref_pair(
+            embedded,
+            |key: &str| storage().and_then(|s| s.get_item(&format!("rustgis.{key}")).ok().flatten()),
+            |key: &str, value: &str| {
+                if let Some(s) = storage() {
+                    let _ = s.set_item(&format!("rustgis.{key}"), value);
+                }
+            },
+        )
+    };
     // Plugins' settings, bound before `with_services` restores the plugins that were installed.
-    rustgis_ui_egui::rustgis_engine::plugins::settings::set_browser_storage(plugin_settings_storage(embedded));
+    rustgis_ui_egui::rustgis_engine::plugins::settings::set_browser_storage(plugin_settings_storage(embedded || preview));
     let arcgis_ctx = ctx.clone();
+    let copernicus_ctx = ctx.clone();
     let clipboard_ctx = ctx.clone();
     Services {
+        save_project: None,
         // The browser's camera isn't asked yet (a phone's shell asks its own).
         take_photo: None,
+        // The browser gives egui's own fields its typing: no text field of its own is needed.
+        enter_text: None,
         // A text field's Paste: the page reads the clipboard (Firefox and Safari show a Paste
         // button to confirm, Chrome asks once); only over HTTPS, where the browser offers it.
         read_clipboard: clipboard().map(|clipboard| -> Box<dyn Fn(Slot<Result<String, String>>)> {
@@ -1202,6 +1318,9 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             })
         }),
         arcgis_sign_in: Some(Box::new(move |portal, client_id, slot| crate::arcgis::sign_in(portal, client_id, slot, arcgis_ctx.clone()))),
+        copernicus_sign_in: Some(Box::new(move |username, password, totp, slot| {
+            crate::copernicus::sign_in(username, password, totp, slot, copernicus_ctx.clone())
+        })),
         load_pref: Some(load_pref),
         save_pref: Some(save_pref),
         // No keychain in the browser: script on the page could read anything stored (#754).
@@ -1210,21 +1329,20 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
         recovery: None,
         fetch_font: Some(Box::new(move |url: &str| {
             let (url, inbox, ctx) = (url.to_string(), font_sink.clone(), font_ctx.clone());
-            let capture = Capture::current();
-            wasm_bindgen_futures::spawn_local(async move {
-                match fetch_bytes(&url, capture, None, &[]).await {
-                    Ok(bytes) => {
-                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((url, bytes));
-                        ctx.request_repaint();
-                    }
-                    Err(e) => {
-                        log::error!("couldn't load font {url}: {e}");
-                        // Empty bytes tell the app the download failed.
-                        inbox.lock().unwrap_or_else(|e| e.into_inner()).push((url, Vec::new()));
-                        ctx.request_repaint();
-                    }
-                }
-            });
+            let request = url.clone();
+            // Use the bounded internet-only transport, as native fallback fonts do.
+            rustgis_ui_egui::rustgis_engine::render::rustgis_tiles::cache::download_public_limited(
+                &request,
+                rustgis_ui_egui::rustgis_engine::render::fonts::MAX_FONT_BYTES,
+                Box::new(move |answer| {
+                    let bytes = answer.unwrap_or_else(|e| {
+                        log::warn!("couldn't load fallback font: {e}");
+                        Vec::new()
+                    });
+                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((url, bytes));
+                    ctx.request_repaint();
+                }),
+            );
         })),
         font_inbox: Some(font_inbox),
         open_async: Some(Box::new(move |purpose: &str| {
@@ -1235,13 +1353,18 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
             // So does a file picked for a tool's file parameter, which goes to the Tools pane.
             let tool_exts = purpose.strip_prefix(rustgis_ui_egui::TOOL_FILE_PURPOSE);
             let dxf = purpose.strip_prefix("dxf:");
+            let marker = purpose.strip_prefix("marker:");
             let mark = if let Some(id) = dxf {
                 format!("{}{id}:", rustgis_ui_egui::DXF_PICK)
+            } else if let Some(id) = marker {
+                format!("{}{id}:", rustgis_ui_egui::MARKER_PICK)
             } else {
                 match (purpose, tool_exts) {
                     ("shortcuts", _) => rustgis_ui_egui::SHORTCUT_PICK,
+                    ("script", _) => rustgis_ui_egui::SCRIPT_PICK,
                     ("text", _) => rustgis_ui_egui::DELIMITED_PICK,
                     ("shapefile", _) => rustgis_ui_egui::SHAPEFILE_PICK,
+                    ("assistantPicture", _) => rustgis_ui_egui::ASSISTANT_PICK,
                     (_, Some(_)) => rustgis_ui_egui::TOOL_FILE_PICK,
                     _ => "",
                 }
@@ -1252,6 +1375,8 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 if exts.is_empty() { rfd::AsyncFileDialog::new() } else { rfd::AsyncFileDialog::new().add_filter(exts.join(", "), &exts) }
             } else if purpose == "shortcuts" {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Keyboard shortcuts"), &["json", "rgisshortcuts"])
+            } else if purpose == "script" {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Script"), &["txt"])
             } else if purpose == "shapefile" {
                 rfd::AsyncFileDialog::new().add_filter("Shapefile", &["shp", "dbf", "shx", "prj", "cpg", "zip"])
             } else if purpose == "project" {
@@ -1291,20 +1416,25 @@ fn services(inbox: Inbox, font_inbox: Inbox, notes: Notes, ctx: egui::Context, e
                 )
             } else if dxf.is_some() {
                 rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("DXF drawing"), &["dxf"])
+            } else if purpose == "assistantPicture" {
+                rfd::AsyncFileDialog::new()
+                    .add_filter(rustgis_ui_egui::tl!("Pictures"), rustgis_ui_egui::rustgis_assistant::attach::EXTENSIONS)
+            } else if marker.is_some() {
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Pictures"), rustgis_ui_egui::MARKER_EXTENSIONS)
             } else if purpose == "picture" {
-                rfd::AsyncFileDialog::new().add_filter("Pictures", &["png", "jpg", "jpeg"])
+                rfd::AsyncFileDialog::new().add_filter(rustgis_ui_egui::tl!("Pictures"), &["png", "jpg", "jpeg"])
             } else {
-                rfd::AsyncFileDialog::new().add_filter("Vector and raster data", DATA_EXTS)
+                rfd::AsyncFileDialog::new().add_filter(
+                    "Vector and raster data",
+                    &[DATA_EXTS, &rustgis_ui_egui::rustgis_engine::data::raster::ELEVATION_EXTENSIONS[..]].concat(),
+                )
             };
-            // Data may come several files at once (photos gather in one layer).
-            let many = matches!(purpose, "data" | "shapefile");
-            let dxf = dxf.is_some();
+            // Data may come several files at once (photos gather in one layer), as may the
+            // assistant's pictures.
+            let many = matches!(purpose, "data" | "shapefile" | "assistantPicture");
             wasm_bindgen_futures::spawn_local(async move {
                 let files: Vec<rfd::FileHandle> =
                     if many { dialog.pick_files().await.unwrap_or_default() } else { dialog.pick_file().await.into_iter().collect() };
-                if dxf && files.is_empty() {
-                    inbox.lock().unwrap_or_else(|e| e.into_inner()).push((mark.clone(), Vec::new()));
-                }
                 read_together(files.iter().map(|f| f.inner().clone()).collect(), &mark, &inbox, notes).await;
                 ctx.request_repaint();
             });
@@ -1386,7 +1516,10 @@ fn keep_app_shortcuts(taken: TakenKeys) -> Result<(), String> {
         // As eframe reads it, Ctrl or ⌘ is egui's command on every platform, so the app's
         // shortcut runs on either and the browser's is kept from both.
         let command = e.ctrl_key() || e.meta_key();
-        if RustGisApp::takes_browser_key(&taken.borrow(), &e.key(), &e.code(), command, e.alt_key(), e.shift_key()) {
+        let (keys, find) = &*taken.borrow();
+        if RustGisApp::takes_browser_key(keys, &e.key(), &e.code(), command, e.alt_key(), e.shift_key())
+            || find.takes(&e.key(), &e.code(), command, e.alt_key(), e.shift_key())
+        {
             e.prevent_default();
         }
     });

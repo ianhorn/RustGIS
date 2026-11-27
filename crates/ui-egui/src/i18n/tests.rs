@@ -98,6 +98,16 @@ fn greek_registration_and_fallback() {
 }
 
 #[test]
+fn simplified_chinese_menu_and_settings_labels() {
+    let zh = Lang::from_code("zh").unwrap();
+    // The AppKit menu uses logical text; the ribbon looks up the complete formatted message.
+    assert_eq!(tr_raw(zh, "Settings…"), "设置…");
+    assert_eq!(tr_raw(zh, "Close Window"), "关闭窗口");
+    assert_eq!(fill_placeholders(tr(zh, "{name} (download)"), &[("name", "阿根廷")]), "阿根廷（需下载）");
+    assert_eq!(fill_placeholders(tr(zh, "Automatic ({kind})"), &[("kind", zh.name())]), "自动（简体中文）");
+}
+
+#[test]
 fn traditional_chinese_registration_and_fallback() {
     let tw = Lang::from_code("zh-tw").unwrap_or(Lang::EN);
     assert_eq!(Lang::from_code("zh-TW"), Some(tw));
@@ -355,6 +365,7 @@ fn context_lookup_fallback_macros_and_formatted_values() {
         script: Script::Alphabetic,
         source: "Open\tDefault\nverb\tOpen\tÖffnen\nstate\tOpen\tOffen\ncount\t{n} open\t{n} offen\nrtl\tOpen\tباز RustGIS\n",
         catalog: OnceLock::new(),
+        letters: OnceLock::new(),
         visual: OnceLock::new(),
     };
     let lang = Lang(&INFO);
@@ -374,4 +385,16 @@ fn context_lookup_fallback_macros_and_formatted_values() {
     });
     set_current(previous);
     result.unwrap();
+}
+
+/// Script marks, punctuation and numerals are required even when they are not alphabetic.
+#[test]
+fn catalog_coverage_keeps_script_marks_punctuation_and_numerals() {
+    for (code, marks) in [("bn", "়্।০"), ("lo", "່້໊໋໌ໍ"), ("fa", "ًِٔ،؛؟۰")] {
+        let lang = Lang::from_code(code).unwrap();
+        for mark in marks.chars() {
+            assert!(lang.0.source.contains(mark), "{code}: fixture mark is not in this catalog");
+            assert!(lang.letters().contains(&mark), "{code}: omitted U+{:04X}", u32::from(mark));
+        }
+    }
 }

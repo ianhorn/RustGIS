@@ -14,6 +14,7 @@ them, and the network permission when a plugin does. `ui.dialog` opens a panel o
 |---|---|---|
 | ArcGIS Portal… | Public items on ArcGIS Online or another portal | [Web services](#web-services) |
 | Boundaries… | A country's administrative boundaries (geoBoundaries) | [OpenStreetMap and administrative boundaries](#openstreetmap-and-administrative-boundaries) |
+| Copernicus Data Space… | Sign in to read CDSE's COGs (CLMS products, Sentinel mosaics) | [Copernicus Data Space](#copernicus-data-space) |
 | Dynamical… | Weather and climate Zarr stores | [Web services](#web-services) |
 | Earthdata GIS… | NASA's Earth science imagery, maps and features | [Web services](#web-services) |
 | Fields of the World… | Agricultural field boundaries, worldwide | [Fields of the World](#fields-of-the-world) |
@@ -482,8 +483,11 @@ The look is the tile layer's own style layers (`map.addTiles` takes MapLibre sty
 is from an [Overpass](https://overpass-api.de) server: a preset (buildings, roads, railways, water,
 land use, parks, points of interest or administrative boundaries) or tag filters such as
 `amenity=cafe, shop`. The answer becomes up to three layers, points, lines and polygons: closed
-ways that are areas (buildings, land use and the like, as OSM reads their tags) are polygons, and
-multipolygon and boundary relations are assembled from their members. A layer's fields are its 25
+ways that are areas (buildings, land use and the like, as OSM reads their tags, also behind a
+lifecycle prefix such as `destroyed:building`; the same reading as an `.osm.pbf` file) are
+polygons, and multipolygon and boundary relations are assembled from their members. The
+buildings preset asks for `building` only: the tag filter `destroyed:building` brings the
+buildings an earthquake or a fire took. A layer's fields are its 25
 most common tags, the rest in `other_tags` as GDAL writes them. The area can be up to 0.25 square
 degrees (about 50 × 50 km), and an answer up to 50,000 elements: the public servers are shared, so
 a larger area is better read from an extract (`.osm.pbf`). `"url"` names another Overpass server
@@ -571,9 +575,16 @@ The [Copernicus Data Space Ecosystem](https://dataspace.copernicus.eu) (CDSE) pu
 Copernicus Land Monitoring Service's global products (NDVI, LAI, Burnt Area, Water Bodies, Land
 Cover 100 m and 10 m, Tree Cover Density…) and the Sentinel-1 and Sentinel-2 mosaics as COGs. Its
 [STAC catalog](https://stac.dataspace.copernicus.eu/v1) is open, but its files need a sign-in with
-a free CDSE account. `copernicus.login` signs in with the account's username and password (and
-`"totp"`, the one-time code, for an account with two-factor authentication). The password is sent
-once, to CDSE's sign-in server (`identity.dataspace.copernicus.eu`), and never kept. The token it
+a free CDSE account. **Home › Add › Web Data › Copernicus Data Space…** signs in from a
+panel: username, password, the one-time code for an account with two-factor authentication, and
+**Remember on this computer** (`remember`, below). It shows whether a sign-in is kept, as whom and
+until when its token is renewed, and **Sign out** runs `copernicus.logout`. In the web app the
+panel sends the sign-in from the browser itself: there is no **Remember** there, and the sign-in
+lasts at most as long as the page. Its token is renewed meanwhile; if CDSE refuses a renewal, the
+sign-in ends sooner and the panel says it expired. `copernicus.login` signs in with the
+account's username and password (and `"totp"`, the one-time code, for an account with two-factor
+authentication). The password is sent only to CDSE's sign-in server
+(`identity.dataspace.copernicus.eu`), and kept only if remembered (below). The token it
 gives is kept until RustGIS closes, never in the project, and renewed before it expires; once it
 can't be renewed any more (after a long pause), the sign-in ends and `copernicus.status` says so.
 The token is sent only over HTTPS to CDSE's data servers (`download.dataspace.copernicus.eu` and
@@ -584,8 +595,19 @@ A collection's items list each band as an asset whose `alternate.https` address 
 server: add it with `layer.addUrl` (`"cog": true`, since the address ends in `$value`, and `"bbox"`
 for a window) and it is read in place, as any COG. A plugin does the same and never sees the token. `copernicus.status` reports the sign-in (as whom, when the token
 expires, until when it is renewed); `copernicus.logout` forgets it and empties the download cache.
-Signing in is for the desktop app and the command line; it isn't remembered between runs (a
-password typed in a command line stays in the shell's history).
+The command is for the desktop app and the command line (a password typed in a command line stays
+in the shell's history); the web app signs in from the panel.
+
+With `"remember": true`, the username and password are also kept on this computer, in the system's
+credential store (Windows Credential Manager, the macOS Keychain, the Secret Service on Linux; the
+command line's only when it opts in to saved secrets), never in the project or a setting. RustGIS
+then signs in by itself (sending the remembered password to CDSE's sign-in server): the desktop app
+when it starts, the command line when a command names a file on CDSE, and either one again
+whenever the sign-in ends.
+Signing in without `remember` deletes the one remembered before, and so does `copernicus.logout`;
+if CDSE refuses it (after a password change), it is deleted and `copernicus.status` says the
+sign-in expired. An account with two-factor authentication isn't remembered, since each sign-in
+needs its one-time code. `copernicus.status` says whether a sign-in is remembered.
 
 ```sh
 rustgis-cli run --cmd 'copernicus.login={"username":"you@example.org","password":"…"}' --cmd 'layer.addUrl={"url":"https://download.dataspace.copernicus.eu/odata/v1/Products(…)/Nodes(…)/Nodes(….tif)/$value","cog":true,"bbox":[-43.0,-20.84,-42.75,-20.65]}'
@@ -633,7 +655,7 @@ Several **Home › Add › Web Data** entries open the same search on one servic
 | **ArcGIS Portal…** (`arcgis-portal`) | Public items on [ArcGIS Online](https://www.arcgis.com), or on the portal whose address is given: feature, map, image and vector tile services, and GeoJSON files | The service (Add From Service), or the file |
 | **Dynamical…** (`dynamical`) | Weather and climate datasets from [dynamical.org](https://dynamical.org) (NOAA GFS, GEFS and HRRR, ECMWF, DWD ICON…); **Add** opens the dataset's Zarr store in the pane to pick a variable and its time steps (a dataset published only as Icechunk says so) | A Zarr variable's map |
 | **Earthdata GIS…** (`earthdata-gis`) | NASA's [Earthdata GIS](https://gis.earthdata.nasa.gov/portal) portal: Earth science imagery, maps and features | The service |
-| **GeoLens…** (`geolens`) | A [GeoLens](https://getgeolens.com) server's vector datasets (`https://datasets.geolibre.app` by default) | Features, the first 1,000 |
+| **GeoLens…** (`geolens`) | A [GeoLens](https://getgeolens.com) server's vector datasets (`https://datasets.geolibre.app` by default) | Features, every page of them (`portal.add` with `"use": "features"`) |
 | **Hugging Face…** (`huggingface`) | Datasets on [Hugging Face](https://huggingface.co/datasets) by name, or one by `owner/name`; **Browse Files** (`portal.files`) lists its GeoTIFFs, GeoParquet, GeoJSON, FlatGeobuf, GeoPackage, PMTiles, LiDAR and other files (public, not gated) | The file |
 | **Ocean Data Platform…** (`ocean-data`) | [HUB Ocean](https://app.hubocean.earth)'s marine datasets, searched by words | Features, up to 10,000 |
 | **OpenAerialMap…** (`openaerialmap`) | Drone and aerial images on [OpenAerialMap](https://openaerialmap.org) where the map is, newest first | A COG, read in place |
@@ -789,7 +811,7 @@ their footprints drawn as a layer.
 | **AlphaEarth Foundations** (Google's Satellite Embedding; 64 values a 10 m pixel, 2017–2025) | Finds the year's UTM tiles where the map is in the dataset's GeoParquet index on [Source Cooperative](https://source.coop/tge-labs/aef), read in place (its bounding boxes, then the rows that meet the map). **Add** shows a tile as a cloud-optimised GeoTIFF read in place: three bands (**Bands**, from 1; A01, A16 and A09 by default) as red, green and blue, dequantised (`sign(v)·(v/127.5)²`) and stretched over ±**Stretch** (0.3). Only the three bands shown are read, a band at a time. **Apply to layers** shows other bands or another stretch on the tiles already added. With **All years, on the time slider**, the search finds each tile's file of every year (2017–2025, matched by place, since each year's files have names of their own) and **Add years** shows them as one tile layer that follows the time slider, a year a step (turned on over the years when it is off); a year a tile has no file for shows nothing, and is said. |
 | **Earth Index** (Earth Genome; 384 values every ~320 m, 2024) | Names the Sentinel-2 (MGRS) tiles where the map is and keeps those with a file. **Add points** reads the file's points in the view in place (every point's position, then the vectors of those in view: zoom to a few kilometres) and colours them by their vectors' first three principal components (64 colours); **Keep value** keeps one of each vector's values as the points' `value` field. |
 | **Tessera** (Cambridge; 128 values a 10 m pixel, 2017–2025) | **Add view** reads three bands (1, 2 and 3 by default) of the view from Tessera's [Zarr store](https://data.source.coop/tessera/tessera/zarr/v1.1-dclimate) in place (the shard's index, then the chunks the view needs: at most about 6 km a side, its centre when the view is larger), as a 32-bit raster in UTM. |
-| **OlmoEarth v1.3** (Ai2; 128 values a 10 m pixel, 2017–2025; the first 64 are a whole embedding on their own) | **Add view** reads three bands (1, 2 and 3 by default) of the view from OlmoEarth's [Zarr store](https://source.coop/olmoearth/olmoearth-v1-3-embeddings) in place, as for Tessera: the shard's index, then the chunks the view needs, of only the bands shown (a chunk holds 64 bands, so three of the first 64 read half the data): at most about 5 km a side, its centre when the view is larger. Values are dequantised (`sign(q)·(q/127.5)²`). Its licence, the OlmoEarth Artifact License, asks to cite Ai2 and forbids military, surveillance, policing and extractive uses (such as mining, drilling or deforestation), terms that go with what is made from it; `embeddings.add` returns them as `"license"`. |
+| **OlmoEarth v1.3** (Ai2; 128 values a 10 m pixel, 2017–2025; the first 64 are a whole embedding on their own) | **Add view** reads three bands (1, 2 and 3 by default) of the view from OlmoEarth's [Zarr store](https://source.coop/olmoearth/olmoearth-v1-3-embeddings) in place, as for Tessera: the shard's index, then the chunks the view needs, of only the bands shown (a chunk holds 64 bands, so three of the first 64 read half the data): at most about 5 km a side (about 2.5 km in the browser), its centre when the view is larger. Values are dequantised (`sign(q)·(q/127.5)²`). Its licence, the OlmoEarth Artifact License, asks to cite Ai2 and forbids military, surveillance, policing and extractive uses (such as mining, drilling or deforestation), terms that go with what is made from it; `embeddings.add` returns them as `"license"`. |
 | **Clay**, **Major TOM**, **Copernicus-Embed** | Listed with links to their data and papers; RustGIS doesn't read them. |
 
 AlphaEarth's tiles are tile layers that keep their look in their address
@@ -817,9 +839,17 @@ extent (or `"bbox"`), reading one AlphaEarth tile's window by range, all 64 band
 no value.
 
 - `embeddings.similarity` (`"point"`: [longitude, latitude], or `"points"`: up to 1000 of them,
-  averaged; `"year"`, 2024 by default): each cell's cosine similarity to the reference's embedding,
-  from −1 to 1. 1 is a place like the reference. Reference points outside the area read, or on no
-  data, are left out and said.
+  averaged, or a point layer's name or id; `"year"`, 2024 by default): each cell's cosine similarity
+  to the reference's embedding, from −1 to 1. 1 is a place like the reference. Reference points
+  outside the area read, or on no data, are left out and said. Of a layer, the points are its
+  selected features', or all of them when none is selected, that its definition query keeps (as for
+  the geoprocessing tools; the time slider and display filters don't apply), with each point of a
+  multipoint counted: more than 1000 are refused. It says when they are only some of the layer's
+  features, and how many have no geometry, aren't points or have a place that can't be given in
+  longitude/latitude, and that a definition query it can't read isn't applied; the answer's
+  `reference` names the layer, how many features gave points and whether they were selected or filtered.
+  A layer read in place holds only the features in view: select the ones to use, or load them all
+  first. The area is the map's extent or `"bbox"`, as with a list, not the layer's extent.
 - `embeddings.change` (`"from"`, 2017 by default, and `"to"`, 2025): how far each cell's embedding
   moved between the two years, 1 − their cosine, from 0 (unchanged) to 2.
 
@@ -831,6 +861,7 @@ saves its values as a GeoTIFF, and `share.exportMap` a PNG preview of the map:
 
 ```sh
 rustgis-cli run --cmd 'embeddings.similarity={"dataset":"alphaearth","year":2024,"point":[-42.88,-20.75],"bbox":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'share.exportRaster={"layer":"AlphaEarth 2024 similarity","path":"aef_similarity.tif"}' --cmd 'share.exportMap={"path":"aef_similarity.png"}'
+rustgis-cli run --cmd 'layer.addData={"path":"samples.geojson"}' --cmd 'embeddings.similarity={"dataset":"alphaearth","year":2024,"points":"samples","bbox":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'share.exportRaster={"layer":"AlphaEarth 2024 similarity","path":"aef_like_samples.tif"}'
 rustgis-cli run --cmd 'embeddings.change={"dataset":"alphaearth","from":2017,"to":2025,"bbox":[-42.91,-20.78,-42.85,-20.735]}' --cmd 'share.exportRaster={"layer":"AlphaEarth change 2017–2025","path":"aef_change.tif"}' --cmd 'share.exportMap={"path":"aef_change.png"}'
 ```
 

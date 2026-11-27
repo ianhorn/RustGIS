@@ -8,7 +8,7 @@
 //! sample are passed over without being fetched.
 
 use super::remote::{self, Remote};
-use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp_limit, in_request, stride};
+use super::{Batch, FeatureSource, Reproject, Request, Sampler, SourceInfo, clamp_limit, stride};
 use crate::raster::Crs;
 use crate::{DataError, Feature, Field, FieldType, GeometryType, Result, Value, wkb};
 use flatgeobuf::geozero::{ColumnValue, CoordDimensions, PropertyProcessor, ToWkb};
@@ -29,22 +29,84 @@ pub(crate) fn header_feature_count(path: &Path) -> Result<u64> {
     Ok(reader.header().features_count())
 }
 
+/// The system a FlatGeobuf header says, read as a GeoPackage row's is ([`super::declared_reproject`]).
+fn header_reproject(header_crs: Option<flatgeobuf::Crs<'_>>, notes: &mut crate::loss::Notes) -> Result<Reproject> {
+    // The header's system is read as a GeoPackage row's is ([`super::declared_reproject`]): by
+    // its EPSG code, or by its WKT when the WKT gives another shift to WGS 84 or there is no
+    // EPSG code (#1855). The code is an EPSG one only when the organization is EPSG (or not
+    // given, which means EPSG); 0 is none.
+    let organization = header_crs.and_then(|c| c.org());
+    let epsg_org = organization.is_none_or(|o| o.eq_ignore_ascii_case("epsg"));
+    let code = header_crs.map(|c| i64::from(c.code())).filter(|c| *c != 0);
+    let declared = super::DeclaredCrs {
+        what: "its coordinate system",
+        organization,
+        code,
+        epsg: code.and_then(|c| u32::try_from(c).ok()).filter(|_| epsg_org),
+        wkt1: super::defined(header_crs.and_then(|c| c.wkt())),
+        wkt2: None,
+    };
+    Ok(match super::declared_reproject(declared, notes) {
+        Some(reproject) => reproject?,
+        // Nothing to read it by: longitude/latitude, said when another organization's code
+        // names the system, or a negative code, which can't be an EPSG one.
+        None => {
+            if !epsg_org && let Some(org) = organization {
+                notes.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::AssumedCrs,
+                    format!("its coordinate system is defined by {org}, not EPSG; read as longitude/latitude"),
+                ));
+            } else if let Some(code) = code {
+                notes.push(crate::loss::Note::loss(
+                    crate::loss::LossCode::AssumedCrs,
+                    format!("its coordinate system's code {code} isn't an EPSG code; read as longitude/latitude"),
+                ));
+            }
+            Reproject::from_crs(Crs::LonLat, notes)
+        }
+    })
+}
+
+/// The system RustGIS reads a FlatGeobuf in, from its header alone (no feature is read): the
+/// outer error when the header can't be read, the inner one when the system it says is refused
+/// (another body's that can't be placed).
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn header_coord_crs(path: &Path) -> Result<Result<Crs>> {
+    let reader = open_reader(BufReader::new(std::fs::File::open(path)?))?;
+    Ok(header_reproject(reader.header().crs(), &mut crate::loss::Notes::new()).map(|r| r.crs()))
+}
+
+/// Whether a FlatGeobuf's header says WGS 84 longitude/latitude or no system: EPSG:4326 (or no
+/// organization with 4326), OGC CRS84, or a definition read as longitude/latitude.
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) fn header_says_wgs84(path: &Path) -> bool {
+    let Ok(reader) = std::fs::File::open(path).map_err(DataError::from).and_then(|f| open_reader(BufReader::new(f))) else { return false };
+    let Some(crs) = reader.header().crs() else { return true };
+    let org = crs.org().unwrap_or("EPSG");
+    (org.eq_ignore_ascii_case("epsg") && crs.code() == 4326)
+        || (org.eq_ignore_ascii_case("ogc") && crs.code_string().is_some_and(|c| c.eq_ignore_ascii_case("CRS84")))
+        || crs.wkt().is_some_and(|w| crate::raster::wkt::read_wkt(w).is_ok_and(|(c, _)| c == Crs::LonLat))
+}
+
 /// A file or an upload, read and seeked.
 trait ReadSeek: Read + Seek {}
 impl<T: Read + Seek> ReadSeek for T {}
 
 #[derive(Clone, Debug)]
 enum Input {
-    Path(PathBuf, Option<PathBuf>),
+    /// A file, and for a conversion its original's fingerprints as they were when it was
+    /// opened ([`crate::provenance::snapshot`]).
+    Path(PathBuf, Option<Arc<Vec<crate::provenance::Fingerprint>>>),
     Bytes(super::Shared),
     /// A file by its web address.
     Remote(Arc<Remote>),
 }
 
-/// Opens the physical conversion while attributing reads to the original local input.
-fn open_input_file(path: &Path, original: Option<&Path>) -> std::io::Result<std::fs::File> {
+/// Opens the physical conversion while attributing reads to the original local input, as it was
+/// when the conversion was opened: a later change to the original isn't what this conversion holds.
+fn open_input_file(path: &Path, original: Option<&[crate::provenance::Fingerprint]>) -> std::io::Result<std::fs::File> {
     if let Some(original) = original {
-        crate::provenance::path(original);
+        crate::provenance::record(original.iter().cloned());
         std::fs::File::open(path)
     } else {
         crate::provenance::open(path)
@@ -90,7 +152,7 @@ impl FgbOpen {
                     date_columns.len()
                 )),
                 Input::Path(path, original) => {
-                    src.classify_dates(BufReader::new(open_input_file(path, original.as_deref())?), &date_columns)?
+                    src.classify_dates(BufReader::new(open_input_file(path, original.as_deref().map(Vec::as_slice))?), &date_columns)?
                 }
                 Input::Bytes(bytes) => src.classify_dates(Cursor::new(bytes.clone()), &date_columns)?,
             }
@@ -112,11 +174,9 @@ impl FgbSource {
     /// Reads a GDAL conversion's header, retaining its source identity for later worker reads.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn prepare_converted_path(path: &Path, name: &str, original: &Path) -> Result<FgbOpen> {
-        Self::prepare(
-            BufReader::new(open_input_file(path, Some(original))?),
-            Input::Path(path.to_path_buf(), Some(original.to_path_buf())),
-            name,
-        )
+        let ((), seen) = crate::provenance::snapshot(|| crate::provenance::path(original));
+        let seen = Arc::new(seen);
+        Self::prepare(BufReader::new(open_input_file(path, Some(&seen))?), Input::Path(path.to_path_buf(), Some(seen)), name)
     }
 
     /// Opens a GDAL conversion without treating its cache or workspace file as a user input.
@@ -141,14 +201,6 @@ impl FgbSource {
     pub fn open_path(path: &Path, name: &str) -> Result<Self> {
         let f = BufReader::new(crate::provenance::open(path)?);
         Self::new(f, Input::Path(path.to_path_buf(), None), name)
-    }
-
-    /// Opens a private conversion, keeping its files alive for every shared reader.
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn open_owned_path(path: &Path, name: &str, workspace: Arc<super::gdal::ReloadWorkspace>) -> Result<Self> {
-        let mut source = Self::open_path(path, name)?;
-        source._workspace = Some(workspace);
-        Ok(source)
     }
 
     pub fn open_bytes(bytes: Vec<u8>, name: &str) -> Result<Self> {
@@ -181,36 +233,8 @@ impl FgbSource {
     fn prepare<R: Read + Seek>(r: R, input: Input, name: &str) -> Result<FgbOpen> {
         let reader = open_reader(r)?;
         let h = reader.header();
-        let mut notes = Vec::new();
-        // The header's system is read as a GeoPackage row's is ([`super::declared_reproject`]): by
-        // its EPSG code, or by its WKT when the WKT gives another shift to WGS 84 or there is no
-        // EPSG code (#1855). The code is an EPSG one only when the organization is EPSG (or not
-        // given, which means EPSG); 0 is none.
-        let header_crs = h.crs();
-        let organization = header_crs.and_then(|c| c.org());
-        let epsg_org = organization.is_none_or(|o| o.eq_ignore_ascii_case("epsg"));
-        let code = header_crs.map(|c| i64::from(c.code())).filter(|c| *c != 0);
-        let declared = super::DeclaredCrs {
-            what: "its coordinate system",
-            organization,
-            code,
-            epsg: code.and_then(|c| u32::try_from(c).ok()).filter(|_| epsg_org),
-            wkt1: super::defined(header_crs.and_then(|c| c.wkt())),
-            wkt2: None,
-        };
-        let reproject = match super::declared_reproject(declared, &mut notes) {
-            Some(reproject) => reproject?,
-            // Nothing to read it by: longitude/latitude, said when another organization's code
-            // names the system, or a negative code, which can't be an EPSG one.
-            None => {
-                if !epsg_org && let Some(org) = organization {
-                    notes.push(format!("its coordinate system is defined by {org}, not EPSG; read as longitude/latitude"));
-                } else if let Some(code) = code {
-                    notes.push(format!("its coordinate system's code {code} isn't an EPSG code; read as longitude/latitude"));
-                }
-                Reproject::from_crs(Crs::LonLat, &mut notes)
-            }
-        };
+        let mut notes = crate::loss::Notes::new();
+        let reproject = header_reproject(h.crs(), &mut notes)?;
         let mut date_columns = Vec::new();
         let mut fields = Vec::new();
         let mut slots = Vec::new();
@@ -289,6 +313,7 @@ impl FgbSource {
         crate::progress::begin(self.info.count.and_then(|n| usize::try_from(n).ok()).unwrap_or(0));
         let mut states = vec![0u8; self.info.fields.len()];
         let mut iter = open_reader(reader)?.select_all().map_err(err)?;
+        let kind = iter.geometry_type();
         while let Some(feature) = iter.next().map_err(err)? {
             crate::progress::step(1)?;
             let mut props = Props {
@@ -298,9 +323,14 @@ impl FgbSource {
                 unread_dates: Vec::new(),
                 rounded_dates: Vec::new(),
             };
-            // Reads skip a feature with unreadable properties and report it in Batch::skipped.
-            // Such a feature must not influence the inferred date type either.
-            if !properties_fit(feature, &self.kinds) || feature.process_properties(&mut props).is_err() {
+            // Reads skip a feature with unreadable properties or geometry and report it in
+            // Batch::skipped. Such a feature must not influence the inferred date type either: its
+            // geometry is converted as a read converts it, which costs this pass one conversion of
+            // each geometry. A cheaper check would have to copy what the conversion refuses.
+            if geometry_of(feature, kind).is_none()
+                || !properties_fit(feature, &self.kinds)
+                || feature.process_properties(&mut props).is_err()
+            {
                 continue;
             }
             for &k in columns {
@@ -336,7 +366,7 @@ impl FgbSource {
     /// counts features and checks Cancel between them.
     fn read_with<R: Read + Seek>(&self, open: &impl Fn() -> Result<R>, req: &Request, scan: bool) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = self.reproject.request_box(req);
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
             return Err(super::unbounded_count());
@@ -370,6 +400,7 @@ impl FgbSource {
         if late {
             crate::progress::begin(usize::try_from(matched).unwrap_or(0));
         }
+        let kind = iter.geometry_type();
         while let Some(f) = iter.next().map_err(err)? {
             if late {
                 crate::progress::step(1)?;
@@ -380,14 +411,15 @@ impl FgbSource {
             if !late && !sample.wants() {
                 continue;
             }
-            let geometry = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
+            let geometry = geometry_of(f, kind).and_then(|g| self.reproject.place(g, req));
             let Some(geometry) = geometry else {
                 out.skipped += 1;
                 continue;
             };
-            if !in_request(&geometry, req) || (late && !sample.wants()) {
+            if !geometry.inside || (late && !sample.wants()) {
                 continue;
             }
+            let geometry = geometry.geometry;
             let mut props = Props {
                 fields: &self.info.fields,
                 slots: &self.slots,
@@ -419,7 +451,7 @@ impl FgbSource {
         extent: Option<Extent>,
         chunks: &mut super::chunk_memory::Chunker<'_>,
     ) -> Result<Batch> {
-        let req = Request { extent, limit: usize::MAX };
+        let req = Request { extent, limit: usize::MAX, own: None };
         let reader = open_reader(open()?)?;
         let native = extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
         let indexed = native.filter(|_| self.info.indexed);
@@ -441,18 +473,20 @@ impl FgbSource {
         let mut out = Batch { complete: true, ..Batch::default() };
         let mut n = 0u64;
         crate::progress::begin(iter.features_count().unwrap_or(0));
+        let kind = iter.geometry_type();
         while let Some(f) = iter.next().map_err(err)? {
             crate::progress::step(1)?;
             n += 1;
             let id = numbers.as_ref().and_then(|v| v.get(usize::try_from(n - 1).unwrap_or(usize::MAX)).copied()).unwrap_or(n);
-            let geometry = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
+            let geometry = geometry_of(f, kind).and_then(|g| self.reproject.place(g, &req));
             let Some(geometry) = geometry else {
                 out.skipped += 1;
                 continue;
             };
-            if !in_request(&geometry, &req) {
+            if !geometry.inside {
                 continue;
             }
+            let geometry = geometry.geometry;
             let mut props = Props {
                 fields: &self.info.fields,
                 slots: &self.slots,
@@ -478,9 +512,10 @@ impl FgbSource {
     fn peek_kind(&self) -> GeometryType {
         let first = |r: Box<dyn ReadSeek>| -> Option<GeometryType> {
             let mut iter = open_reader(r).ok()?.select_all().ok()?;
+            let kind = iter.geometry_type();
             for _ in 0..16 {
                 let f = iter.next().ok()??;
-                if let Some(g) = f.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode) {
+                if let Some(g) = geometry_of(f, kind) {
                     return Some(g.kind());
                 }
             }
@@ -488,7 +523,7 @@ impl FgbSource {
         };
         let r: Option<Box<dyn ReadSeek>> = match &self.input {
             Input::Path(p, original) => {
-                open_input_file(p, original.as_deref()).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
+                open_input_file(p, original.as_deref().map(Vec::as_slice)).ok().map(|f| Box::new(BufReader::new(f)) as Box<dyn ReadSeek>)
             }
             Input::Bytes(b) => Some(Box::new(Cursor::new(b.clone()))),
             Input::Remote(f) => Some(Box::new(remote::Reader::new(f.clone()))),
@@ -662,7 +697,7 @@ impl FgbSource {
     /// spatial read scans every candidate within the budget, counting features and checking Cancel.
     fn read_remote(&self, f: &Arc<Remote>, req: &Request) -> Result<Batch> {
         let limit = clamp_limit(req.limit);
-        let native = req.extent.and_then(|e| self.reproject.extent_from_lonlat(&e));
+        let native = self.reproject.request_box(req);
         // Preserve ordinary candidate counts; a refused view needs a geometry scan to count.
         if limit == 0 && req.extent.is_some() && native.is_none() {
             return Err(super::unbounded_count());
@@ -747,6 +782,7 @@ impl FgbSource {
         if late {
             crate::progress::begin(n);
         }
+        let kind = iter.geometry_type();
         while let Some(feat) = iter.next().map_err(err)? {
             if late {
                 crate::progress::step(1)?;
@@ -757,15 +793,15 @@ impl FgbSource {
                 continue;
             }
             let id = hits.items.get(this).map(|(_, i)| i + 1).unwrap_or(this as u64 + 1);
-            let geometry =
-                feat.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode).and_then(|g| self.reproject.geometry(g));
+            let geometry = geometry_of(feat, kind).and_then(|g| self.reproject.place(g, req));
             let Some(geometry) = geometry else {
                 out.skipped += 1;
                 continue;
             };
-            if !in_request(&geometry, req) || (late && !sample.wants()) {
+            if !geometry.inside || (late && !sample.wants()) {
                 continue;
             }
+            let geometry = geometry.geometry;
             let mut props = Props {
                 fields: &self.info.fields,
                 slots: &self.slots,
@@ -806,9 +842,20 @@ impl FeatureSource for FgbSource {
         &self.info
     }
 
+    fn reads_own_box(&self) -> bool {
+        true
+    }
+
+    /// Its own system, in which it gives its features as the file holds them.
+    fn coord_crs(&self) -> crate::raster::Crs {
+        self.reproject.crs()
+    }
+
     fn read(&self, req: &Request) -> Result<Batch> {
         match &self.input {
-            Input::Path(p, original) => self.read_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref())?)), req, false),
+            Input::Path(p, original) => {
+                self.read_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref().map(Vec::as_slice))?)), req, false)
+            }
             Input::Bytes(b) => self.read_with(&|| Ok(Cursor::new(b.clone())), req, false),
             Input::Remote(f) => self.read_remote(f, req),
         }
@@ -832,7 +879,7 @@ impl FeatureSource for FgbSource {
         let mut chunks = super::chunk_memory::Chunker::new(bytes, visit)?;
         match &self.input {
             Input::Path(p, original) => {
-                self.visit_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref())?)), extent, &mut chunks)
+                self.visit_with(&|| Ok(BufReader::new(open_input_file(p, original.as_deref().map(Vec::as_slice))?)), extent, &mut chunks)
             }
             Input::Bytes(b) => self.visit_with(&|| Ok(Cursor::new(b.clone())), extent, &mut chunks),
             Input::Remote(_) => Err(DataError::Unsupported("a whole FlatGeobuf by its web address read a chunk at a time".into())),
@@ -880,6 +927,80 @@ fn field_type(t: ColumnType) -> Option<FieldType> {
         ColumnType::Bool => FieldType::Boolean,
         ColumnType::Binary => return None,
         _ => FieldType::Text,
+    })
+}
+
+/// A feature's geometry as a read takes it, or `None` when it can't be read: also when it doesn't
+/// hold what the reader indexes ([`geometry_fits`]). `kind` is the file's geometry type, from its
+/// header. Reads and the date pass all convert through this, so they skip the same features.
+fn geometry_of(feature: &flatgeobuf::FgbFeature, kind: GeometryKind) -> Option<crate::Geometry> {
+    if !geometry_fits(feature, kind) {
+        return None;
+    }
+    feature.to_wkb(CoordDimensions::xy()).ok().as_deref().and_then(wkb::decode)
+}
+
+type GeometryKind = flatgeobuf::GeometryType;
+
+/// Whether a feature's geometry holds what flatgeobuf 6.0.1 reads from it, in it and in each of its
+/// parts: an even number of `xy` values, ring or line ends that never go back and stay within them,
+/// and a coordinate where a point is read. The reader indexes `xy` by the ends the file gives, and
+/// reads a point's first coordinate whatever `xy` holds; past the end, or on an end before the one
+/// before it, it panics, which the browser can't catch. A feature that fails this is skipped as
+/// unreadable, as one whose geometry the reader refuses. Found by fuzzing `read_layers` (#3006).
+fn geometry_fits(feature: &flatgeobuf::FgbFeature, kind: GeometryKind) -> bool {
+    // As the reader does: the file's type, or the feature's own when the file says Unknown.
+    feature.fbs_feature().geometry().is_none_or(|g| {
+        let kind = if kind == GeometryKind::Unknown { g.type_() } else { kind };
+        geometry_part_fits(&g, kind, 0)
+    })
+}
+
+/// [`geometry_fits`] for `g`, read as `kind`.
+fn geometry_part_fits(g: &flatgeobuf::Geometry<'_>, kind: GeometryKind, depth: u32) -> bool {
+    use GeometryKind as K;
+    // Parts within parts are a collection's; a file nesting them deeper is refused, not followed.
+    if depth > 32 {
+        return false;
+    }
+    // These are read from their parts alone: their own xy and ends are never looked at.
+    let from_parts = matches!(
+        kind,
+        K::MultiPolygon
+            | K::PolyhedralSurface
+            | K::GeometryCollection
+            | K::MultiCurve
+            | K::MultiSurface
+            | K::CompoundCurve
+            | K::CurvePolygon
+    );
+    if !from_parts {
+        let values = g.xy().map_or(0, |xy| xy.len());
+        // A point is read from its own first coordinate.
+        if !values.is_multiple_of(2) || (kind == K::Point && values < 2) {
+            return false;
+        }
+        // Ends are read only for these kinds, and only when there are two or more of them.
+        let reads_ends = matches!(kind, K::Polygon | K::MultiLineString | K::Triangle | K::TIN);
+        if let Some(ends) = g.ends().filter(|ends| reads_ends && ends.len() > 1) {
+            let mut last = 0usize;
+            for end in ends.iter() {
+                let end = usize::try_from(end).unwrap_or(usize::MAX);
+                if end < last || end.saturating_mul(2) > values {
+                    return false;
+                }
+                last = end;
+            }
+        }
+        // Read from its own xy alone: parts it carries are never looked at.
+        return true;
+    }
+    // A multi-polygon's parts are read as polygons whatever they say; the rest by their own type.
+    g.parts().is_none_or(|parts| {
+        parts.iter().all(|part| {
+            let read_as = if matches!(kind, K::MultiPolygon | K::PolyhedralSurface) { K::Polygon } else { part.type_() };
+            geometry_part_fits(&part, read_as, depth + 1)
+        })
     })
 }
 
@@ -1143,6 +1264,113 @@ fn write_run(
     fed?;
     w.write(out).map_err(err)?;
     Ok(Some(left_out))
+}
+
+#[cfg(test)]
+mod geometry_fits_tests {
+    use super::{GeometryKind, geometry_part_fits};
+    use flatbuffers::FlatBufferBuilder;
+    use flatgeobuf::{Geometry, GeometryArgs};
+
+    /// `g`, built in a buffer of its own, as the reader would see it.
+    fn fits(build: impl FnOnce(&mut FlatBufferBuilder<'static>) -> flatbuffers::WIPOffset<Geometry<'static>>, kind: GeometryKind) -> bool {
+        let mut fbb = FlatBufferBuilder::new();
+        let root = build(&mut fbb);
+        fbb.finish(root, None);
+        let g = flatbuffers::root::<Geometry>(fbb.finished_data()).unwrap();
+        geometry_part_fits(&g, kind, 0)
+    }
+
+    fn square<'a>(fbb: &mut FlatBufferBuilder<'a>) -> flatbuffers::WIPOffset<Geometry<'a>> {
+        let xy = fbb.create_vector(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+        Geometry::create(fbb, &GeometryArgs { xy: Some(xy), type_: GeometryKind::Polygon, ..Default::default() })
+    }
+
+    /// A multi-polygon whose own `xy` is there but empty reads from its parts, so it fits; a point
+    /// with an empty or absent `xy` doesn't, nor a collection's point part (#3006).
+    #[test]
+    fn a_point_is_held_to_its_coordinate_and_a_multi_part_geometry_is_not() {
+        let multi = |kind| {
+            fits(
+                |fbb| {
+                    let part = square(fbb);
+                    let parts = fbb.create_vector(&[part]);
+                    let xy = fbb.create_vector::<f64>(&[]);
+                    Geometry::create(fbb, &GeometryArgs { xy: Some(xy), parts: Some(parts), type_: kind, ..Default::default() })
+                },
+                kind,
+            )
+        };
+        assert!(multi(GeometryKind::MultiPolygon));
+        assert!(multi(GeometryKind::GeometryCollection), "its polygon part fits");
+        // Read as a point, as a file whose header says Point reads it: refused.
+        assert!(!multi(GeometryKind::Point));
+        let empty_point = |fbb: &mut FlatBufferBuilder<'static>| {
+            let xy = fbb.create_vector::<f64>(&[]);
+            Geometry::create(fbb, &GeometryArgs { xy: Some(xy), type_: GeometryKind::Point, ..Default::default() })
+        };
+        assert!(!fits(empty_point, GeometryKind::Point));
+        let no_xy = |fbb: &mut FlatBufferBuilder<'static>| {
+            Geometry::create(fbb, &GeometryArgs { type_: GeometryKind::Point, ..Default::default() })
+        };
+        assert!(!fits(no_xy, GeometryKind::Point), "a point with no xy at all is refused too");
+        let collection = fits(
+            |fbb| {
+                let point = empty_point(fbb);
+                let parts = fbb.create_vector(&[point]);
+                Geometry::create(fbb, &GeometryArgs { parts: Some(parts), type_: GeometryKind::GeometryCollection, ..Default::default() })
+            },
+            GeometryKind::GeometryCollection,
+        );
+        assert!(!collection, "a collection reads its point part as a point");
+        assert!(fits(square, GeometryKind::Polygon));
+        // A multi-polygon's own xy, odd or not, is never read; a polygon's is, parts or not.
+        let odd_own = |kind| {
+            fits(
+                |fbb| {
+                    let part = square(fbb);
+                    let parts = fbb.create_vector(&[part]);
+                    let xy = fbb.create_vector(&[1.0, 2.0, 3.0]);
+                    Geometry::create(fbb, &GeometryArgs { xy: Some(xy), parts: Some(parts), type_: kind, ..Default::default() })
+                },
+                kind,
+            )
+        };
+        assert!(odd_own(GeometryKind::MultiPolygon));
+        assert!(!odd_own(GeometryKind::Polygon));
+        // A polygon's parts are never read, so a broken one doesn't refuse it.
+        let polygon_with_broken_part = fits(
+            |fbb| {
+                let xy = fbb.create_vector(&[1.0, 2.0, 3.0]);
+                let part = Geometry::create(fbb, &GeometryArgs { xy: Some(xy), type_: GeometryKind::Point, ..Default::default() });
+                let parts = fbb.create_vector(&[part]);
+                let xy = fbb.create_vector(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+                Geometry::create(
+                    fbb,
+                    &GeometryArgs { xy: Some(xy), parts: Some(parts), type_: GeometryKind::Polygon, ..Default::default() },
+                )
+            },
+            GeometryKind::Polygon,
+        );
+        assert!(polygon_with_broken_part);
+        // Stray ends are refused only where the reader follows them: on a polygon, two or more.
+        let with_ends = |kind, ends: &'static [u32]| {
+            fits(
+                |fbb| {
+                    let xy = fbb.create_vector(&[0.0, 0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 0.0]);
+                    let ends = fbb.create_vector(ends);
+                    Geometry::create(fbb, &GeometryArgs { xy: Some(xy), ends: Some(ends), type_: kind, ..Default::default() })
+                },
+                kind,
+            )
+        };
+        assert!(with_ends(GeometryKind::LineString, &[9, 2]));
+        assert!(with_ends(GeometryKind::MultiPoint, &[9, 2]));
+        assert!(with_ends(GeometryKind::Polygon, &[9]), "one end is never read");
+        assert!(!with_ends(GeometryKind::Polygon, &[2, 9]));
+        assert!(!with_ends(GeometryKind::MultiLineString, &[3, 2]));
+        assert!(with_ends(GeometryKind::Polygon, &[2, 4]));
+    }
 }
 
 #[cfg(test)]

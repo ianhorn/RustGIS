@@ -140,7 +140,7 @@ fn encode(s: &str) -> String {
     out
 }
 
-fn form(params: &[(&str, &str)]) -> String {
+pub(crate) fn form(params: &[(&str, &str)]) -> String {
     params.iter().map(|(k, v)| format!("{k}={}", encode(v))).collect::<Vec<_>>().join("&")
 }
 
@@ -338,6 +338,14 @@ struct Session {
     scopes: Vec<Scope>,
     /// Unix seconds before which a renewal isn't tried again (after the portal couldn't be reached).
     retry_at: i64,
+}
+
+impl Session {
+    /// Whether it is a sign-in that still gives a token at `now`: it renews itself, or it hasn't
+    /// expired. A token given with an address isn't a sign-in.
+    fn signed_in_at(&self, now: i64) -> bool {
+        !self.client_id.is_empty() && (self.refresh_token.is_some() || self.expires_at > now)
+    }
 }
 
 /// An immutable, exact runtime account snapshot, never an output representation. It contains
@@ -743,6 +751,14 @@ pub fn signed_in(portal: &str) -> Option<Info> {
     list().into_iter().find(|s| s.portal == portal && !s.token)
 }
 
+/// Whether a sign-in kept still gives a token: one that renews itself or hasn't expired. A sign-in
+/// past its expiry with nothing to renew it stays in memory but isn't counted (no request uses
+/// it); a token given with an address covers its server only and isn't counted either.
+pub fn kept() -> bool {
+    let now = now_secs();
+    sessions().iter().any(|s| s.signed_in_at(now))
+}
+
 /// A revocation to send after a sign-out: the endpoint and its form.
 #[derive(Clone, PartialEq, Eq)]
 pub struct Revocation {
@@ -923,7 +939,7 @@ mod native {
             f.cancel = Some(cancel.clone());
         }
         let pending = Pending { portal, client_id: client_id.to_string(), redirect, verifier, state };
-        std::thread::spawn(move || {
+        let spawned = std::thread::Builder::new().name("rustgis-portal-sign-in".into()).spawn(move || {
             let result = serve(&listener, &cancel, &pending);
             let mut f = flow();
             // A newer sign-in replaced this one: its outcome isn't this one's to tell.
@@ -935,6 +951,13 @@ mod native {
                 f.cancel = None;
             }
         });
+        if let Err(e) = spawned {
+            let why = format!("the system refused a thread to wait for the sign-in on ({e})");
+            let mut f = flow();
+            f.progress = Progress::Failed(why.clone());
+            f.cancel = None;
+            return Err(why);
+        }
         Ok(url)
     }
 
@@ -1041,13 +1064,22 @@ mod native {
         let grant = super::parse_grant(&body, super::now_secs())?;
         let scopes = discover(&p.portal, &grant.access_token);
         if cancel.load(Ordering::SeqCst) {
-            revoke_all(vec![Revocation {
+            let revocation = Revocation {
                 endpoint: super::endpoint(&p.portal, "revokeToken"),
                 body: match &grant.refresh_token {
                     Some(r) => super::revoke_body(&p.client_id, r, true),
                     None => super::revoke_body(&p.client_id, &grant.access_token, false),
                 },
-            }]);
+            };
+            // No thread to send it on: sent here, on the sign-in's own thread, so the grant
+            // RustGIS doesn't keep isn't left live without a word.
+            if let Err(unsent) = revoke_all(vec![revocation]) {
+                // Every one is sent, whichever fail.
+                let failed = unsent.iter().filter(|r| !post_form(&r.endpoint, &r.body).is_ok_and(|b| revoked(&b))).count();
+                if failed > 0 {
+                    return Err("the sign-in was cancelled, but the portal didn't confirm revoking its token: it may stay valid there until it expires".into());
+                }
+            }
             return Err("the sign-in was cancelled".into());
         }
         super::sign_in(&p.portal, &p.client_id, grant, scopes);
@@ -1095,16 +1127,55 @@ mod native {
         super::authorization(url)
     }
 
-    /// Sends revocations off the caller's thread, on a best-effort basis.
-    pub fn revoke_all(revocations: Vec<Revocation>) {
+    /// Whether a portal's answer to a revocation confirms it (`{"success": true}`): an OAuth error
+    /// or an answer that isn't JSON doesn't.
+    fn revoked(answer: &[u8]) -> bool {
+        use serde_json::Value;
+        serde_json::from_slice::<Value>(answer).ok().and_then(|v| v.get("success").and_then(Value::as_bool)) == Some(true)
+    }
+
+    /// Only an answer that says it succeeded confirms a revocation.
+    #[cfg(test)]
+    #[test]
+    fn a_revocation_is_confirmed_only_by_success() {
+        assert!(revoked(br#"{"success": true}"#));
+        assert!(!revoked(br#"{"success": false}"#));
+        assert!(!revoked(br#"{"error": {"code": 400, "error": "invalid_request"}}"#));
+        assert!(!revoked(b"<html>Bad Gateway</html>"));
+    }
+
+    /// Sends revocations off the caller's thread, on a best-effort basis. When the system refuses
+    /// a thread, they come back unsent, for the caller to send or to say.
+    pub fn revoke_all(revocations: Vec<Revocation>) -> Result<(), Vec<Revocation>> {
+        revoke_all_with(|send| std::thread::Builder::new().name("rustgis-portal-revoke".into()).spawn(send).map(drop), revocations)
+    }
+
+    /// [`revoke_all`], its thread started by `spawn`, which a test can make refuse.
+    fn revoke_all_with(
+        spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+        revocations: Vec<Revocation>,
+    ) -> Result<(), Vec<Revocation>> {
         if revocations.is_empty() {
-            return;
+            return Ok(());
         }
-        std::thread::spawn(move || {
+        let unsent = revocations.clone();
+        spawn(Box::new(move || {
             for r in revocations {
                 let _ = post_form(&r.endpoint, &r.body);
             }
-        });
+        }))
+        .map_err(|_| unsent)
+    }
+
+    /// Revocations a thread is refused for come back unsent, every one of them.
+    #[cfg(test)]
+    #[test]
+    fn revocations_refused_a_thread_come_back_unsent() {
+        let r = || Revocation { endpoint: "https://portal.example/sharing/rest/oauth2/revokeToken".into(), body: "token=t".into() };
+        let refuse = |_| Err(std::io::Error::other("no threads left"));
+        assert!(revoke_all_with(refuse, vec![r(), r()]).is_err_and(|unsent| unsent == vec![r(), r()]));
+        assert!(revoke_all_with(|_| Ok(()), vec![r()]).is_ok());
+        assert!(revoke_all_with(refuse, Vec::new()).is_ok());
     }
 
     /// The request line's target of an HTTP request.
@@ -1156,6 +1227,7 @@ mod native {
         )
     }
 
+    #[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
     #[cfg(test)]
     mod renewal_tests {
         use super::*;

@@ -2,6 +2,7 @@
 
 mod check_geometry;
 mod geometry;
+mod network_analysis;
 mod repair_geometry;
 mod tabulate_area;
 
@@ -37,6 +38,9 @@ const SEPARATOR: P = P {
     help: "Put between the values CONCATENATE joins.",
 };
 
+/// Each grid system's resolutions and their sizes, for both grid tools' Resolution.
+const DGGS_RESOLUTIONS: &str = "H3 0–15 (each step about a seventh: 5 is about 250 km², 9 about 0.1 km²); S2 0–30 (a quarter: 10 is about 80 km²); A5 0–30 and Hexagon 0–24 (a quarter: 5 is about 33,000 km², 12 about 2 km²).";
+
 pub static TOOLS: &[ToolSpec] = &[
     ToolSpec {
         id: "polygonToLine",
@@ -64,7 +68,7 @@ pub static TOOLS: &[ToolSpec] = &[
         id: "featureEnvelopeToPolygon",
         name: "Feature Envelope To Polygon",
         toolbox: "Data Management › Features",
-        summary: "Writes one axis-aligned bounding rectangle per feature in stored longitude/latitude coordinates. Zero-area envelopes are skipped.",
+        summary: "Writes one axis-aligned bounding rectangle per feature in the layer's own coordinates when it is held in a projected system other than Web Mercator and the other world projections (Robinson, Plate Carrée and the like), else in longitude/latitude. Zero-area envelopes are skipped.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
@@ -97,9 +101,17 @@ pub static TOOLS: &[ToolSpec] = &[
         id: "repairGeometry",
         name: "Repair Geometry",
         toolbox: "Data Management › Features",
-        summary: "Writes every feature with its geometry made valid where it can be: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved. Features with a missing or non-finite coordinate anywhere, even in a hole, or left with no usable points or, for polygons, no area once repaired, are written without geometry. Other features too complex to check, or whose repair fails, are written unchanged. Says what was repaired in each.",
+        summary: "Writes every feature with its geometry made valid where it can be: rings closed, repeated vertices and degenerate parts dropped, self-intersections, overlapping parts and holes outside their shell resolved by the chosen rule (Shells Minus Holes merges overlapping parts; Even-Odd keeps what lies inside an odd number of rings). Features with a missing or non-finite coordinate anywhere, even in a hole, or left with no usable points or, for polygons, no area once repaired, are written without geometry. Other features too complex to check, or whose repair fails, are written unchanged. Says what was repaired in each.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::VectorLayer, required: true, default: "", help: "" },
+            P {
+                name: "rule",
+                label: "Rule",
+                kind: K::Choice(&crate::repair::RULES),
+                required: false,
+                default: "\"Shells Minus Holes\"",
+                help: "What is inside a polygon whose rings cross, overlap or sit in the wrong place. Shells Minus Holes: each part is its outer ring less its holes, and overlapping parts merge. Even-Odd: what lies inside an odd number of rings, so where two parts overlap is left out and a ring listed as a part inside another is a hole. Valid polygons are written the same either way.",
+            },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: repair_geometry::run,
@@ -111,7 +123,14 @@ pub static TOOLS: &[ToolSpec] = &[
         summary: "Creates polygons around input features at a given distance.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "distance", label: "Distance", kind: K::Number, required: true, default: "100", help: "" },
+            P {
+                name: "distance",
+                label: "Distance",
+                kind: K::Number,
+                required: true,
+                default: "100",
+                help: "Measured on the ground, or flat for a layer in a projected system. Negative shrinks polygons.",
+            },
             P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
             P { name: "dissolve", label: "Dissolve", kind: K::Choice(&["None", "All"]), required: false, default: "\"None\"", help: "" },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
@@ -272,6 +291,124 @@ pub static TOOLS: &[ToolSpec] = &[
         run: near,
     },
     ToolSpec {
+        id: "serviceArea",
+        name: "Service Area",
+        toolbox: "Analysis › Network",
+        summary: "Finds the lines reachable within one or more travel costs of points, along a line network.",
+        params: &[
+            P {
+                name: "network",
+                label: "Network Lines",
+                kind: K::VectorLayer,
+                required: true,
+                default: "",
+                help: "A line layer. Lines join where their vertices meet.",
+            },
+            P {
+                name: "facilities",
+                label: "Facilities",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "The points to measure from. Each is moved onto the nearest line.",
+            },
+            P {
+                name: "breaks",
+                label: "Breaks",
+                kind: K::Text,
+                required: true,
+                default: "\"1, 2, 5\"",
+                help: "Costs to stop at, separated by commas, in the units below. Each part of a line is labelled with the band it lies in and the facility nearest to it.",
+            },
+            P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
+            P {
+                name: "costField",
+                label: "Cost Field",
+                kind: K::NumericField,
+                required: false,
+                default: "",
+                help: "Multiplies each line's length, so breaks count weighted distance. Empty counts the length alone; 0 or less closes a line.",
+            },
+            P {
+                name: "snapDistance",
+                label: "Snap Distance (m)",
+                kind: K::Number,
+                required: false,
+                default: "1000",
+                help: "How far a facility may be moved onto the network, in metres. Farther ones are left out.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: network_analysis::service_area,
+    },
+    ToolSpec {
+        id: "odCostMatrix",
+        name: "OD Cost Matrix",
+        toolbox: "Analysis › Network",
+        summary: "Measures the cost and length of the cheapest way along a line network from each origin to each destination.",
+        params: &[
+            P {
+                name: "network",
+                label: "Network Lines",
+                kind: K::VectorLayer,
+                required: true,
+                default: "",
+                help: "A line layer. Lines join where their vertices meet.",
+            },
+            P {
+                name: "origins",
+                label: "Origins",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "Each is moved onto the nearest line.",
+            },
+            P {
+                name: "destinations",
+                label: "Destinations",
+                kind: K::PointLayer,
+                required: true,
+                default: "",
+                help: "Each is moved onto the nearest line.",
+            },
+            P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
+            P {
+                name: "costField",
+                label: "Cost Field",
+                kind: K::NumericField,
+                required: false,
+                default: "",
+                help: "Multiplies each line's length. Empty counts the length alone; 0 or less closes a line.",
+            },
+            P {
+                name: "cutoff",
+                label: "Cutoff",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "Leaves out destinations costing more than this, in the units above. Empty: no limit.",
+            },
+            P {
+                name: "count",
+                label: "Destinations to Find",
+                kind: K::Number,
+                required: false,
+                default: "",
+                help: "Keeps only this many of the cheapest destinations from each origin. Empty: all.",
+            },
+            P {
+                name: "snapDistance",
+                label: "Snap Distance (m)",
+                kind: K::Number,
+                required: false,
+                default: "1000",
+                help: "How far an origin or destination may be moved onto the network, in metres. Farther ones are left out.",
+            },
+            P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
+        ],
+        run: network_analysis::od_cost_matrix,
+    },
+    ToolSpec {
         id: "convexHull",
         name: "Minimum Bounding Geometry",
         toolbox: "Data Management › Features",
@@ -351,7 +488,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: true,
                 default: "1",
-                help: "The distance between points, measured on the ground.",
+                help: "The distance between points, measured on the ground, or flat for a layer in a projected system.",
             },
             P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
             P {
@@ -424,7 +561,14 @@ pub static TOOLS: &[ToolSpec] = &[
         summary: "Removes vertices that deviate less than a tolerance (Douglas–Peucker).",
         params: &[
             P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "tolerance", label: "Tolerance (km)", kind: K::Number, required: true, default: "25", help: "" },
+            P {
+                name: "tolerance",
+                label: "Tolerance (km)",
+                kind: K::Number,
+                required: true,
+                default: "25",
+                help: "How far a vertex may move, on the ground, or flat for a layer in a projected system.",
+            },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: simplify,
@@ -451,18 +595,19 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         id: "a5Grid",
-        name: "A5 Grid",
+        name: "Generate Tessellation",
         toolbox: "Analysis › DGGS",
-        summary: "A5's equal-area pentagonal cells at a resolution, over the map's extent, a layer or the world, as polygons with their ids.",
+        summary: "Cells of a grid system (H3 hexagons, S2 quadrilaterals, A5 pentagons, or flat hexagons anchored on the map's plane) at a resolution, over the map's extent, a layer or the world, as polygons with their ids.",
         params: &[
             P {
-                name: "resolution",
-                label: "Resolution (0–30)",
-                kind: K::Number,
+                name: "system",
+                label: "System",
+                kind: K::Choice(&crate::dggs::System::NAMES),
                 required: false,
-                default: "5",
-                help: "Each step divides a cell into about four: resolution 5 cells are about 33,000 km², 9 about 130 km², 12 about 2 km².",
+                default: "\"A5\"",
+                help: "H3 (Uber) hexagons, S2 (Google) cells, A5 (Felix Palmer) equal-area pentagons. Hexagon lays flat hexagons on the map's projection (Web Mercator for a globe), anchored at its origin: a place gets the same cell with any layer, in that projection.",
             },
+            P { name: "resolution", label: "Resolution", kind: K::Number, required: false, default: "5", help: DGGS_RESOLUTIONS },
             P {
                 name: "area",
                 label: "Area",
@@ -486,12 +631,20 @@ pub static TOOLS: &[ToolSpec] = &[
     },
     ToolSpec {
         id: "a5Aggregate",
-        name: "Aggregate Points to A5",
+        name: "Aggregate Points to Grid",
         toolbox: "Analysis › DGGS",
-        summary: "Counts a layer's points by the A5 cell holding them (cells of equal area, so the count is a density), with a field's sum and mean.",
+        summary: "Counts a layer's points by the cell of a grid system (H3, S2, A5 or anchored hexagons) holding them, with the density by each cell's area and a field's sum and mean.",
         params: &[
             P { name: "input", label: "Input Points", kind: K::PointLayer, required: true, default: "", help: "" },
-            P { name: "resolution", label: "Resolution (0–30)", kind: K::Number, required: false, default: "9", help: "" },
+            P {
+                name: "system",
+                label: "System",
+                kind: K::Choice(&crate::dggs::System::NAMES),
+                required: false,
+                default: "\"A5\"",
+                help: "The cells of Generate Tessellation's system, with the same ids, so the two layers join.",
+            },
+            P { name: "resolution", label: "Resolution", kind: K::Number, required: false, default: "9", help: DGGS_RESOLUTIONS },
             P {
                 name: "field",
                 label: "Field to Sum and Average",
@@ -512,7 +665,14 @@ pub static TOOLS: &[ToolSpec] = &[
         params: &[
             P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
             P { name: "select", label: "Selecting Features", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "distance", label: "Search Distance", kind: K::Number, required: false, default: "0", help: "" },
+            P {
+                name: "distance",
+                label: "Search Distance",
+                kind: K::Number,
+                required: false,
+                default: "0",
+                help: "Measured on the ground, or flat for a layer in a projected system.",
+            },
             P { name: "units", label: "Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
             P { name: "invert", label: "Invert", kind: K::Choice(&["No", "Yes"]), required: false, default: "\"No\"", help: "" },
         ],
@@ -525,7 +685,7 @@ pub static TOOLS: &[ToolSpec] = &[
         summary: "Selects features with a SQL where clause, e.g. pop_est > 1000000.",
         params: &[
             P { name: "input", label: "Input Rows", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "where", label: "Where Clause", kind: K::Text, required: true, default: "", help: "" },
+            P { name: "where", label: "Where Clause", kind: K::Expression, required: true, default: "", help: "" },
         ],
         run: select_by_attributes,
     },
@@ -587,7 +747,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Fields { input: "input" },
                 required: false,
                 default: "",
-                help: "Groups records by the combination of these fields' values. Scripts and the AI Assistant can give several fields as a list.",
+                help: "Groups records by the combination of these fields' values; with no statistics and no Statistics Field, each group's row counts its records (FREQUENCY). Scripts and the AI Assistant can give several fields as a list.",
             },
             SEPARATOR,
         ],
@@ -684,6 +844,14 @@ pub static TOOLS: &[ToolSpec] = &[
                 default: "\"km2\"",
                 help: "Square metres (m2), square kilometres (km2), hectares (ha), acres (ac), square feet (ft2) or square miles (mi2), as in Calculate Geometry and area(). The area field is named area_<unit>.",
             },
+            P {
+                name: "includeEmptyZones",
+                label: "Include Empty Zones",
+                kind: K::Bool,
+                required: false,
+                default: "false",
+                help: "Keep one row for each polygon zone with no class overlap, even if the class layer is empty. Class fields are blank, and area, percentage and sum fields are zero. Off by default.",
+            },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: tabulate_intersection,
@@ -695,7 +863,7 @@ pub static TOOLS: &[ToolSpec] = &[
         summary: "Copies the (selected) features of a layer to a new layer.",
         params: &[
             P { name: "input", label: "Input Features", kind: K::Layer, required: true, default: "", help: "" },
-            P { name: "where", label: "Expression", kind: K::Text, required: false, default: "", help: "" },
+            P { name: "where", label: "Expression", kind: K::Expression, required: false, default: "", help: "" },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
         run: export_features,
@@ -745,7 +913,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent and pixel size; when empty, the projected one the layer is held in, or else was read in, else the project's projected one, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -787,7 +955,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Number,
                 required: false,
                 default: "",
-                help: "Closest: how far to look (no limit when empty). Within a distance: required. Measured on the ground.",
+                help: "Closest: how far to look (no limit when empty). Within a distance: required. Measured on the ground, or flat for a target in a projected system.",
             },
             P { name: "units", label: "Distance Units", kind: K::Choice(UNITS), required: false, default: "\"Kilometers\"", help: "" },
             P {
@@ -911,7 +1079,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; when empty, the one the layer was read in if projected, else degrees; EPSG:4326 for degrees.",
+                help: "A projected coordinate system (e.g. EPSG:32618) to make the raster in, its units for the extent, pixel size and range; when empty, the projected one the layer is held in, or else was read in, else the project's projected one, else degrees; EPSG:4326 for degrees.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "" },
         ],
@@ -1161,7 +1329,7 @@ pub static TOOLS: &[ToolSpec] = &[
                 kind: K::Text,
                 required: false,
                 default: "",
-                help: "Projected coordinate system (e.g. EPSG:32618); defaults to the layer's CRS when projected, or required when the layer has none or is in degrees.",
+                help: "Projected coordinate system (e.g. EPSG:32618); defaults to the projected system the layer is held in, or else was read in, else the project's projected system; required when none of these is set.",
             },
             P { name: "output", label: "Output Name", kind: K::Text, required: false, default: "", help: "Output raster layer name." },
         ],
@@ -1310,7 +1478,7 @@ fn vector_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let file_name = if output.is_empty() { format!("{default_name}.pmtiles") } else { output.to_string() };
     let selected = inp.selection(s(p, "input"));
     let (bytes, messages) = inp.vector_to_pmtiles(ds, selected, min_zoom, max_zoom, source_layer)?;
-    Ok(ToolResult { output: Output::File { file_name, bytes }, messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::File { file_name, bytes }, messages })
 }
 
 fn raster_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -1320,7 +1488,7 @@ fn raster_to_pmtiles(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let default_name = name.rsplit(['/', '\\']).find(|part| !part.is_empty()).unwrap_or("output");
     let file_name = if output.is_empty() { format!("{default_name}.pmtiles") } else { output.to_string() };
     let bytes = inp.raster_to_pmtiles(name, min_zoom, max_zoom)?;
-    Ok(ToolResult { output: Output::File { file_name, bytes }, messages: vec![] })
+    Ok(ToolResult { losses: Vec::new(), output: Output::File { file_name, bytes }, messages: vec![] })
 }
 
 /// The name of a tool's new layer, from its `output` parameter.
@@ -1348,7 +1516,7 @@ fn to_metres(d: f64, units: &str) -> Result<f64, String> {
 }
 
 fn result(ds: Dataset, msg: String) -> Result<ToolResult, String> {
-    Ok(ToolResult { output: Output::Layer(ds), messages: vec![msg] })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Layer(ds), messages: vec![msg] })
 }
 
 /// A geometry's polygons, or none when it has no polygon to give: an empty polygon, or a point
@@ -1450,8 +1618,11 @@ fn union_all<'a>(polys: impl IntoIterator<Item = &'a geo::Polygon<f64>>) -> Mult
 const MAX_BUFFER_VERTICES: usize = 2_000_000;
 /// Retained ordinary output/selector storage, separate from overlay complexity. Temporary
 /// geometry on each worker and the already loaded input are additional to this allowance. The
-/// browser's budget, and the fewest bytes [`max_buffer_bytes`] allows on the desktop.
-const MAX_BUFFER_BYTES: usize = if cfg!(target_arch = "wasm32") { 128 << 20 } else { 512 << 20 };
+/// browser's budget, and the fewest bytes [`max_buffer_bytes`] allows on the desktop (a phone:
+/// [`BROWSER_BUFFER_BYTES`]).
+const MAX_BUFFER_BYTES: usize = if cfg!(target_arch = "wasm32") { BROWSER_BUFFER_BYTES } else { 512 << 20 };
+/// The budget in the browser, and the fewest bytes [`max_buffer_bytes`] allows on a phone.
+const BROWSER_BUFFER_BYTES: usize = 128 << 20;
 /// The most bytes [`max_buffer_bytes`] allows, however much memory the computer has.
 const BUFFER_BYTES_CEILING: usize = 8 << 30;
 /// Drain results regularly instead of keeping a second whole-layer result array.
@@ -1462,9 +1633,12 @@ const MAX_SELECTOR_CHECKS: usize = 50_000_000;
 const BUFFER_STORAGE_ERROR: &str = "Buffer output or distance selectors exceed their memory budget; select fewer features";
 
 /// Buffer's retained-storage budget on this computer: on the desktop a quarter of its memory, from
-/// [`MAX_BUFFER_BYTES`] up to [`BUFFER_BYTES_CEILING`] (#1291 step 2); fixed in the browser.
+/// [`MAX_BUFFER_BYTES`] (a phone: [`BROWSER_BUFFER_BYTES`]) up to [`BUFFER_BYTES_CEILING`]
+/// (#1291 step 2); fixed in the browser.
+/// Less once RustGIS holds more than half the memory, never below the floor ([`rustgis_data::memory::planned`], #2431).
 pub fn max_buffer_bytes() -> usize {
-    rustgis_data::memory::scaled(rustgis_data::memory::physical(), MAX_BUFFER_BYTES, BUFFER_BYTES_CEILING, 1)
+    let floor = if rustgis_data::memory::on_phone() { BROWSER_BUFFER_BYTES } else { MAX_BUFFER_BYTES };
+    rustgis_data::memory::planned(floor, BUFFER_BYTES_CEILING, 1)
 }
 
 /// [`BUFFER_STORAGE_ERROR`] with the budget it ran out of, so a run refused here but not on a
@@ -1618,17 +1792,23 @@ fn buffer_with_limits(inp: &dyn Inputs, p: &Json, limit: usize, bytes: usize) ->
     let units = if s(p, "units").is_empty() { "Kilometers" } else { s(p, "units") };
     let mut r = result(out, format!("Buffer: {n} features at {d} {units}"))?;
     if without > 0 {
-        r.messages.push(format!("{without} of {} features lack geometry, so they have no buffer", picked.len()));
+        let text = format!("{without} of {} features lack geometry, so they have no buffer", picked.len());
+        // Each feature has a row of its own, which these lose; dissolved, they add nothing.
+        if s(p, "dissolve") == "All" {
+            r.messages.push(text);
+        } else {
+            r.losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::DroppedFeature, text });
+        }
     }
     if empty > 0 {
         r.messages
             .push(format!("{empty} of {} features made no buffer at {d} {units} (nothing left, or no finite coordinates)", picked.len()));
     }
     if coarse > 0 {
-        r.messages.push(format!(
+        r.losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::ApproximatedCurve, text: format!(
             "{coarse} of {} features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): their sides there can stray from the distance by more than a buffer otherwise keeps to (0.012%, 0.05% along a line or outline buffered in stretches, or 1 cm)",
             picked.len()
-        ));
+        ) });
     }
     Ok(r)
 }
@@ -1648,10 +1828,10 @@ fn dissolved(g: &Geometry) -> std::borrow::Cow<'_, Geometry> {
 /// overlap with it, a line's stretches in it, the points in it or on its edge; outside, the rest.
 /// `None` when nothing is left, or only a shared edge or corner.
 ///
-/// The mask's polygons are in the analysis plane, oriented as `union_all` leaves them. The
-/// feature's may wind either way (the reference corpus has a clockwise parcel), but must not
-/// overlap each other: pass a feature of several polygons through [`dissolved`] first, once for all
-/// its masks.
+/// The mask's polygons are in the run's plane ([`crate::convert::plane`]), oriented as `union_all`
+/// leaves them. The feature's may wind either way (the reference corpus has a clockwise parcel),
+/// but must not overlap each other: pass a feature of several polygons through [`dissolved`] first,
+/// once for all its masks.
 fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry> {
     match g {
         Geometry::Polygon(_) => {
@@ -1670,7 +1850,7 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
                 .iter()
                 .copied()
                 .filter(|c| {
-                    let m = rustgis_geom::lonlat_to_plane(*c);
+                    let m = crate::convert::to_plane(*c);
                     // A point at a pole touches a mask that reaches the pole, whatever its
                     // longitude.
                     let at = reaches_poles(c.y, c.y);
@@ -1686,6 +1866,13 @@ fn part(g: &Geometry, mask: &MultiPolygon<f64>, inside: bool) -> Option<Geometry
             }
         }
     }
+}
+
+/// A multipolygon in the run's plane as a [`Geometry`] of the same coordinates, not taken back
+/// to the layer's, so [`crate::validity::check`] looks at the rings the overlay would.
+fn in_plane(mp: &MultiPolygon<f64>) -> Geometry {
+    let ring = |r: &geo::LineString<f64>| r.0.iter().map(|c| Coord::new(c.x, c.y)).collect();
+    Geometry::Polygon(mp.0.iter().map(|p| std::iter::once(p.exterior()).chain(p.interiors()).map(ring).collect()).collect())
 }
 
 /// Clip's part and whether its total polygon area is less than one millionth of the input's:
@@ -1706,12 +1893,141 @@ fn clip_part(g: &Geometry, mask: &MultiPolygon<f64>) -> Option<(Geometry, bool)>
     }
 }
 
+/// Where a polygon feature lies against one clip mask, found without an overlay.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Place {
+    /// All of it is inside the mask, clear of its edges: Clip keeps it as it is.
+    Inside,
+    /// None of it is inside the mask, and it is clear of its edges: nothing is clipped from it.
+    Outside,
+    /// An edge of the mask is within reach of its box, or a point of it is on an edge (or the mask
+    /// has a non-finite coordinate): only the overlay can say what is left.
+    Edge,
+}
+
+/// The most coordinates a polygon feature may have to be kept whole without the overlay: the
+/// validity check holds about 100 bytes for each ([`crate::validity`]), so a thread's share is
+/// about a megabyte.
+const KEEP_WHOLE_COORDS: usize = 10_000;
+
+/// A clip mask's edges, on a grid, so that the edges near a feature are found without going
+/// through all of them. It holds the grid's references (one for each cell an edge's box meets)
+/// and a table of the mask's rings, not a second copy of its coordinates: an edge's ends are read
+/// from the mask it was made for, which is passed to [`MaskEdges::near`]. Making it holds each
+/// edge's box until the grid is built.
+struct MaskEdges {
+    /// Each ring's first edge's number (edges are numbered through the rings in order), its
+    /// polygon, and which of the polygon's rings it is: 0 for the outside, then the holes.
+    rings: Vec<(usize, usize, usize)>,
+    grid: ExtentIndex,
+    /// What it holds, about: the grid's storage and the table of rings.
+    bytes: usize,
+    /// The mask has a coordinate that isn't finite, which no grid cell holds reliably: every
+    /// feature is then [`Place::Edge`].
+    unsure: bool,
+}
+
+impl MaskEdges {
+    /// The rings of every polygon of `mask`: the outside, then the holes.
+    fn rings_of(mask: &MultiPolygon<f64>) -> impl Iterator<Item = (usize, usize, &geo::LineString<f64>)> {
+        mask.0.iter().enumerate().flat_map(|(p, poly)| {
+            std::iter::once(poly.exterior()).chain(poly.interiors().iter()).enumerate().map(move |(r, ring)| (p, r, ring))
+        })
+    }
+
+    /// The edges of every ring of `mask`.
+    fn new(mask: &MultiPolygon<f64>) -> Self {
+        let unsure = mask.coords_iter().any(|c| !c.x.is_finite() || !c.y.is_finite());
+        let mut first = 0;
+        let rings: Vec<(usize, usize, usize)> = Self::rings_of(mask)
+            .map(|(p, r, ring)| {
+                let start = first;
+                first += ring.0.len().saturating_sub(1);
+                (start, p, r)
+            })
+            .collect();
+        let boxes = Self::rings_of(mask).flat_map(|(_, _, ring)| {
+            ring.0.windows(2).map(|w| w.iter().fold(Extent::EMPTY, |e, c| e.union(&Extent::new(c.x, c.y, c.x, c.y))))
+        });
+        let grid = ExtentIndex::new(boxes);
+        let bytes = grid.storage_bytes().saturating_add(rings.capacity().saturating_mul(std::mem::size_of::<(usize, usize, usize)>()));
+        MaskEdges { rings, grid, bytes, unsure }
+    }
+
+    /// The ends of edge `i` of `mask`, which this was made from.
+    fn edge(&self, mask: &MultiPolygon<f64>, i: usize) -> Option<[geo::Coord<f64>; 2]> {
+        let (start, p, r) = *self.rings.get(self.rings.partition_point(|ring| ring.0 <= i).checked_sub(1)?)?;
+        let poly = mask.0.get(p)?;
+        let ring = if r == 0 { poly.exterior() } else { poly.interiors().get(r - 1)? };
+        let j = i - start;
+        Some([*ring.0.get(j)?, *ring.0.get(j + 1)?])
+    }
+
+    /// Whether any edge of `mask`, which this was made from, has a box that meets `ext`: exactly,
+    /// so an edge within `ext`'s padding counts. An edge it can't find counts too.
+    fn near(&self, mask: &MultiPolygon<f64>, ext: &Extent) -> bool {
+        self.unsure
+            || self.grid.any_candidate(ext, |i| {
+                self.edge(mask, i).is_none_or(|[a, b]| {
+                    a.x.min(b.x) <= ext.max_x && a.x.max(b.x) >= ext.min_x && a.y.min(b.y) <= ext.max_y && a.y.max(b.y) >= ext.min_y
+                })
+            })
+    }
+}
+
+/// Whether every ring of `whole` has an area to keep as it is: four or more points enclosing more
+/// than a billionth of `ext`'s. A collapsed or hair-thin ring is the overlay's to drop.
+fn rings_have_area(whole: &MultiPolygon<f64>, ext: &Extent) -> bool {
+    let least = ext.width() * ext.height() * 1e-9;
+    whole.0.iter().flat_map(|p| std::iter::once(p.exterior()).chain(p.interiors().iter())).all(|r| {
+        // From the ring's first point, so that large coordinates don't swamp a small ring's area.
+        let o = r.0.first().copied().unwrap_or_default();
+        let twice: f64 =
+            r.0.windows(2)
+                .map(|w| w.first().zip(w.get(1)).map_or(0.0, |(a, b)| (a.x - o.x) * (b.y - o.y) - (b.x - o.x) * (a.y - o.y)))
+                .sum();
+        r.0.len() >= 4 && twice.abs() * 0.5 > least
+    })
+}
+
+/// Whether `whole` (a feature's polygons, in the run's plane, dissolved) can be placed against the
+/// masks without the overlay's say: its box `ext` isn't empty, its coordinates are finite and each
+/// ring has an area. Made once for a feature, whatever number of masks it meets. Keeping it
+/// whole also needs it to be valid ([`crate::validity`]), which is looked at only then.
+fn fit_to_place(whole: &MultiPolygon<f64>, ext: &Extent) -> bool {
+    !ext.is_empty() && whole.coords_iter().all(|c| c.x.is_finite() && c.y.is_finite()) && rings_have_area(whole, ext)
+}
+
+/// Where `whole`, a feature [`fit_to_place`] accepts, lies against `mask`, whose edges are
+/// `edges`; `ext` is the feature's extent, padded as [`clip_on`] pads it for the overlay's grid.
+/// With no mask edge in `ext`, the feature's outline can't meet the mask's or hold a piece of it,
+/// so it is wholly in or wholly out, as any one of its points is. The answer is exact, never a
+/// float comparison against an edge the feature might poke out of; a point on an edge is
+/// [`Place::Edge`], for the overlay to decide.
+fn place_against(whole: &MultiPolygon<f64>, ext: &Extent, mask: &MultiPolygon<f64>, edges: &MaskEdges) -> Place {
+    use geo::algorithm::coordinate_position::{CoordPos, CoordinatePosition};
+    if edges.near(mask, ext) {
+        return Place::Edge;
+    }
+    let Some(c) = whole.coords_iter().next() else { return Place::Edge };
+    match mask.coordinate_position(&c) {
+        CoordPos::Inside => Place::Inside,
+        CoordPos::Outside => Place::Outside,
+        CoordPos::OnBoundary => Place::Edge,
+    }
+}
+
 /// Clip each input feature to the union of only the selected clip polygons whose projected
 /// extents meet it. Union candidates together so overlapping masks never duplicate output.
+/// A polygon feature with no mask edge in its box is not sent to the overlay: one inside a mask, if it is valid,
+/// is kept as it is (wound as the overlay winds a polygon, its vertices not snapped to the
+/// overlay's grid), and the masks it is outside take nothing from it, so only those whose edges
+/// may cross it are unioned and overlaid (see [`place_against`]).
 /// Cancel is looked at, and progress counted, mask by mask and feature by feature; one mask's
-/// union, and one feature's overlay, can't be stopped once started (#1562). Masks with no polygon,
-/// or whose union has no area, are left out and counted (a mask selected twice is used once);
-/// with none left, it's an error.
+/// union, one mask's edge index (made when a polygon feature first needs it), and one feature's
+/// overlay, can't be stopped once started (#1562). Masks with no polygon, or whose union has no
+/// area, are left out and counted (a mask selected twice is used once); with none left, it's an
+/// error.
 fn clip(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     clip_on(inp, p, None, None)
 }
@@ -1755,6 +2071,64 @@ fn kept_union_bytes(key: &[usize], m: &MultiPolygon<f64>) -> usize {
 /// The memory a feature's coordinates take, about, as a mask or an overlay holds them.
 fn coord_bytes(g: &Geometry) -> usize {
     g.coord_count().saturating_mul(std::mem::size_of::<geo::Coord<f64>>())
+}
+
+/// Selects workers lazily: an explicit count, a small run or the single-threaded browser
+/// never pays for a geometry sizing pass. Estimation reports its own phase; actual work starts
+/// a fresh counted phase once the worker count is known.
+fn geometry_threads(items: usize, requested: Option<usize>, estimate: impl FnOnce() -> Result<usize, String>) -> Result<usize, String> {
+    let threads = match requested {
+        Some(n) => n,
+        None if crate::parallel::threads_for(items, PARALLEL_FEATURES) <= 1 => 1,
+        None => crate::parallel::threads_for_scratch(items, PARALLEL_FEATURES, estimate()?),
+    };
+    crate::control::begin(items);
+    Ok(threads)
+}
+
+/// Largest selected geometry's coordinate storage. Estimation is cancellable between features;
+/// counting one feature's vertices is one uninterrupted step, as the conversion itself is.
+fn largest_geometry_bytes(ds: &Dataset, rows: &[usize]) -> Result<usize, String> {
+    crate::control::begin(rows.len());
+    let mut largest = 0;
+    for &row in rows {
+        crate::control::check()?;
+        if let Some(g) = ds.features.geometry(row) {
+            largest = largest.max(coord_bytes(g));
+        }
+        crate::control::advance(1);
+    }
+    Ok(largest)
+}
+
+/// Peak per-feature overlay storage, estimated from the masks it may actually meet: converted
+/// and dissolved input, the masks' union and output. Overlapping masks can each retain the
+/// entire input as an inside piece, so cuts budget another input copy per candidate mask.
+/// Four input copies allow conversion, dissolve, intermediate and output; three mask copies
+/// allow the union, boolean-operation work and output. The index's candidate references can
+/// exceed the number of zones before deduplication.
+/// Like Clip's estimate this sizes coordinate storage, not a worst-case bound on edge crossings.
+fn overlay_scratch(ds: &Dataset, rows: &[usize], zones: &[Zone], near: (&ExtentIndex, &AtPoles), inside: bool) -> Result<usize, String> {
+    crate::control::begin(rows.len().saturating_add(zones.len()));
+    let mut sizes = Vec::with_capacity(zones.len());
+    for zone in zones {
+        crate::control::check()?;
+        sizes.push(kept_union_bytes(&[], &zone.poly));
+        crate::control::advance(1);
+    }
+    let candidates = near.0.references.max(zones.len()).saturating_mul(std::mem::size_of::<usize>());
+    let mut largest = 0;
+    for &row in rows {
+        crate::control::check()?;
+        if let Some(g) = ds.features.geometry(row) {
+            let hits = meeting(g, &g.extent(), zones, near);
+            let masks = hits.iter().filter_map(|&i| sizes.get(i)).fold(0usize, |n, &b| n.saturating_add(b));
+            let copies = if inside { hits.len().saturating_add(4) } else { 4 };
+            largest = largest.max(coord_bytes(g).saturating_mul(copies).saturating_add(masks.saturating_mul(3)));
+        }
+        crate::control::advance(1);
+    }
+    Ok(largest.saturating_add(candidates))
 }
 
 /// One thread's recent multi-mask unions for Clip, least recently used first, with the memory
@@ -1821,9 +2195,12 @@ impl MaskCache {
 /// coordinates while the masks are unioned, then twice the largest input feature's, a list of
 /// the masks (or the index's references to them), and the larger of the largest mask and the
 /// largest size of the masks one feature meets, together (found for each batch first, standing
-/// for their union); the threads are as many as half the scratch
-/// memory work may take holds of that, and their recent unions of several masks share
-/// `cache_bytes` (by default the other half of [`crate::parallel::scratch_budget`]).
+/// for their union); as many threads run as fit, at that much work each, in half the scratch
+/// budget, and their recent unions of several masks share `cache_bytes` (by default the other
+/// half of [`crate::parallel::scratch_budget`], less the masks' edge indexes made so far). The masks'
+/// edge indexes ([`MaskEdges`]) are shared by the threads and kept for the run: grid references to
+/// the masks' edges, made when a polygon feature first needs a mask's (holding each of its edges'
+/// boxes meanwhile, twice its coordinates, on one thread).
 fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     let clip_ds = input(inp, p, "clip")?;
@@ -1897,8 +2274,10 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
         if matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
             at_poles.add_to(poles(&g.extent()), &mut near);
         }
-        near
+        (near, ext)
     };
+    // Each mask's edges, made when a polygon feature first needs them (on any thread).
+    let edges: Vec<std::sync::OnceLock<MaskEdges>> = masks.iter().map(|_| std::sync::OnceLock::new()).collect();
     // The union of the masks a feature meets, when they are several, can be far larger than any
     // one mask (at most all of them). Its size is taken as theirs together, which it doesn't
     // exceed by much (an overlay adds a vertex where edges cross, and takes away the overlaps).
@@ -1923,7 +2302,7 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
             batch,
             most_threads,
             || (),
-            |_, _, &r| Ok::<_, String>(ds.features.get(r).and_then(|f| f.geometry.as_ref()).map_or(0, |g| union_bytes(&near_of(g)))),
+            |_, _, &r| Ok::<_, String>(ds.features.get(r).and_then(|f| f.geometry.as_ref()).map_or(0, |g| union_bytes(&near_of(g).0))),
         )?;
         // The batch's threads, by its largest union too.
         let largest_union = unions.into_iter().max().unwrap_or(0);
@@ -1931,25 +2310,68 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
         // Single candidates reuse their normalized mask. Each thread keeps eight recent multi-mask
         // unions, so alternating neighbourhoods can reuse work too, the least recently used going
         // first; the threads' unions together stay within their share of the scratch memory.
-        let cache_cap = cache_bytes.unwrap_or_else(|| crate::parallel::scratch_budget() / 2) / clip_threads.max(1);
+        // The masks' edge indexes made so far come out of the unions' share, at what each holds
+        // ([`MaskEdges::bytes`]): they are shared by the threads and kept for the run.
+        let index_bytes = edges.iter().filter_map(std::sync::OnceLock::get).fold(0usize, |a, e| a.saturating_add(e.bytes));
+        let cache_cap =
+            cache_bytes.unwrap_or_else(|| (crate::parallel::scratch_budget() / 2).saturating_sub(index_bytes)) / clip_threads.max(1);
         let clipped = crate::parallel::try_map_on(
             batch,
             clip_threads,
             || MaskCache::new(cache_cap),
             |cache, _, &r| {
                 let Some(g) = ds.features.get(r).and_then(|f| f.geometry.as_ref()) else { return Ok::<_, String>(None) };
-                let near = near_of(g);
+                let (near, ext) = near_of(g);
                 if near.is_empty() {
                     // A big union is kept only while the features next to each other meet it.
                     cache.big = None;
                     return Ok(None);
                 }
                 let shape = dissolved(g);
-                Ok(if let [i] = near.as_slice() {
+                // A polygon feature wholly inside one mask is kept as it is, and the masks it is
+                // wholly outside take nothing from it: the overlay (and the union of the masks
+                // it meets) is only for those whose edges it may cross.
+                let mut crossing = Cow::Borrowed(near.as_slice());
+                if let Some(whole) = to_multipolygon(&shape).filter(|whole| fit_to_place(whole, &ext)) {
+                    let mut edge = Vec::with_capacity(near.len());
+                    let mut valid = None;
+                    for &i in &near {
+                        // A mask that isn't there (not so, as `near` is of the masks) is left to the overlay.
+                        let place = masks.get(i).zip(edges.get(i)).map_or(Place::Edge, |((mask, _), cell)| {
+                            place_against(&whole, &ext, mask, cell.get_or_init(|| MaskEdges::new(mask)))
+                        });
+                        match place {
+                            // Kept as it is only if it is one valid shape (no ring crossing itself or
+                            // another, a hole inside its polygon, its interior in one piece) in the
+                            // run's plane, where the overlay works: it would have rewritten anything
+                            // else, and a ring simple in longitude/latitude can cross itself once
+                            // projected. Looked at once; a feature of more than [`KEEP_WHOLE_COORDS`]
+                            // coordinates, which the check would need about 100 bytes each for, goes
+                            // to the overlay.
+                            Place::Inside
+                                if *valid.get_or_insert_with(|| {
+                                    shape.coord_count() <= KEEP_WHOLE_COORDS
+                                        && crate::validity::check(Some(&in_plane(&whole)), crate::validity::MAX_WORK).problems.is_empty()
+                                }) =>
+                            {
+                                cache.big = None;
+                                return Ok(from_multipolygon(&whole.orient(Direction::Default)).map(|g| (g, false)));
+                            }
+                            Place::Inside | Place::Edge => edge.push(i),
+                            Place::Outside => {}
+                        }
+                    }
+                    if edge.is_empty() {
+                        cache.big = None;
+                        return Ok(None);
+                    }
+                    crossing = Cow::Owned(edge);
+                }
+                Ok(if let [i] = crossing.as_ref() {
                     cache.big = None;
                     masks.get(*i).and_then(|(m, _)| clip_part(&shape, m))
                 } else {
-                    clip_part(&shape, &cache.union_of(&near, &masks))
+                    clip_part(&shape, &cache.union_of(&crossing, &masks))
                 })
             },
         )?;
@@ -1962,7 +2384,10 @@ fn clip_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>, cache_bytes: Opti
     let n = out.features.len();
     let mut r = result(out, format!("Clip: {n} features kept"))?;
     if without > 0 {
-        r.messages.push(format!("Clip: {without} feature(s) of '{}' left out: they have no geometry to clip", ds.name));
+        r.losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedFeature,
+            text: format!("Clip: {without} feature(s) of '{}' left out: they have no geometry to clip", ds.name),
+        });
     }
     r.messages.extend(left.notes("Clip", &clip_ds.name));
     if slivers > 0 {
@@ -2007,8 +2432,8 @@ fn erase_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
 
 /// Each of `input_rows`' parts outside every zone, as [`outside`] gives it, in their order: `None`
 /// for a row with no feature or no geometry, `Some(None)` for one left with nothing. Made on
-/// `threads` threads (by the number of rows when `None`), each feature on its own (#1252); Cancel
-/// is looked at, and progress counted, between features.
+/// `threads` threads (by rows and estimated per-feature scratch when `None`), each feature on
+/// its own (#1252); Cancel is looked at, and progress counted, between features.
 fn outside_each(
     ds: &Dataset,
     input_rows: &[usize],
@@ -2016,8 +2441,7 @@ fn outside_each(
     near: (&ExtentIndex, &AtPoles),
     threads: Option<usize>,
 ) -> Result<Vec<Option<Option<Geometry>>>, String> {
-    crate::control::begin(input_rows.len());
-    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(input_rows.len(), PARALLEL_FEATURES));
+    let threads = geometry_threads(input_rows.len(), threads, || overlay_scratch(ds, input_rows, zones, near, false))?;
     crate::parallel::try_map_on(
         input_rows,
         threads,
@@ -2069,7 +2493,8 @@ enum ZoneMade {
 /// as they cover nothing. A polygon of one part is only oriented, its edges kept exactly, so one
 /// with no area stays a zone, as it always has.
 ///
-/// On `threads` threads (by the number of zones when `None`). A zone of several parts is a union:
+/// On `threads` threads (by the number of zones and the largest geometry's scratch when `None`).
+/// A zone of several parts is a union:
 /// each zone is made on its own, on several threads when there are many (#1252), and they come
 /// back in order, as on one thread; Cancel is looked at, and progress counted, between zones.
 fn overlay_zones_on<'a>(
@@ -2085,8 +2510,7 @@ fn overlay_zones_on<'a>(
         return Err(format!("'{}' is not a polygon layer", ov.name));
     }
     let zone_rows = each_once(rows(inp, p, k, ov));
-    crate::control::begin(zone_rows.len());
-    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(zone_rows.len(), PARALLEL_FEATURES));
+    let threads = geometry_threads(zone_rows.len(), threads, || Ok(largest_geometry_bytes(ov, &zone_rows)?.saturating_mul(2)))?;
     let made = crate::parallel::try_map_on(
         &zone_rows,
         threads,
@@ -2282,7 +2706,8 @@ fn overlay(inp: &dyn Inputs, p: &Json, op: Overlay) -> Result<ToolResult, String
     overlay_on(inp, p, op, None)
 }
 
-/// [`overlay`] on `threads` threads (by the number of items in each step when `None`).
+/// [`overlay`] on `threads` threads (by the items and estimated per-worker scratch in each step
+/// when `None`). The estimate pass checks Cancel between features, before the work it sizes.
 fn overlay_on(inp: &dyn Inputs, p: &Json, op: Overlay, threads: Option<usize>) -> Result<ToolResult, String> {
     let ds = input(inp, p, "input")?;
     if ds.geometry_type == GeometryType::None {
@@ -2297,14 +2722,13 @@ fn overlay_on(inp: &dyn Inputs, p: &Json, op: Overlay, threads: Option<usize>) -
     let at_poles = AtPoles::new(zones.iter().map(|z| poles(&z.ext)));
     let mut out = overlay_schema(ds, ov, out_name(p, format!("{}_{}", ds.name, op.suffix())), ds.geometry_type);
     let zone_attrs = |z: &Zone| ov.features.get(z.row).map(|o| o.attrs.as_slice());
-    let threads_for = |n: usize| threads.unwrap_or_else(|| crate::parallel::threads_for(n, PARALLEL_FEATURES));
     // Each input feature is cut on its own: its parts in the zones it overlaps (the part only for
     // the tools that keep it, the zone's index for all) and its part outside them.
     let input_rows = rows(inp, p, "input", ds);
-    crate::control::begin(input_rows.len());
+    let workers = geometry_threads(input_rows.len(), threads, || overlay_scratch(ds, &input_rows, &zones, (&index, &at_poles), true))?;
     let cuts = crate::parallel::try_map_on(
         &input_rows,
-        threads_for(input_rows.len()),
+        workers,
         || (),
         |_, _, &r| {
             let cut = ds.features.get(r).and_then(|f| f.geometry.as_ref()).map(|g| {
@@ -2342,19 +2766,38 @@ fn overlay_on(inp: &dyn Inputs, p: &Json, op: Overlay, threads: Option<usize>) -
         }
     }
     if op.keeps_overlay_rest() {
-        crate::control::begin(zones.len());
         let pairs: Vec<(&Zone, &Vec<usize>)> = zones.iter().zip(&covering).collect();
+        // A remainder worker collects all covering input polygons, unions them, then subtracts
+        // them from its zone. Estimate the largest such collection before starting workers.
+        let workers = geometry_threads(pairs.len(), threads, || {
+            crate::control::begin(pairs.len());
+            let mut scratch = 0;
+            for (z, inputs) in &pairs {
+                crate::control::check()?;
+                let mut cover = 0usize;
+                for &row in *inputs {
+                    crate::control::check()?;
+                    cover = cover.saturating_add(ds.features.geometry(row).map_or(0, coord_bytes));
+                }
+                scratch = scratch.max(cover.saturating_mul(3).saturating_add(kept_union_bytes(&[], &z.poly).saturating_mul(2)));
+                crate::control::advance(1);
+            }
+            Ok(scratch)
+        })?;
         let rests = crate::parallel::try_map_on(
             &pairs,
-            threads_for(pairs.len()),
+            workers,
             || (),
             |_, _, &(z, inputs)| {
                 let rest = if inputs.is_empty() {
                     from_multipolygon(&z.poly)
                 } else {
-                    let polys: Vec<MultiPolygon<f64>> =
-                        inputs.iter().filter_map(|r| ds.features.get(*r)?.geometry.as_ref()).filter_map(to_multipolygon).collect();
-                    from_multipolygon(&z.poly.difference(&union_all(polys.iter().flat_map(|m| m.0.iter()))))
+                    let polygons =
+                        inputs.iter().filter_map(|r| ds.features.get(*r)?.geometry.as_ref()).filter_map(to_multipolygon).flat_map(|m| m.0);
+                    // A redundant union rounds a lone polygon's vertices. That can open a
+                    // passage where it touches the zone boundary, joining separate pieces.
+                    let cover = mask_of(MultiPolygon::new(polygons.collect()));
+                    from_multipolygon(&z.poly.difference(&cover))
                 };
                 Ok::<_, String>(rest)
             },
@@ -2505,18 +2948,25 @@ fn update_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolR
     }
     let added = out.features.len() - kept;
     let mut messages = vec![format!("Update: {kept} input features kept, {added} update features added")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     messages.extend(left_out.notes("Update", &up.name));
     let features = |n: usize| if n == 1 { "1 update feature".to_string() } else { format!("{n} update features") };
     for (f, (n, days)) in ds.fields.iter().zip(unfit) {
         if n > 0 {
-            messages.push(format!("Update: '{}' is null in {}, whose value isn't a {} value", f.name, features(n), f.ty.label()));
+            losses.push(rustgis_data::loss::LossMessage {
+                code: rustgis_data::loss::LossCode::DroppedValue,
+                text: format!("Update: '{}' is null in {}, whose value isn't a {} value", f.name, features(n), f.ty.label()),
+            });
         }
         if days > 0 {
             let their = if days == 1 { "its" } else { "their" };
-            messages.push(format!("Update: '{}' holds dates, so {} kept only {their} day", f.name, features(days)));
+            losses.push(rustgis_data::loss::LossMessage {
+                code: rustgis_data::loss::LossCode::DroppedTime,
+                text: format!("Update: '{}' holds dates, so {} kept only {their} day", f.name, features(days)),
+            });
         }
     }
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// The most split areas (split polygons, or values of the split field) Split takes: more is an
@@ -2817,7 +3267,11 @@ fn split_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRe
         let areas = if empty == 1 { "split area" } else { "split areas" };
         msg = format!("{msg} ({empty} {areas} held no features)");
     }
-    Ok(ToolResult { output: Output::Layers(layers), messages: std::iter::once(msg).chain(left_out.notes("Split", &sp.name)).collect() })
+    Ok(ToolResult {
+        losses: Vec::new(),
+        output: Output::Layers(layers),
+        messages: std::iter::once(msg).chain(left_out.notes("Split", &sp.name)).collect(),
+    })
 }
 
 /// Dissolve: one feature for each value of the dissolve field (one for all without it), the union
@@ -2900,13 +3354,16 @@ fn dissolve(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         ));
     }
     let mut messages = vec![format!("Dissolve: {n} features")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     if not_polygons > 0 {
-        messages.push(format!(
+        losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::DroppedFeature, text: format!(
             "Dissolve: {not_polygons} feature(s) left out, with their values: no geometry, an empty polygon, or a point or line rather than a polygon"
-        ));
+        ) });
     }
-    messages.extend(rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default()));
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    let (said, rounded) = rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default());
+    messages.extend(said);
+    losses.extend(rounded);
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// The farthest (meters, either way) Minimum Bounding Geometry takes a point from the analysis
@@ -2945,10 +3402,11 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let points = |g: &Geometry| {
         let (mut these, mut gaps, mut poles) = (Vec::new(), 0usize, 0usize);
         g.for_each_vertex(|_, c| {
-            let m = if c.is_finite() { Some(rustgis_geom::lonlat_to_plane(c)) } else { None };
+            let m = if c.is_finite() { Some(crate::convert::to_plane(c)) } else { None };
             match m {
                 Some(m) if m.x.abs() <= HULL_LIMIT_M && m.y.abs() <= HULL_LIMIT_M => {
-                    poles += usize::from(c.y.abs() > 90.0);
+                    // (A projected system's y is no latitude.)
+                    poles += usize::from(crate::convert::plane() == crate::convert::Plane::Analysis && c.y.abs() > 90.0);
                     these.push(geo::Point::new(m.x, m.y));
                 }
                 _ => gaps += 1,
@@ -2985,7 +3443,7 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         let first = *ring.first()?;
         let (a, _) = farthest(first);
         let (b, span) = farthest(a);
-        let back = |c: geo::Coord<f64>| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y));
+        let back = |c: geo::Coord<f64>| crate::convert::from_plane(Coord::new(c.x, c.y));
         Some(if span > 0.0 { Geometry::Line(vec![vec![back(a), back(b)]]) } else { Geometry::Point(back(a)) })
     };
     let (mut flat, mut gaps, mut poles) = (0usize, 0usize, 0usize);
@@ -3060,8 +3518,12 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         out.geometry_type = first;
     }
     let out_kind = out.geometry_type;
+    // How far out a coordinate is too far, in the units the run works in.
+    let own = crate::convert::plane() == crate::convert::Plane::Own;
+    let too_far =
+        if own { format!("past {HULL_LIMIT_M:.0e} in the layer's own units") } else { "past about 9 million degrees".to_string() };
     let gaps_note = (gaps > 0).then(|| {
-        format!("{gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)")
+        format!("{gaps} vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it ({too_far})")
     });
     let poles_note = (poles > 0).then(|| format!("{poles} vertex(es) with a latitude past a pole found (taken as that pole)"));
     // Nothing hulled, every feature skipped: an unusable result, so an error saying why, with the
@@ -3073,7 +3535,14 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let n = out.features.len();
     let mut r = result(out, format!("Minimum Bounding Geometry: {n} hulls"))?;
     if skipped > 0 {
-        r.messages.push(format!("Minimum Bounding Geometry: {skipped} feature(s) skipped: no geometry, or no point it can use"));
+        let text = format!("Minimum Bounding Geometry: {skipped} feature(s) skipped: no geometry, or no point it can use");
+        // Each feature has a hull of its own, which these lose; hulled together, a feature without
+        // geometry adds nothing, and one whose points are passed over is said with them.
+        if each {
+            r.losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::DroppedFeature, text });
+        } else {
+            r.messages.push(text);
+        }
     }
     r.messages.extend(gaps_note.into_iter().chain(poles_note).map(|n| format!("Minimum Bounding Geometry: {n}")));
     if flat > 0 {
@@ -3089,8 +3558,14 @@ fn convex_hull(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
                 n.saturating_sub(flat)
             ),
         };
+        // On one straight line in the plane the run works in: in longitude/latitude, the map's.
+        let line = if own {
+            "points in one place or on one straight line in the layer's coordinate system".to_string()
+        } else {
+            "points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground)".to_string()
+        };
         r.messages.push(format!(
-            "Minimum Bounding Geometry: {flat} of {n} hulls have no area, so they are written as a point or a line: a single point, or points in one place or on one straight line on the map (on one meridian or parallel, say; beyond 85.05° that includes points around a pole, which enclose a cap on the ground); {layer}"
+            "Minimum Bounding Geometry: {flat} of {n} hulls have no area, so they are written as a point or a line: a single point, or {line}; {layer}"
         ));
     }
     Ok(r)
@@ -3491,6 +3966,10 @@ const SEAM: f64 = 1e-9;
 /// on opposite sides of the antimeridian; a part that touches it and turns back, or two that only
 /// meet there, stay apart, as parts meeting anywhere else do.
 fn meet_at_seam(part: &[Coord], next: &[Coord]) -> bool {
+    // No antimeridian in a projected system's own plane.
+    if crate::convert::plane() == crate::convert::Plane::Own {
+        return false;
+    }
     fn on_seam(c: &Coord) -> bool {
         180.0 - rustgis_geom::fold_lon(c.x).abs() <= SEAM
     }
@@ -3514,7 +3993,7 @@ fn meet_at_seam(part: &[Coord], next: &[Coord]) -> bool {
 fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
     let closed = |run: &[Vec<Coord>]| {
         let mut v = run.iter().flatten().filter(|c| c.is_finite());
-        matches!((v.next(), v.next_back()), (Some(a), Some(b)) if a == b || rustgis_geom::wgs84_inverse(*a, *b).0 < MIN_SEGMENT)
+        matches!((v.next(), v.next_back()), (Some(a), Some(b)) if a == b || inverse(*a, *b).0 < MIN_SEGMENT)
     };
     match g {
         Geometry::Line(parts) => {
@@ -3538,8 +4017,9 @@ fn for_each_line(g: &Geometry, mut f: impl FnMut(&[Vec<Coord>], bool)) {
     }
 }
 
-/// A segment of a part on the WGS 84 ellipsoid: its ends, its length in meters, and its azimuths
-/// at either end (degrees clockwise from north).
+/// A segment of a part on the WGS 84 ellipsoid, or straight in a projected system's own plane: its
+/// ends, its length in meters, and its azimuths at either end (degrees clockwise from north, grid
+/// north in a projected system).
 #[derive(Clone, Copy, Debug)]
 struct Segment {
     a: Coord,
@@ -3564,7 +4044,7 @@ fn segments(line: &[Vec<Coord>], ring: bool) -> impl Iterator<Item = Segment> + 
         .chain(first.filter(|_| ring))
         .scan(first, |kept, b| {
             let a = (*kept)?;
-            let (len, azi_a, azi_b) = rustgis_geom::wgs84_inverse(a, b);
+            let (len, azi_a, azi_b) = inverse(a, b);
             // False for NaN; a vertex passed over leaves the next segment starting at `a`.
             let long_enough = len >= MIN_SEGMENT;
             if long_enough {
@@ -3585,8 +4065,22 @@ const ELLIPSOID_STRETCH: f64 = 1.005;
 /// sphere, stretched by [`ELLIPSOID_STRETCH`]. A few operations a segment, against an iterative
 /// solution for the exact length, it sizes the point list before each segment is solved, once.
 /// (Leaving out a vertex only shortens a part.) Coordinates are folded and clamped as GeographicLib
-/// takes them, so the bound holds for any finite ones.
+/// takes them, so the bound holds for any finite ones. In a projected system's own plane, the bound
+/// is the edges' flat metres, as the walk adds them up, and a hair more.
+#[expect(clippy::disallowed_methods, reason = "an upper bound, stretched by `ELLIPSOID_STRETCH` to cover the ellipsoid's longer paths")]
 fn length_bound(line: &[Vec<Coord>], ring: bool) -> f64 {
+    if let Some(unit) = crate::convert::own_unit_m() {
+        let mut verts = line.iter().flatten().filter(|c| c.is_finite());
+        let Some(first) = verts.next() else { return 0.0 };
+        // Each edge's metres, as `segments` makes them and the walk adds them up, and a hair more
+        // for the rounding of the sums (a vertex `segments` passes over only shortens the line).
+        let (mut prev, mut sum) = (first, 0.0);
+        for c in verts.chain(ring.then_some(first)) {
+            sum += (c.x - prev.x).hypot(c.y - prev.y) * unit;
+            prev = c;
+        }
+        return sum * (1.0 + 1e-9);
+    }
     let fold = |c: &Coord| Coord::new(rustgis_geom::fold_lon(c.x), c.y.clamp(-90.0, 90.0));
     let mut verts = line.iter().flatten().filter(|c| c.is_finite()).map(fold);
     let Some(first) = verts.next() else { return 0.0 };
@@ -3596,6 +4090,34 @@ fn length_bound(line: &[Vec<Coord>], ring: bool) -> f64 {
         prev = c;
     }
     sum * ELLIPSOID_STRETCH
+}
+
+/// The length in meters from `a` to `b` and the azimuths at either end (degrees clockwise from
+/// north): on the WGS 84 ellipsoid ([`rustgis_geom::wgs84_inverse`]), or straight in a projected
+/// system's own plane, its length in its unit times the unit's ([`crate::convert::own_unit_m`]),
+/// from grid north, whichever way the system's axes point (`+axis=wsu`).
+fn inverse(a: Coord, b: Coord) -> (f64, f64, f64) {
+    match crate::convert::own_unit_m() {
+        Some(unit) => {
+            let (east, north) = crate::convert::own_east_north(b.x - a.x, b.y - a.y);
+            let azimuth = east.atan2(north).to_degrees();
+            ((b.x - a.x).hypot(b.y - a.y) * unit, azimuth, azimuth)
+        }
+        None => rustgis_geom::wgs84_inverse(a, b),
+    }
+}
+
+/// The place `along` meters from a segment's start toward its end, and the direction there: by a
+/// direct solution on the ellipsoid ([`rustgis_geom::wgs84_direct`]), or straight along it in a
+/// projected system's own plane.
+fn direct(seg: &Segment, along: f64) -> (Coord, f64) {
+    match crate::convert::plane() {
+        crate::convert::Plane::Own => {
+            let t = if seg.len > 0.0 { along / seg.len } else { 0.0 };
+            (Coord::new(seg.a.x + t * (seg.b.x - seg.a.x), seg.a.y + t * (seg.b.y - seg.a.y)), seg.azi_a)
+        }
+        crate::convert::Plane::Analysis => rustgis_geom::wgs84_direct(seg.a, seg.azi_a, along),
+    }
 }
 
 /// The direction halfway between two azimuths (degrees), or `b` when they are opposite.
@@ -3635,11 +4157,8 @@ fn walk_line(segs: &[Segment], ring: bool, spacing: Spacing, mut emit: impl FnMu
         // The points before this segment's end; one at its end is on the next one's start.
         while k < n && at(k) < walked + seg.len - tol {
             let along = at(k) - walked;
-            let (c, azimuth) = if along <= tol {
-                (seg.a, arriving.map_or(seg.azi_a, |inc| mean_azimuth(inc, seg.azi_a)))
-            } else {
-                rustgis_geom::wgs84_direct(seg.a, seg.azi_a, along)
-            };
+            let (c, azimuth) =
+                if along <= tol { (seg.a, arriving.map_or(seg.azi_a, |inc| mean_azimuth(inc, seg.azi_a))) } else { direct(seg, along) };
             let vertex = (along <= tol).then_some(i);
             if vertex.is_none() || vertex != on_vertex {
                 if emit(c, at(k), bearing(azimuth)).is_break() {
@@ -3674,6 +4193,9 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         return Err(format!("{TOOL} needs a line or polygon layer"));
     }
     let unit = to_metres(1.0, s(p, "units"))?;
+    // Measured straight in a projected system's own plane (#2032 C2e-3), with no antimeridian or
+    // poles there.
+    let own_plane = crate::convert::plane() == crate::convert::Plane::Own;
     // Finite in meters too: 1e308 miles is not a distance.
     let step = num(p, "distance")
         .map(|d| d * unit)
@@ -3802,7 +4324,9 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 return;
             }
             missing = missing.saturating_add(line.iter().flatten().filter(|c| !c.is_finite()).count());
-            past_pole = past_pole.saturating_add(line.iter().flatten().filter(|c| c.is_finite() && c.y.abs() > 90.0).count());
+            if !own_plane {
+                past_pole = past_pole.saturating_add(line.iter().flatten().filter(|c| c.is_finite() && c.y.abs() > 90.0).count());
+            }
             // Each segment solved once. A line has no more segments than vertices, so the list
             // stays within the room reserved for the longest.
             segs.clear();
@@ -3815,7 +4339,8 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 }
                 // Folded into −180..180: a point past the antimeridian is on the far side of the map.
                 // A vertex's latitude past a pole (bad data) is the pole, where the walk measured it.
-                let c = Coord::new(rustgis_geom::fold_lon(c.x), c.y.clamp(-90.0, 90.0));
+                // (In a projected system's own plane, as it is.)
+                let c = if own_plane { c } else { Coord::new(rustgis_geom::fold_lon(c.x), c.y.clamp(-90.0, 90.0)) };
                 list.push(c, own, kept, [fid.clone(), Value::Float(along / unit), Value::Float(angle)])
             });
         });
@@ -3832,7 +4357,10 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let written = out.features.len();
     let mut r = result(out, format!("{TOOL}: {written} points"))?;
     if missing > 0 {
-        r.messages.push(format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over"));
+        r.losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedGeometry,
+            text: format!("{TOOL}: {missing} vertex(es) with a coordinate missing or infinite passed over"),
+        });
     }
     if past_pole > 0 {
         r.messages.push(format!(
@@ -3840,7 +4368,10 @@ fn points_along_lines(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         ));
     }
     if without_geometry > 0 {
-        r.messages.push(format!("{TOOL}: {without_geometry} feature(s) without geometry skipped"));
+        r.losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedFeature,
+            text: format!("{TOOL}: {without_geometry} feature(s) without geometry skipped"),
+        });
     }
     if point_features > 0 {
         r.messages.push(format!("{TOOL}: {point_features} point feature(s) skipped; only lines and polygon rings produce points"));
@@ -3913,10 +4444,21 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         total += 1;
         let xy = coordinate(ds.value(r, xi)).zip(coordinate(ds.value(r, yi)));
         read += usize::from(xy.is_some());
-        let pt = xy.and_then(|(x, y)| to.to_lonlat(Coord::new(x, y))).filter(|c| c.is_finite() && c.x.abs() <= 180.0 && c.y.abs() <= 90.0);
+        // Kept as the table gives it, held in its system, where it has a place in
+        // longitude/latitude (as a CSV file's points are read); in Web Mercator, one it can hold
+        // there, within 85.05° (as `Dataset::hold_in` takes it).
+        let max_lat = if crs == Crs::WebMercator { rustgis_geom::MAX_LAT } else { 90.0 };
+        let pt = xy
+            .map(|(x, y)| Coord::new(x, y))
+            .filter(|&c| to.to_lonlat(c).is_some_and(|l| l.is_finite() && l.x.abs() <= 180.0 && l.y.abs() <= max_lat));
         placed += usize::from(pt.is_some());
         // A row without a usable position stays in the layer's table, without a point.
         out.push_next(pt.map(Geometry::Point), f.attrs.clone());
+    }
+    // Its points are held in their own system, which exports use by default (#2032 C2e-5).
+    if crs != Crs::LonLat {
+        out.held_in = crs;
+        out.crs = Some(crs);
     }
     if placed == 0 {
         return Err(if read == 0 {
@@ -3930,11 +4472,24 @@ fn xy_table_to_point(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         });
     }
     let mut messages = vec![format!("XY Table To Point: {placed} points")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     messages.extend(crs_note.map(|note| format!("XY Table To Point: its coordinate system: {note}")));
-    if placed < total {
-        messages.push(format!("{} of {total} rows have no usable coordinates; they are in the table without a point", total - placed));
+    // A row without numbers had no place to lose; one whose numbers have no place in the system
+    // has lost it.
+    if read < total {
+        messages.push(format!("{} of {total} rows have no numbers in both fields; they are in the table without a point", total - read));
     }
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    if placed < read {
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedGeometry,
+            text: format!(
+                "{} of {total} rows have coordinates with no place in {}; they are in the table without a point",
+                read - placed,
+                crs.label()
+            ),
+        });
+    }
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// The distances a Douglas–Peucker run of `n` vertices may measure, `n` times this: far more than
@@ -4007,11 +4562,15 @@ fn simplify_coords_within(pts: &[geo::Coord<f64>], tol_m: f64, run: &SimplifyRun
     {
         return pts.to_vec();
     }
+    // In a projected system's own plane, the tolerance is a length there, at one scale
+    // ([`crate::convert::own_length`]): every vertex's scale is 1 and its "latitude" 0.
+    let own = crate::convert::own_length(tol_m);
     // On the ellipsoid, not the sphere ([`SPHERE_TO_WGS84`]).
-    let tol_m = tol_m * SPHERE_TO_WGS84;
+    let tol_m = own.unwrap_or(tol_m * SPHERE_TO_WGS84);
     // Each vertex's latitude and scale (plane meters per ground meter, [`merc_scale`]), worked out
     // once.
-    let lat: Vec<f64> = pts.iter().map(|c| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y).collect();
+    let lat: Vec<f64> =
+        if own.is_some() { vec![0.0; n] } else { pts.iter().map(|c| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y)).y).collect() };
     let scale: Vec<f64> = lat.iter().map(|&y| merc_scale(y)).collect();
     let mut keep = vec![false; n];
     if let Some(k) = keep.first_mut() {
@@ -4136,20 +4695,23 @@ pub fn simplify_geometry(g: &Geometry, tol_m: f64) -> (Geometry, SimplifyNotes) 
     // plane, is left exactly as it was (`simplify_checked`), and the feature is counted. Otherwise
     // a latitude past ±90° (bad data), infinite ones included, is taken as that pole by the plane,
     // and the vertices are counted; a line part of fewer than 2 vertices has no line to keep
-    // (`from_line`), and is counted. Points aren't simplified.
+    // (`from_line`), and is counted. Points aren't simplified. A projected system's own plane has
+    // no latitude, and no pole to take a vertex to.
+    let own = crate::convert::plane() == crate::convert::Plane::Own;
     if tol_m > 0.0 && !s.broken && !matches!(g, Geometry::Point(_) | Geometry::MultiPoint(_)) {
         let mut beyond = false;
-        g.for_each_coord(|c| beyond |= !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
+        g.for_each_coord(|c| beyond |= !own && !c.y.is_nan() && c.y.abs() > rustgis_geom::MAX_LAT);
         notes.polar = usize::from(beyond);
+        let count_past_pole = |coords: &mut dyn Iterator<Item = &Coord>| if own { 0 } else { past_pole(coords) };
         // The vertices taken to a pole are those in what's kept: a line's parts of 2 vertices or
         // more, a polygon's rings. A line whose parts are all that short is kept as it was
         // (`from_line` has none to give), so only the short parts beside a longer one go.
         (notes.past_pole, notes.short) = match g {
             Geometry::Line(parts) if parts.iter().any(|p| p.len() >= 2) => {
-                (past_pole(parts.iter().filter(|p| p.len() >= 2).flatten()), parts.iter().filter(|p| p.len() < 2).count())
+                (count_past_pole(&mut parts.iter().filter(|p| p.len() >= 2).flatten()), parts.iter().filter(|p| p.len() < 2).count())
             }
             Geometry::Line(_) => (0, 0),
-            Geometry::Polygon(polygons) => (past_pole(polygons.iter().flatten().flatten()), 0),
+            Geometry::Polygon(polygons) => (count_past_pole(&mut polygons.iter().flatten().flatten()), 0),
             _ => (0, 0),
         };
         // A geometry given back as it was (nothing to keep in the plane, or canceled) moved nothing
@@ -4259,7 +4821,7 @@ fn simplify_checked(g: &Geometry, tol_m: f64) -> Simplified {
         // overflow; no place on Earth is within a hair of it.
         const PLANE_LIMIT: f64 = 1e150;
         g.for_each_coord(|c| {
-            let p = rustgis_geom::lonlat_to_plane(c);
+            let p = crate::convert::to_plane(c);
             broken |= p.x.is_nan() || p.y.is_nan() || p.x.abs() > PLANE_LIMIT || p.y.abs() > PLANE_LIMIT;
         });
         if broken {
@@ -4321,8 +4883,8 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
     let (mut before, mut after, mut without) = (0usize, 0usize, 0usize);
     let mut notes = SimplifyNotes::default();
     let input_rows = rows(inp, p, "input", ds);
-    crate::control::begin(input_rows.len());
-    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(input_rows.len(), PARALLEL_FEATURES));
+    // Converted coordinates, latitude/scale arrays, simplifier work and the rebuilt geometry.
+    let threads = geometry_threads(input_rows.len(), threads, || Ok(largest_geometry_bytes(ds, &input_rows)?.saturating_mul(8)))?;
     let simplified = crate::parallel::try_map_on(
         &input_rows,
         threads,
@@ -4349,11 +4911,15 @@ fn simplify_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<Too
         out.push(Some(geometry), f.attrs.clone());
     }
     let mut messages = vec![format!("Simplify: {before} → {after} vertices")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     messages.extend(notes.messages("Simplify"));
     if without > 0 {
-        messages.push(format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"));
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedFeature,
+            text: format!("Simplify: {without} feature(s) left out: they have no geometry to simplify"),
+        });
     }
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// A Select by Location selector: its shape and extent in the analysis plane, and the poles it
@@ -4501,7 +5067,7 @@ fn select_by_location_with_work_limit(inp: &dyn Inputs, p: &Json, limit: usize, 
             "{coarse} selecting features' buffers have outline edges left with fewer points along them than they need (the points a ring may add ran out, as on a ring of thousands of long edges, or a very long edge was halved as many times as it may be): features near their edges there may be selected or not by more than a buffer otherwise keeps to (0.012% of the distance, 0.05% along a line or outline buffered in stretches, or 1 cm)"
         ));
     }
-    Ok(ToolResult { output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Selection { layer: ds.name.clone(), rows: hits }, messages })
 }
 
 fn select_by_attributes(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -4509,6 +5075,7 @@ fn select_by_attributes(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String
     let hits = rustgis_data::query::select(s(p, "where"), ds)?;
     let n = hits.len();
     Ok(ToolResult {
+        losses: Vec::new(),
         output: Output::Selection { layer: ds.name.clone(), rows: hits },
         messages: vec![format!("Selected {n} features in {}", ds.name)],
     })
@@ -4529,8 +5096,8 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
             }
         });
     }
-    let (crs, crs_note) = raster_crs(ds, p, "IDW Interpolation")?;
-    let (pts, beyond_note) = points_in(crs, pts)?;
+    let (crs, crs_note) = raster_crs_in(ds, inp.work_crs(), inp.project_crs(), p, "IDW Interpolation")?;
+    let (pts, beyond_note) = points_from(inp.work_crs(), crs, pts)?;
     let extent = match s(p, "extent").trim() {
         "" => {
             let mut e = Extent::EMPTY;
@@ -4566,6 +5133,7 @@ fn idw_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     let bytes = rustgis_data::raster::geotiff::write(&r, 0).map_err(|e| e.to_string())?;
     let msg = format!("IDW Interpolation: {} × {} cells from {} points", r.width, r.height, pts.len());
     Ok(ToolResult {
+        losses: Vec::new(),
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
         messages: std::iter::once(msg).chain(beyond_note).chain(crs_note).collect(),
     })
@@ -4591,7 +5159,10 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let field = s(p, "field");
     let fi = find_field_case_insensitive(ds, field)?;
     let mut raw_pts: Vec<(Coord, f64)> = Vec::new();
-    for r in rows(inp, p, "input", ds) {
+    for (n, r) in rows(inp, p, "input", ds).into_iter().enumerate() {
+        if n % LOOK_EVERY == 0 {
+            crate::control::check()?;
+        }
         let Some(g) = ds.features.get(r).and_then(|f| f.geometry.as_ref()) else { continue };
         let Some(v) = ds.value(r, fi).as_f64().filter(|v| v.is_finite()) else { continue };
         match g {
@@ -4618,32 +5189,10 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             }
         }
     }
-    let (crs, crs_note) = raster_crs(ds, p, "Ordinary Kriging")?;
-    let (mut raw_pts, beyond_note) = points_in(crs, raw_pts)?;
-    // Deduplicate sample points by coordinate to prevent singular kriging matrix
-    raw_pts.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.0.y.total_cmp(&b.0.y)));
-    let mut accum: Vec<(Coord, f64, usize)> = Vec::with_capacity(raw_pts.len());
-    for (c, v) in raw_pts {
-        let mut duplicate_idx = None;
-        for (i, (last_c, _, _)) in accum.iter().enumerate().rev() {
-            if c.x - last_c.x >= 1e-9 {
-                break;
-            }
-            if (c.y - last_c.y).abs() < 1e-9 {
-                duplicate_idx = Some(i);
-                break;
-            }
-        }
-        if let Some(i) = duplicate_idx {
-            if let Some((_, sum, count)) = accum.get_mut(i) {
-                *sum += v;
-                *count += 1;
-            }
-            continue;
-        }
-        accum.push((c, v, 1));
-    }
-    let pts: Vec<(Coord, f64)> = accum.into_iter().map(|(c, sum, count)| (c, sum / count as f64)).collect();
+    let (crs, crs_note) = raster_crs_in(ds, inp.work_crs(), inp.project_crs(), p, "Ordinary Kriging")?;
+    let (raw_pts, beyond_note) = points_from(inp.work_crs(), crs, raw_pts)?;
+    // Points at the same place as one, so the kriging matrix isn't singular.
+    let pts = merge_coincident(raw_pts)?;
     if pts.len() < 2 {
         return Err(with_note("kriging needs at least two points with values".into(), &beyond_note));
     }
@@ -4707,12 +5256,116 @@ fn kriging_interpolation(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let var_name = format!("{name}_variance");
     let msg = format!("Ordinary Kriging ({}): {} × {} cells from {} points", model.as_str(), r.width, r.height, pts.len());
     Ok(ToolResult {
+        losses: Vec::new(),
         output: Output::Layers(vec![
             OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes: pred_bytes },
             OutputLayer::Raster { file_name: format!("{var_name}.tif"), name: var_name, bytes: var_bytes },
         ]),
         messages: std::iter::once(msg).chain(beyond_note).chain(crs_note).collect(),
     })
+}
+
+/// How many points or rows Kriging's preparation goes through between two looks at Cancel.
+const LOOK_EVERY: usize = 4096;
+
+/// Kriging's sample points with those at the same place (within 1e-9 in x and in y) as one, their
+/// values averaged: in x then y order, each point joins the latest point kept before it that is
+/// less than 1e-9 to its left and less than 1e-9 above or below it, else is kept. The points kept
+/// so far are found through cells of 4e-9 around each point, so a run of points sharing an x (a
+/// survey line, a grid's column) costs as little as any other: linear work, looking at Cancel
+/// every [`LOOK_EVERY`] points. A point first scans back a few steps, as the merge always did,
+/// which settles nearly every one; only a point in a longer run within 1e-9 to its left looks in
+/// the cells, and only such runs are filed in them. The cells hold no list of their own: each
+/// holds its latest point filed, and each point the one filed before it in its cell. The sort is one short step without a look. (A cell is four times
+/// the tolerance so a point's cell number, rounded, is never more than one cell from its
+/// neighbour's: two coordinates within 1e-9 of each other but not equal are under 2^23, where the
+/// rounding is a fraction of a cell. From 2^24 on, where only equal coordinates are that close, a
+/// coordinate is its own cell, numbered by its bits, which no cell number below reaches: huge
+/// coordinates don't all share the last cell.)
+fn merge_coincident(mut points: Vec<(Coord, f64)>) -> Result<Vec<(Coord, f64)>, String> {
+    const NEAR: f64 = 1e-9;
+    // How far back each point scans before it looks in the cells.
+    const SCAN: usize = 8;
+    let cell = coincident_cell;
+    points.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.0.y.total_cmp(&b.0.y)));
+    let mut kept: Vec<(Coord, f64, usize)> = Vec::with_capacity(points.len());
+    // The cells, filed only when a run needs them: the latest point filed in each cell, and for
+    // each point filed the one filed before it in its cell. Points are filed in the order kept, from
+    // the first within 1e-9 to the left of the point that needs them (`window`: none before it can
+    // be near it or any point after it), up to `filed`.
+    let mut latest: HashMap<(i64, i64), usize> = HashMap::new();
+    let mut before: Vec<Option<usize>> = Vec::new();
+    let (mut window, mut filed) = (0usize, 0usize);
+    for (n, (c, v)) in points.into_iter().enumerate() {
+        if n % LOOK_EVERY == 0 {
+            crate::control::check()?;
+        }
+        // The points kept just before it first, as the scan back always went: most points end it
+        // within a few steps (a point found, or one past 1e-9 to the left). A run that goes on (a
+        // shared x) is looked up in the cells instead.
+        let mut joins: Option<usize> = None;
+        let mut settled = false;
+        for (i, (k, _, _)) in kept.iter().enumerate().rev().take(SCAN) {
+            if c.x - k.x >= NEAR {
+                settled = true;
+                break;
+            }
+            if (c.y - k.y).abs() < NEAR {
+                joins = Some(i);
+                settled = true;
+                break;
+            }
+        }
+        settled |= kept.len() <= SCAN;
+        if !settled {
+            while kept.get(window).is_some_and(|(k, _, _)| c.x - k.x >= NEAR) {
+                window += 1;
+            }
+            for i in filed.max(window)..kept.len() {
+                if let (Some((k, _, _)), Some(slot)) = (kept.get(i), before.get_mut(i)) {
+                    *slot = latest.insert((cell(k.x), cell(k.y)), i);
+                }
+            }
+            filed = kept.len();
+        }
+        // (A point kept is never to the right of it, so never a column of cells to its right.)
+        let (cx, cy) = (cell(c.x), cell(c.y));
+        for dx in (-1..=0).filter(|_| !settled) {
+            for dy in -1..=1 {
+                // A cell's points, latest first: its first near one is its latest.
+                let mut at = latest.get(&(cx.saturating_add(dx), cy.saturating_add(dy))).copied();
+                while let Some(i) = at {
+                    if kept.get(i).is_some_and(|(k, _, _)| c.x - k.x < NEAR && (c.y - k.y).abs() < NEAR) {
+                        if joins.is_none_or(|j| i > j) {
+                            joins = Some(i);
+                        }
+                        break;
+                    }
+                    at = before.get(i).copied().flatten();
+                }
+            }
+        }
+        match joins.and_then(|i| kept.get_mut(i)) {
+            Some((_, sum, count)) => {
+                *sum += v;
+                *count += 1;
+            }
+            None => {
+                before.push(None);
+                kept.push((c, v, 1));
+            }
+        }
+    }
+    Ok(kept.into_iter().map(|(c, sum, count)| (c, sum / count as f64)).collect())
+}
+
+/// The cell [`merge_coincident`] files a coordinate `v` under: below 2^24, the index of its
+/// 4e-9-wide cell, numbered from zero (under 2^53, an i64 exactly); from 2^24 on, the coordinate's own bits,
+/// whose magnitude (an exponent of 24 or more) is past 2^60, beyond every number below.
+fn coincident_cell(v: f64) -> i64 {
+    const CELL: f64 = 4e-9;
+    const EXACT_FROM: f64 = 16_777_216.0;
+    if v.abs() < EXACT_FROM { (v / CELL).floor() as i64 } else { v.to_bits() as i64 }
 }
 
 /// The projected system an interpolation takes from a layer read in `crs` when it is given none
@@ -4729,30 +5382,64 @@ pub fn layer_raster_crs(crs: Option<Crs>) -> Option<Result<Crs, String>> {
 
 /// The coordinate system an interpolation (`tool`) makes its grid in: the projected system given as
 /// `p`'s `crs`; degrees for `EPSG:4326`; else [`layer_raster_crs`], the projected system `ds` was
-/// read in, as Kernel Density uses, and degrees for a layer read in degrees. The note says what the
-/// run used where that could surprise: the system it took from the layer, or the compatibility note
-/// on the one given.
+/// read in, and degrees for a layer read in degrees. The Geostatistical Wizard and a run in
+/// longitude/latitude take it so; the interpolations and Kernel Density, in a run in a layer's own
+/// projected system, take that one ([`raster_crs_in`]). The note says what the run used where that
+/// could surprise: the system it took from the layer, or the compatibility note on the one given.
 pub fn raster_crs(ds: &Dataset, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
+    raster_crs_of(ds.crs, "was read in", &ds.name, p, tool)
+}
+
+/// [`raster_crs`] for a run in `work` ([`Inputs::work_crs`]): a layer held in its own projected
+/// system makes its grid there unless `p` names another; one in degrees, or with no system, makes
+/// it in `project`, the project's system ([`Inputs::project_crs`]), when that is projected.
+pub fn raster_crs_in(ds: &Dataset, work: Crs, project: Option<Crs>, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
+    if work != Crs::LonLat {
+        return raster_crs_of(Some(work), "is held in", &ds.name, p, tool);
+    }
+    if let Some(c) = project_raster_crs(ds.crs, project, p) {
+        let note = format!(
+            "{tool}: made in {}, the project's coordinate system, with its units for the extent and sizes, as '{}' {}; set crs to EPSG:4326 to make it in degrees",
+            c.label(),
+            ds.name,
+            if ds.crs.is_some() { "is in degrees" } else { "has no coordinate system" },
+        );
+        return Ok((c, Some(note)));
+    }
+    raster_crs_of(ds.crs, "was read in", &ds.name, p, tool)
+}
+
+/// The project's system (`project`) for a grid made from a layer read in `layer_crs` when the run
+/// names none (`p`'s `crs`): only for a layer in degrees or with no system, and only a projected
+/// system this version can project to.
+fn project_raster_crs(layer_crs: Option<Crs>, project: Option<Crs>, p: &Json) -> Option<Crs> {
+    let unnamed = p.get("crs").is_none_or(|v| v.is_null() || v.as_str().is_some_and(|t| t.trim().is_empty()));
+    if !unnamed || layer_raster_crs(layer_crs).is_some() {
+        return None;
+    }
+    layer_raster_crs(project)?.ok()
+}
+
+/// [`raster_crs`] for a layer named `name` that `how` ("was read in", "is held in") `layer_crs`.
+fn raster_crs_of(layer_crs: Option<Crs>, how: &str, name: &str, p: &Json, tool: &str) -> Result<(Crs, Option<String>), String> {
     if p.get("crs").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("crs must be text".into());
     }
     match s(p, "crs").trim() {
-        "" => Ok(match layer_raster_crs(ds.crs) {
+        "" => Ok(match layer_raster_crs(layer_crs) {
             // A system that can't hold a raster's cells (geocentric), or one this version can't
             // project to: degrees, as before, and said why.
             Some(Err(why)) => (
                 Crs::LonLat,
                 Some(format!(
-                    "{tool}: made in degrees of longitude and latitude, though {} was read in {why}; give a projected crs to make it in metres or feet",
-                    ds.name
+                    "{tool}: made in degrees of longitude and latitude, though {name} {how} {why}; give a projected crs to make it in metres or feet"
                 )),
             ),
             Some(Ok(c)) => (
                 c,
                 Some(format!(
-                    "{tool}: made in {}, the coordinate system {} was read in, with its units for the extent and sizes; set crs to EPSG:4326 to make it in degrees",
-                    c.label(),
-                    ds.name
+                    "{tool}: made in {}, the coordinate system {name} {how}, with its units for the extent and sizes; set crs to EPSG:4326 to make it in degrees",
+                    c.label()
                 )),
             ),
             None => (Crs::LonLat, None),
@@ -4783,17 +5470,55 @@ pub fn projected_crs(text: &str) -> Result<(Crs, Option<String>), String> {
 }
 
 /// `pts` (longitude/latitude) in `crs`, and a note counting those left out because the system
-/// can't hold them (see [`in_projected`]). One short step without a Cancel check: a point costs a
-/// projection and its round trip, far less than the interpolation that follows.
+/// can't hold them (see [`in_projected`]). A point costs a projection and its round trip: Cancel is
+/// looked at every [`LOOK_EVERY`] points.
 pub fn points_in(crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
-    if crs == Crs::LonLat {
+    points_from(Crs::LonLat, crs, pts)
+}
+
+/// [`points_in`] for points in `from`, a run's own system ([`Inputs::work_crs`]): as they are
+/// when the grid is in it too, else through [`ToGrid`].
+pub fn points_from(from: Crs, crs: Crs, pts: Vec<(Coord, f64)>) -> Result<(Vec<(Coord, f64)>, Option<String>), String> {
+    if from == crs {
         return Ok((pts, None));
     }
-    let to = crs.transformer()?;
-    let n = pts.len();
-    let kept: Vec<(Coord, f64)> = pts.into_iter().filter_map(|(c, v)| in_projected(crs, &to, c).map(|c| (c, v))).collect();
-    let beyond = n - kept.len();
-    Ok((kept, beyond_note(crs, beyond)))
+    let to = ToGrid::new(from, crs)?;
+    let (mut beyond, mut unplaced) = (0usize, 0usize);
+    // (In the points' own storage, as a filtered collect of the same kind reuses it.)
+    let kept: Vec<(Coord, f64)> = pts
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, (c, v))| {
+            if i % LOOK_EVERY == 0
+                && let Err(cancelled) = crate::control::check()
+            {
+                return Some(Err(cancelled));
+            }
+            match to.try_place(c) {
+                Ok(c) => Some(Ok((c, v))),
+                Err(Miss::Source) => {
+                    unplaced += 1;
+                    None
+                }
+                Err(Miss::Grid) => {
+                    beyond += 1;
+                    None
+                }
+            }
+        })
+        .collect::<Result<_, crate::control::Cancelled>>()?;
+    Ok((kept, left_out_note(from, crs, unplaced, beyond)))
+}
+
+/// The note on the points left out: `unplaced` that their own system `from` can't give in
+/// longitude/latitude, and `beyond` that the grid's `crs` can't hold ([`beyond_note`]).
+fn left_out_note(from: Crs, crs: Crs, unplaced: usize, beyond: usize) -> Option<String> {
+    let unplaced =
+        (unplaced > 0).then(|| format!("{unplaced} point(s) that {} can't give in longitude/latitude were left out", from.label()));
+    match (unplaced, beyond_note(crs, beyond)) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    }
 }
 
 /// The note on `beyond` points left out because `crs` can't hold them (see [`in_projected`]).
@@ -4817,6 +5542,86 @@ fn in_projected(crs: Crs, to: &Transformer, c: Coord) -> Option<Coord> {
     // past it through, onto the edge.
     let held = crs != Crs::WebMercator || c.y.abs() <= rustgis_geom::MAX_LAT;
     held.then(|| to.from_lonlat(c)).flatten().filter(|p| p.is_finite() && to.to_lonlat(*p).is_some_and(|back| (back.y - c.y).abs() < 1e-4))
+}
+
+/// Which system a place failed in ([`ToGrid::try_place`]).
+pub(crate) enum Miss {
+    /// The run's own: it can't give the place in longitude/latitude.
+    Source,
+    /// The grid's: it can't hold the place.
+    Grid,
+}
+
+/// Places in a run's own system converted to a grid's system `crs`, as [`in_projected`] takes
+/// them from longitude/latitude: a place `crs` can't hold is `None`. From longitude/latitude, that
+/// conversion; from the grid's own system, the place as it is; from another, through
+/// longitude/latitude for the check, then the direct operation between the two where it lands
+/// near that ([`Reprojection::point_near`]), so a datum pair takes its best operation.
+///
+/// [`Reprojection::point_near`]: rustgis_data::raster::Reprojection::point_near
+pub(crate) struct ToGrid {
+    crs: Crs,
+    same: bool,
+    /// The run's system's transformer, `None` from longitude/latitude.
+    from: Option<Transformer>,
+    to: Transformer,
+    direct: Option<rustgis_data::raster::Reprojection>,
+}
+
+impl ToGrid {
+    pub(crate) fn new(from: Crs, crs: Crs) -> Result<Self, String> {
+        let same = from == crs;
+        let unproject = if same || from == Crs::LonLat { None } else { Some(from.transformer()?) };
+        let direct = if unproject.is_some() { Some(from.to(crs)?) } else { None };
+        Ok(Self { crs, same, from: unproject, to: crs.transformer()?, direct })
+    }
+
+    pub(crate) fn place(&self, c: Coord) -> Option<Coord> {
+        self.try_place(c).ok()
+    }
+
+    /// [`ToGrid::place`], saying which system failed: the run's, which can't give the place in
+    /// longitude/latitude (a place that isn't finite counts as such, in any run), or the grid's,
+    /// which can't hold it.
+    pub(crate) fn try_place(&self, c: Coord) -> Result<Coord, Miss> {
+        if !c.is_finite() {
+            return Err(Miss::Source);
+        }
+        if self.same {
+            return Ok(c);
+        }
+        let lonlat = match &self.from {
+            Some(t) => t.to_lonlat(c).ok_or(Miss::Source)?,
+            None => c,
+        };
+        let via = in_projected(self.crs, &self.to, lonlat).ok_or(Miss::Grid)?;
+        Ok(self.direct.as_ref().map_or(via, |d| d.point_near(c, via)))
+    }
+
+    /// The places of the North and South Pole in the grid's system, those it holds: none when the
+    /// systems are the same.
+    pub(crate) fn poles(&self) -> Vec<Coord> {
+        if self.same {
+            return Vec::new();
+        }
+        [90.0, -90.0].into_iter().filter_map(|lat| in_projected(self.crs, &self.to, Coord::new(0.0, lat))).collect()
+    }
+
+    /// A polygon's vertex in the grid's system, as the grid's transformer takes a place in
+    /// longitude/latitude, with no check: Web Mercator takes a latitude past 85.05° as 85.05°, so a
+    /// zone reaching past it keeps its part below, as zones in longitude/latitude always did. Then
+    /// the direct operation's coordinates where it lands near that, as [`ToGrid::place`].
+    pub(crate) fn vertex(&self, c: Coord) -> Option<Coord> {
+        if self.same {
+            return c.is_finite().then_some(c);
+        }
+        let lonlat = match &self.from {
+            Some(t) => t.to_lonlat(c)?,
+            None => c,
+        };
+        let via = self.to.from_lonlat(lonlat).filter(|p| p.is_finite())?;
+        Some(self.direct.as_ref().map_or(via, |d| d.point_near(c, via)))
+    }
 }
 
 /// The note on a system an interpolation took from the layer (`p`'s `crs` empty), naming the values
@@ -4906,9 +5711,14 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     }
 
     let crs_text = s(p, "crs").trim();
+    // The system the layer is held in, in a run in its own; else the one it was read in.
+    let layer_crs = if inp.work_crs() == Crs::LonLat { ds.crs } else { Some(inp.work_crs()) };
     let (crs, crs_note) = if !crs_text.is_empty() {
         crs_with_compatibility_note(crs_text)?
-    } else if let Some(c) = ds.crs {
+    } else if let Some(c) = project_raster_crs(layer_crs, inp.project_crs(), p) {
+        let how = if layer_crs.is_some() { "is in degrees" } else { "has no coordinate system" };
+        (c, Some(format!("made in {}, the project's coordinate system, as '{}' {how}", c.label(), ds.name)))
+    } else if let Some(c) = layer_crs {
         (c, None)
     } else {
         return Err(format!(
@@ -4930,7 +5740,9 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         ));
     }
 
-    let transformer = crs.transformer()?;
+    // From the layer's own system when it is held in one (straight through when that is the
+    // grid's), else from longitude/latitude.
+    let to_grid = ToGrid::new(inp.work_crs(), crs)?;
 
     if p.get("field").is_some_and(|v| !v.is_null() && !v.is_string()) {
         return Err("field must be text".into());
@@ -4957,10 +5769,18 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
     // A multipoint's members with non-finite coordinates, in the features with finite ones (a
     // feature with none is counted in `skipped`).
     let (mut non_finite, mut non_finite_features) = (0usize, 0usize);
-    let project = |c: Coord, beyond: &mut usize| {
-        let p = in_projected(crs, &transformer, c);
-        *beyond += usize::from(p.is_none());
-        p
+    // And a point the layer's own system can't give in longitude/latitude, counted apart.
+    let mut unplaced = 0usize;
+    let mut project = |c: Coord, beyond: &mut usize| match to_grid.try_place(c) {
+        Ok(p) => Some(p),
+        Err(Miss::Source) => {
+            unplaced += 1;
+            None
+        }
+        Err(Miss::Grid) => {
+            *beyond += 1;
+            None
+        }
     };
     for r in rows(inp, p, "input", ds) {
         let Some(g) = ds.features.get(r).and_then(|f| f.geometry.as_ref()) else {
@@ -5011,7 +5831,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         }
     }
 
-    let beyond_note = beyond_note(crs, beyond);
+    let beyond_note = left_out_note(inp.work_crs(), crs, unplaced, beyond);
     let non_finite_note = (non_finite > 0).then(|| {
         format!("{non_finite} point(s) with non-finite coordinates were left out of {non_finite_features} multipoint feature(s) that have other points")
     });
@@ -5082,6 +5902,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
         format!("Kernel Density: {} × {} cells from {} points (bandwidth: {:.2})", r.width, r.height, pts.len(), bandwidth)
     };
     Ok(ToolResult {
+        losses: Vec::new(),
         output: Output::Layers(vec![OutputLayer::Raster { file_name: format!("{name}.tif"), name, bytes }]),
         messages: std::iter::once(msg)
             .chain(beyond_note)
@@ -5095,7 +5916,7 @@ fn kernel_density_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String>
 /// same transform and non-finite-coordinate filtering as [`to_geo`] followed by [`merc_extent`].
 fn projected_extent(g: &Geometry) -> Extent {
     let mut ext = Extent::EMPTY;
-    g.for_each_coord(|c| ext.expand(rustgis_geom::lonlat_to_plane(c)));
+    g.for_each_coord(|c| ext.expand(crate::convert::to_plane(c)));
     ext
 }
 
@@ -5111,8 +5932,9 @@ fn merc_extent(g: &impl geo::CoordsIter<Scalar = f64>) -> Extent {
 /// Summarize Within: each polygon's count of the (selected) point features that meet it, inside it
 /// or on its edge; a feature of several points counts once in each polygon it meets. Each point is
 /// tested only against the polygons whose extents hold it, through an [`ExtentIndex`], and, at a
-/// pole, those reaching it, which it touches at any longitude. The extents are in the analysis
-/// plane, where the test runs, which goes on past 85.05° to the poles (#1033). The statistics
+/// pole, those reaching it, which it touches at any longitude. The extents are in the run's plane
+/// ([`crate::convert::plane`]), where the test runs: the analysis plane, which goes on past 85.05° to
+/// the poles (#1033), or a projected layer's own coordinates. The statistics
 /// asked for, of the point layer's fields, are over the same points, as `<STAT>_<field>` after
 /// `point_count`.
 fn count_points(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -5239,8 +6061,9 @@ fn count_points_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
         }
     }
     let mut messages = vec![format!("Summarize Within: {total} points counted")];
-    messages.extend(rounded_notice(&rounded, out.fields.get(first..).unwrap_or_default()));
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    let (said, losses) = rounded_notice(&rounded, out.fields.get(first..).unwrap_or_default());
+    messages.extend(said);
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// A lon/lat line or ring as a `geo` line string, in degrees.
@@ -5268,8 +6091,8 @@ fn ground_area_perimeter(g: &Geometry) -> (f64, f64) {
             for c in &mut ring.0 {
                 let step = c.x - previous;
                 previous = c.x;
-                // Within 1e-4° of a full turn, as `wgs84_ring_perimeter_area_m2` takes it.
-                if step.abs() >= 360.0 - 1e-4 && step.is_finite() {
+                // A full turn as `wgs84_ring_perimeter_area_m2` takes it.
+                if rustgis_geom::is_full_turn_step(step) {
                     longitude += step;
                     full_turn = true;
                 } else {
@@ -5480,10 +6303,35 @@ fn merc_area_perimeter(mp: &MultiPolygon<f64>) -> (f64, f64) {
 /// [`ground_area_perimeter`]), `length_km` to a line layer, and `point_x`/`point_y` (a label point)
 /// to any other, updating the layer in place. Polygon measurements and ambiguity counts check
 /// Cancel between features; measuring one feature's rings is an uninterruptible step.
+///
+/// In a layer's own projected system ([`Inputs::work_crs`]) the point's x and y are that system's,
+/// in its unit, as the layer holds them; areas and lengths are still measured on the ground, each
+/// feature given in longitude/latitude for it (#2032 C2e-5). A feature with a place that can't be
+/// given there, or is given beyond the poles, gets no measures, and is counted in a notice.
 fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     use geo::{Geodesic, Length};
     let ds = input(inp, p, "input")?;
     let mut out = ds.clone();
+    // Each geometry in longitude/latitude for its measures: as it is in a run there.
+    let to = ds.lonlat_conversion()?;
+    let unplaced = std::sync::atomic::AtomicUsize::new(0);
+    fn counted<'a>(
+        to: &rustgis_data::raster::Reprojection,
+        g: &'a Geometry,
+        unplaced: &std::sync::atomic::AtomicUsize,
+    ) -> Option<Cow<'a, Geometry>> {
+        // A place given beyond the poles (a latitude past ±90°) has none either; a missing
+        // coordinate is measured as it always was.
+        let g = Dataset::converted_to_lonlat(to, g).filter(|g| {
+            let mut placed = true;
+            g.for_each_coord(|c| placed &= !(c.is_finite() && c.y.abs() > 90.0));
+            placed
+        });
+        if g.is_none() {
+            unplaced.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        g
+    }
     match ds.geometry_type {
         GeometryType::Polygon => {
             let fa = out.ensure_field("area_km2", FieldType::Double);
@@ -5497,9 +6345,11 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 |_, _, f| {
                     // Validate every winding, including ones without a full-turn edge, in the
                     // cancellable worker pass. An unavailable area needs no further measurement.
-                    let rings = f.geometry.as_ref().map_or(0, Geometry::ambiguous_area_rings);
-                    let measures = if rings == 0 { f.geometry.as_ref().map_or((0.0, 0.0), ground_area_perimeter) } else { (f64::NAN, 0.0) };
-                    Ok::<_, String>((measures, rings))
+                    let Some(g) = f.geometry.as_ref() else { return Ok::<_, String>((Some((0.0, 0.0)), 0)) };
+                    let Some(g) = counted(&to, g, &unplaced) else { return Ok((None, 0)) };
+                    let rings = g.ambiguous_area_rings();
+                    let measures = if rings == 0 { ground_area_perimeter(&g) } else { (f64::NAN, 0.0) };
+                    Ok((Some(measures), rings))
                 },
             )?;
             let (rings, features) = measured.iter().fold((0usize, 0usize), |(rings, features), (_, count)| {
@@ -5511,12 +6361,13 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                     ds.name
                 ));
             }
-            for (f, ((a, per), _)) in out.features.iter_mut().zip(measured) {
+            // (A feature that can't be given in longitude/latitude has no measures: empty.)
+            for (f, (measures, _)) in out.features.iter_mut().zip(measured) {
                 if let Some(v) = f.attrs.get_mut(fa) {
-                    *v = Value::Float(a / 1e6);
+                    *v = measures.map_or(Value::Null, |(a, _)| Value::Float(a / 1e6));
                 }
                 if let Some(v) = f.attrs.get_mut(fp) {
-                    *v = Value::Float(per / 1e3);
+                    *v = measures.map_or(Value::Null, |(_, per)| Value::Float(per / 1e3));
                 }
             }
         }
@@ -5528,15 +6379,16 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
                 PARALLEL_FEATURES,
                 || (),
                 |_, _, f| {
-                    Ok::<_, String>(match &f.geometry {
-                        Some(Geometry::Line(parts)) => parts.iter().map(|p| Geodesic.length(&lonlat_line(p))).sum::<f64>(),
+                    let Some(g) = f.geometry.as_ref() else { return Ok::<_, String>(Some(0.0)) };
+                    Ok(counted(&to, g, &unplaced).map(|g| match &*g {
+                        Geometry::Line(parts) => parts.iter().map(|p| Geodesic.length(&lonlat_line(p))).sum::<f64>(),
                         _ => 0.0,
-                    })
+                    }))
                 },
             )?;
             for (f, len) in out.features.iter_mut().zip(lengths) {
                 if let Some(v) = f.attrs.get_mut(fl) {
-                    *v = Value::Float(len / 1e3);
+                    *v = len.map_or(Value::Null, |len| Value::Float(len / 1e3));
                 }
             }
         }
@@ -5554,10 +6406,17 @@ fn calculate_geometry(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
             }
         }
     }
-    Ok(ToolResult {
-        output: Output::Update { layer: ds.name.clone(), dataset: out },
-        messages: vec![format!("Calculated geometry attributes for {}", ds.name)],
-    })
+    let messages = vec![format!("Calculated geometry attributes for {}", ds.name)];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
+    let unplaced = unplaced.into_inner();
+    if unplaced > 0 {
+        losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::DroppedCalculationResult, text: format!(
+            "Calculate Geometry Attributes: {unplaced} feature(s) of {} have a place with no longitude/latitude (beyond the poles, or not convertible from {}), and weren't measured",
+            ds.name,
+            to.source().label()
+        ) });
+    }
+    Ok(ToolResult { losses, output: Output::Update { layer: ds.name.clone(), dataset: out }, messages })
 }
 
 /// The longest separator CONCATENATE joins values with, in bytes: each value adds one, so a long
@@ -5567,20 +6426,22 @@ const MAX_SEPARATOR: usize = 256;
 /// Summary Statistics: a row for each group of records sharing the case fields' values, holding
 /// the case fields, `FREQUENCY` (the group's records) and each requested statistic as
 /// `<STAT>_<field>`. Without `statistics`, `field` takes COUNT, SUM, MEAN, MIN, MAX and STD, its
-/// values read as numbers whatever its type, as before the statistics list.
+/// values read as numbers whatever its type, as before the statistics list. With case fields and
+/// neither, each group's row has only `FREQUENCY`: a count of records by group.
 fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     use crate::stats::{self, Request, Stat};
     let ds = input(inp, p, "input")?;
     let mut requests = stats::parse_requests(ds, p.get("statistics"))?;
-    let field_only = requests.is_empty();
+    let cases = key_fields(ds, p.get("case"), "Case Field")?;
+    let field = s(p, "field").trim();
+    let field_only = requests.is_empty() && !field.is_empty();
     // A Statistics Field is read as numbers, except a date field: its values are dates, which give
     // a count and the earliest and latest, not sums.
     let mut as_numbers = field_only;
+    if requests.is_empty() && field.is_empty() && cases.is_empty() {
+        return Err("give the statistics to compute, a Statistics Field, or Case Fields to count records by".into());
+    }
     if field_only {
-        let field = s(p, "field").trim();
-        if field.is_empty() {
-            return Err("give the statistics to compute, or a Statistics Field".into());
-        }
         let fi = find_field_case_insensitive(ds, field)?;
         let stats: &[Stat] = if ds.fields.get(fi).is_some_and(|f| f.ty.is_temporal()) {
             as_numbers = false;
@@ -5590,7 +6451,6 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
         };
         requests = stats.iter().map(|&stat| Request { field: fi, stat }).collect();
     }
-    let cases = key_fields(ds, p.get("case"), "Case Field")?;
     let separator = concatenate_separator(p)?;
     let mut fields: Vec<Field> = cases.iter().filter_map(|&c| ds.fields.get(c).cloned()).collect();
     fields.push(Field::new("FREQUENCY", FieldType::Integer));
@@ -5609,6 +6469,8 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     let mut rounded = Rounded::new(requests.len());
     rounded.count_texts(ds, &rs, &requests, as_numbers)?;
     for group in stats::group_rows(ds, &rs, &cases) {
+        // A count by case fields alone has no statistic to check Cancel between groups.
+        crate::control::check()?;
         let mut row = group.key;
         row.push(stats::count(group.rows.len()));
         row.extend(statistic_values(ds, &group.rows, &requests, as_numbers, separator, &mut rounded)?);
@@ -5617,8 +6479,9 @@ fn summary_statistics(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> 
     }
     let n = out.features.len();
     let mut messages = vec![format!("Summary Statistics: {n} rows")];
-    messages.extend(rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default()));
-    Ok(ToolResult { output: Output::Table(out), messages })
+    let (said, losses) = rounded_notice(&rounded, out.fields.get(first_added..).unwrap_or_default());
+    messages.extend(said);
+    Ok(ToolResult { losses, output: Output::Table(out), messages })
 }
 
 /// The output fields of a statistics list over `ds`: `<STAT>_<field>` for each request, typed by
@@ -5727,17 +6590,23 @@ fn statistic_values(
 /// naming their output fields `fields` (one per request, as `rounded` counts them), as a decimal
 /// field holds whole numbers exactly only up to 2^53; and the whole numbers written as text past
 /// the i64 range that were read as decimals, whose statistics aren't checked, naming their input
-/// fields. Empty when nothing was rounded.
-fn rounded_notice(rounded: &Rounded, fields: &[Field]) -> Vec<String> {
+/// fields. The first is a loss, with its code; the second says they may be rounded, so it is a
+/// plain notice. Both empty when nothing was rounded.
+fn rounded_notice(rounded: &Rounded, fields: &[Field]) -> (Vec<String>, Vec<rustgis_data::loss::LossMessage>) {
     let mut notices = Vec::new();
+    let mut losses = Vec::new();
+    // Each counted result came out rounded: a value changed.
     let total: usize = rounded.results.iter().sum();
     if total > 0 {
         let names: Vec<&str> = rounded.results.iter().zip(fields).filter(|(n, _)| **n > 0).map(|(_, f)| f.name.as_str()).collect();
         let results = if total == 1 { "result" } else { "results" };
-        notices.push(format!(
-            "{total} {results} rounded in {}: a decimal field holds whole numbers exactly only up to 2^53 (9007199254740992)",
-            names.join(", ")
-        ));
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::ChangedRounded,
+            text: format!(
+                "{total} {results} rounded in {}: a decimal field holds whole numbers exactly only up to 2^53 (9007199254740992)",
+                names.join(", ")
+            ),
+        });
     }
     let total: usize = rounded.texts.iter().map(|(_, n)| n).sum();
     if total > 0 {
@@ -5749,7 +6618,7 @@ fn rounded_notice(rounded: &Rounded, fields: &[Field]) -> Vec<String> {
             names.join(", ")
         ));
     }
-    notices
+    (notices, losses)
 }
 
 /// The statistics list of a tool that adds statistics to its own output (Dissolve, Summarize
@@ -5956,8 +6825,9 @@ fn pivot_table(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     }
     let n = out.features.len();
     let mut messages = vec![format!("Pivot Table: {n} rows, {} pivot fields", columns.len())];
-    messages.extend(rounded_notice(&rounded, out.fields.get(first_pivot_field..).unwrap_or_default()));
-    Ok(ToolResult { output: Output::Table(out), messages })
+    let (said, losses) = rounded_notice(&rounded, out.fields.get(first_pivot_field..).unwrap_or_default());
+    messages.extend(said);
+    Ok(ToolResult { losses, output: Output::Table(out), messages })
 }
 
 /// Whether a pivot value is missing: null, or a number that isn't one.
@@ -6050,6 +6920,10 @@ struct TabulateCell {
 /// with no value in a sum field and, with sum fields, class features not wholly inside the zones,
 /// whose values are not wholly shared out.
 ///
+/// With `includeEmptyZones`, a polygon zone with no overlapping class gets one row with null class
+/// fields and zero area, percentage and sums. Progress and Cancel are checked between items; one
+/// zone mask, feature overlay or cell union can run as a single step.
+///
 /// Without zone fields, each feature is a separate zone, identified by `zone_row` (its zero-based
 /// input row); those zones stay in input order, including when a selection is used.
 /// The area defaults to `area_km2` and is measured on the ellipsoid, as Calculate Geometry
@@ -6068,6 +6942,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         }
     }
     let zone_keys = key_fields(zones, p.get("zoneFields"), "Zone Field")?;
+    let include_empty = p.get("includeEmptyZones").and_then(Json::as_bool).unwrap_or(false);
     let area_unit = p.get("areaUnit").and_then(Json::as_str).unwrap_or("km2");
     let area_divisor = Measure::Area.unit(area_unit).ok_or("unknown area unit")?;
     let class_keys = key_fields(classes, p.get("classFields"), "Class Field")?;
@@ -6141,17 +7016,18 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     let zone_list: Vec<TabulateZone> = zone_groups
         .into_iter()
         .map(|group| {
+            crate::control::check()?;
             let shapes: Vec<&Geometry> =
                 group.rows.iter().filter_map(|&r| zones.features.get(r)?.geometry.as_ref()).filter(|g| has_shape(g)).collect();
             let ext = shapes.iter().fold(Extent::EMPTY, |e, g| e.union(&g.extent()));
             let mask = mask_of(MultiPolygon::new(shapes.iter().filter_map(|g| to_multipolygon(g)).flat_map(|m| m.0).collect()));
             let map_area = from_multipolygon(&mask).map_or(0.0, |g| map_area_m2(&g));
             let merc_ext = merc_extent(&mask);
-            TabulateZone { key: group.key, ext, mask, merc_ext, map_area_m2: map_area }
+            Ok(TabulateZone { key: group.key, ext, mask, merc_ext, map_area_m2: map_area })
         })
-        .collect();
+        .collect::<Result<_, crate::control::Cancelled>>()?;
     let class_groups = crate::stats::group_rows(classes, &class_rows, &class_keys);
-    let index = ExtentIndex::new(zone_list.iter().map(|z| z.ext));
+    let index = ExtentIndex::with_checks(zone_list.iter().map(|z| z.ext), crate::control::check)?;
     let mut cells: std::collections::BTreeMap<(usize, usize), TabulateCell> = std::collections::BTreeMap::new();
     // For each sum field, the class features in some zone whose value isn't a number.
     let mut missing = vec![0usize; sum_fields.len()];
@@ -6164,14 +7040,20 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
     // indices: neighbouring features near the same zones reuse them, as Clip reuses its masks.
     const MAX_CACHED_UNIONS: usize = 8;
     let mut near_unions: std::collections::VecDeque<(Vec<usize>, MultiPolygon<f64>)> = std::collections::VecDeque::new();
+    crate::control::begin(class_rows.len());
     for (ci, group) in class_groups.iter().enumerate() {
         for &r in &group.rows {
-            let Some(g) = classes.features.get(r).and_then(|f| f.geometry.as_ref()).filter(|g| has_shape(g)) else { continue };
+            crate::control::check()?;
+            let Some(g) = classes.features.get(r).and_then(|f| f.geometry.as_ref()).filter(|g| has_shape(g)) else {
+                crate::control::advance(1);
+                continue;
+            };
             let ext = g.extent();
             let near: Vec<usize> =
                 index.candidates(&ext).into_iter().filter(|&zi| zone_list.get(zi).is_some_and(|z| z.ext.intersects(&ext))).collect();
             if near.is_empty() {
                 outside += usize::from(!sum_fields.is_empty());
+                crate::control::advance(1);
                 continue;
             }
             // Overlapping parts of one feature are unioned once, so they count once.
@@ -6189,6 +7071,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             let mut held = false;
             let mut cut_part = false;
             for &zi in &near {
+                crate::control::check()?;
                 let Some(zone) = zone_list.get(zi) else { continue };
                 // A cut that leaves nothing, or nothing with area, when the feature's interior meets
                 // the zone's lost that part to rounding. Only a feature the grid doesn't resolve can
@@ -6292,8 +7175,10 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
                 };
                 outside += usize::from(lies_outside);
             }
+            crate::control::advance(1);
         }
     }
+    crate::control::finish();
     let mut out = Dataset::new(
         out_name(p, format!("{}_Tabulate", zones.name)),
         GeometryType::None,
@@ -6315,39 +7200,66 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         let name = unique_field(&out, base);
         out.fields.push(Field::new(name, FieldType::Double));
     }
-    let mut zones_hit: HashSet<usize> = HashSet::new();
-    for ((zi, ci), cell) in cells {
-        let (Some(zone), Some(class)) = (zone_list.get(zi), class_groups.get(ci)) else { continue };
-        zones_hit.insert(zi);
-        // Parts of a class's features that overlap each other are unioned, so they count once.
-        let union;
-        let covered = match cell.parts.as_slice() {
-            [one] => one,
-            parts => {
-                let polys: Vec<MultiPolygon<f64>> = parts.iter().filter_map(to_multipolygon).collect();
-                let Some(g) = from_multipolygon(&union_all(polys.iter().flat_map(|m| m.0.iter()))) else {
-                    let key: Vec<String> = zone.key.iter().map(ToString::to_string).collect();
-                    return Err(format!(
-                        "Tabulate Intersection: the parts of a class in the zone '{}' could not be combined",
-                        key.join(", ")
-                    ));
-                };
-                union = g;
-                &union
+    let mut cells = cells.into_iter().peekable();
+    let mut omitted_zones = 0;
+    crate::control::begin(zone_list.len());
+    for (zi, zone) in zone_list.iter().enumerate() {
+        crate::control::check()?;
+        crate::control::reached(zi);
+        if cells.peek().is_none_or(|((index, _), _)| *index != zi) {
+            // A group without any polygon is counted by the missing-polygon notice.
+            if !zone.ext.is_empty() {
+                if include_empty {
+                    let mut row = zone.key.clone();
+                    row.extend(std::iter::repeat_n(Value::Null, class_keys.len()));
+                    row.extend(std::iter::repeat_n(Value::Float(0.0), 2 + sum_fields.len()));
+                    out.push_next(None, row);
+                } else {
+                    omitted_zones += 1;
+                }
             }
-        };
-        let mut row = zone.key.clone();
-        row.extend(class.key.iter().cloned());
-        if let Some(message) = rustgis_data::ambiguous_area_message(std::iter::once(covered)) {
-            return Err(format!("Tabulate Intersection: {message}"));
+            continue;
         }
-        row.push(Value::Float(ground_area_perimeter(covered).0 / area_divisor));
-        let covered_area = map_area_m2(covered);
-        row.push(if zone.map_area_m2 > 0.0 { Value::Float(covered_area / zone.map_area_m2 * 100.0) } else { Value::Null });
-        row.extend(cell.sums.into_iter().map(Value::Float));
-        // One past the last id: `push` would search them all for each row.
-        out.push_next(None, row);
+        while let Some(((_, ci), cell)) = cells.next_if(|((index, _), _)| *index == zi) {
+            crate::control::check()?;
+            let Some(class) = class_groups.get(ci) else { continue };
+            // Parts of a class's features that overlap each other are unioned, so they count once.
+            let union;
+            let covered = match cell.parts.as_slice() {
+                [one] => one,
+                parts => {
+                    let polys: Vec<MultiPolygon<f64>> = parts.iter().filter_map(to_multipolygon).collect();
+                    let Some(g) = from_multipolygon(&union_all(polys.iter().flat_map(|m| m.0.iter()))) else {
+                        let key: Vec<String> = zone.key.iter().map(ToString::to_string).collect();
+                        return Err(format!(
+                            "Tabulate Intersection: the parts of a class in the zone '{}' could not be combined",
+                            key.join(", ")
+                        ));
+                    };
+                    union = g;
+                    &union
+                }
+            };
+            let mut row = zone.key.clone();
+            row.extend(class.key.iter().cloned());
+            if let Some(message) = rustgis_data::ambiguous_area_message(std::iter::once(covered)) {
+                let zone_key: Vec<String> = zone.key.iter().map(ToString::to_string).collect();
+                let class_key: Vec<String> = class.key.iter().map(ToString::to_string).collect();
+                return Err(format!(
+                    "Tabulate Intersection: in zone '{}' and class '{}': {message}",
+                    zone_key.join(", "),
+                    class_key.join(", ")
+                ));
+            }
+            row.push(Value::Float(ground_area_perimeter(covered).0 / area_divisor));
+            let covered_area = map_area_m2(covered);
+            row.push(if zone.map_area_m2 > 0.0 { Value::Float(covered_area / zone.map_area_m2 * 100.0) } else { Value::Null });
+            row.extend(cell.sums.into_iter().map(Value::Float));
+            // One past the last id: `push` would search them all for each row.
+            out.push_next(None, row);
+        }
     }
+    crate::control::finish();
     let mut messages = vec![match out.features.len() {
         1 => "Tabulate Intersection: 1 row".to_string(),
         n => format!("Tabulate Intersection: {n} rows"),
@@ -6359,8 +7271,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
             n => messages.push(format!("{n} {layer} features have no polygon and were left out")),
         }
     }
-    // Zones without geometry are counted above, not again here.
-    match zone_list.iter().enumerate().filter(|(zi, z)| !z.ext.is_empty() && !zones_hit.contains(zi)).count() {
+    match omitted_zones {
         0 => {}
         1 => messages.push("1 zone overlaps no class feature, so it has no rows".into()),
         n => messages.push(format!("{n} zones overlap no class feature, so they have no rows")),
@@ -6421,7 +7332,7 @@ fn tabulate_intersection(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Strin
         1 => messages.push("1 class feature lies partly or wholly outside the zones: its value outside isn't shared out".into()),
         n => messages.push(format!("{n} class features lie partly or wholly outside the zones: their values outside aren't shared out")),
     }
-    Ok(ToolResult { output: Output::Table(out), messages })
+    Ok(ToolResult { losses: Vec::new(), output: Output::Table(out), messages })
 }
 
 fn export_features(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
@@ -6433,6 +7344,9 @@ fn export_features(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
         rs.retain(|r| rustgis_data::query::eval(&e, ds, *r));
     }
     let mut out = copy_schema(ds, out_name(p, format!("{}_Export", ds.name)), ds.geometry_type);
+    // Its features as they are: in the input's system, which exports use by default, with what it
+    // lost on reading.
+    (out.crs, out.crs_incomplete, out.zm_dropped) = (ds.crs, ds.crs_incomplete, ds.zm_dropped);
     for r in rs {
         if let Some(f) = ds.features.get(r) {
             out.push(f.geometry.clone(), f.attrs.clone());
@@ -6566,7 +7480,8 @@ impl AtPoles {
     }
 }
 
-/// The poles polygons in the analysis plane reach, from their box there: north, then south.
+/// The poles polygons in the run's plane reach, from their box there: north, then south (none in
+/// a projected layer's own coordinates, [`crate::convert::plane`]).
 fn plane_poles(mp: &MultiPolygon<f64>) -> (bool, bool) {
     use geo::BoundingRect;
     let lat = |y: f64| rustgis_geom::plane_to_lonlat(Coord::new(0.0, y)).y;
@@ -6587,9 +7502,21 @@ fn ground_distance(t: &Geometry, t_geo: &geo::Geometry<f64>, j: &Geometry, j_geo
 }
 
 /// How much of a target lies in a join polygon: the ground area of a polygon's overlap, the ground
-/// length of a line's. The geometries are in the analysis plane, polygons oriented for the overlay;
-/// the overlap found is measured on the ground, in longitude/latitude.
+/// length of a line's. The geometries are in the run's plane ([`crate::convert::plane`]), polygons
+/// oriented for the overlay; in the analysis plane the overlap found is measured on the ground, in
+/// longitude/latitude, and in a projected system's own plane by its area or length there, which
+/// ranks overlaps of one target as the ground does.
 fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
+    if crate::convert::plane() == crate::convert::Plane::Own {
+        use geo::{Area, Euclidean, Length};
+        return match (t_geo, j_geo) {
+            (geo::Geometry::MultiPolygon(t), geo::Geometry::MultiPolygon(j)) => t.intersection(j).unsigned_area(),
+            (geo::Geometry::MultiLineString(t), geo::Geometry::MultiPolygon(j)) => {
+                j.clip(t, false).0.iter().map(|l| Euclidean.length(l)).sum()
+            }
+            _ => 0.0,
+        };
+    }
     match (t_geo, j_geo) {
         (geo::Geometry::MultiPolygon(t), geo::Geometry::MultiPolygon(j)) => {
             from_multipolygon(&t.intersection(j)).map_or(0.0, |g| crate::join::area_m2(&g))
@@ -6601,7 +7528,7 @@ fn overlap(t_geo: &geo::Geometry<f64>, j_geo: &geo::Geometry<f64>) -> f64 {
     }
 }
 
-/// A geometry in the analysis plane, polygons oriented as the overlay needs.
+/// A geometry in the run's plane ([`crate::convert::plane`]), polygons oriented as the overlay needs.
 fn oriented(g: &Geometry) -> geo::Geometry<f64> {
     match to_geo(g) {
         geo::Geometry::MultiPolygon(m) => geo::Geometry::MultiPolygon(m.orient(Direction::Default)),
@@ -6715,7 +7642,13 @@ impl ExtentIndex {
         (kx.clamp(0.0, 512.0) as i64, ky.clamp(0.0, 512.0) as i64)
     }
 
-    /// The larger side of a cell in degrees, when there is a grid.
+    /// Whether `b` holds every feature's extent.
+    fn covered_by(&self, b: &Extent) -> bool {
+        extent_contains(b, &self.total)
+    }
+
+    /// The larger side of a cell in degrees (the system's unit in a projected system's own plane),
+    /// when there is a grid.
     fn cell_size(&self) -> Option<f64> {
         self.grid.as_ref().map(|_| self.cell_w.max(self.cell_h))
     }
@@ -6827,6 +7760,18 @@ struct Nearby<'a, 'b> {
 }
 
 impl Nearby<'_, '_> {
+    /// Peak distance-search storage beyond geometry: candidate references before deduplication,
+    /// the measured-distance hash table and the retained/sorted distance results. A hash table
+    /// can use nearly four buckets per entry after growth; each includes its control byte.
+    fn scratch_bytes(&self) -> usize {
+        let entry = std::mem::size_of::<(usize, Option<f64>)>().saturating_add(1);
+        let distances = std::mem::size_of::<(usize, f64)>().saturating_mul(3); // Vec capacity and stable-sort work.
+        self.feats
+            .len()
+            .saturating_mul(entry.saturating_mul(4).saturating_add(distances))
+            .saturating_add(self.index.references.max(self.feats.len()).saturating_mul(std::mem::size_of::<usize>()).saturating_mul(2))
+    }
+
     /// The features within `reach` meters of a target (`t`, with its extent, and its geometry in
     /// the analysis plane), in order, with their distances. With `nearest`, only the nearest is
     /// wanted: a feature that can't be as near as the nearest so far isn't measured, so some
@@ -6888,15 +7833,21 @@ impl Nearby<'_, '_> {
         exclude: Option<usize>,
     ) -> Option<(usize, f64)> {
         let mut measured = std::collections::HashMap::new();
+        // A cell is degrees in longitude/latitude, the system's unit in a projected system's own
+        // plane.
         let mut reach = match self.index.cell_size() {
-            Some(cell) => (cell.to_radians() * rustgis_geom::EARTH_RADIUS_M).max(MIN_REACH_M),
+            Some(cell) => match crate::convert::own_unit_m() {
+                Some(unit) => cell * unit,
+                None => cell.to_radians() * rustgis_geom::EARTH_RADIUS_M,
+            }
+            .max(MIN_REACH_M),
             None => f64::INFINITY,
         };
         let mut near = loop {
             let r = limit.map_or(reach, |l| reach.min(l));
-            // A search reaching a pole or across the antimeridian looks at every feature anyway: it
-            // measures them out to the limit.
-            if crate::join::search_box(t_ext, r).is_none() {
+            // A search reaching a pole or across the antimeridian looks at every feature anyway, as
+            // does one holding them all: it measures them out to the limit.
+            if crate::join::search_box(t_ext, r).is_none_or(|b| self.index.covered_by(&b)) {
                 break self.within(t, t_ext, t_geo, limit.unwrap_or(f64::INFINITY), true, exclude, &mut measured);
             }
             let found = self.within(t, t_ext, t_geo, r, true, exclude, &mut measured);
@@ -6915,7 +7866,7 @@ impl Nearby<'_, '_> {
 /// geometries come with their forms in the analysis plane, where the test and the overlay work.
 fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &geo::Geometry<f64>) -> Option<Coord> {
     use geo::LinesIter;
-    let back = |c: geo::Coord<f64>| rustgis_geom::plane_to_lonlat(Coord::new(c.x, c.y));
+    let back = |c: geo::Coord<f64>| crate::convert::from_plane(Coord::new(c.x, c.y));
     // Points answer with their own coordinates, not ones back from the plane.
     let point_on = |pts: &Geometry, other: &geo::Geometry<f64>| -> Option<Option<Coord>> {
         let pts: &[Coord] = match pts {
@@ -6924,7 +7875,7 @@ fn shared_point(a: &Geometry, a_geo: &geo::Geometry<f64>, b: &Geometry, b_geo: &
             _ => return None,
         };
         Some(pts.iter().copied().find(|c| {
-            let m = rustgis_geom::lonlat_to_plane(*c);
+            let m = crate::convert::to_plane(*c);
             other.intersects(&geo::Point::new(m.x, m.y))
         }))
     };
@@ -7031,8 +7982,19 @@ fn near_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRes
     // Each feature's nearest one is found on its own, on several threads when there are many
     // (#1252); the rows are then made in input order.
     let targets = rows(inp, p, "input", ds);
-    crate::control::begin(targets.len());
-    let threads = threads.unwrap_or_else(|| crate::parallel::threads_for(targets.len(), PARALLEL_FEATURES));
+    let threads = geometry_threads(targets.len(), threads, || {
+        crate::control::begin(feats.len());
+        let mut near_bytes = 0;
+        for feature in &feats {
+            crate::control::check()?;
+            near_bytes = near_bytes.max(coord_bytes(feature.geom));
+            crate::control::advance(1);
+        }
+        Ok(largest_geometry_bytes(ds, &targets)?
+            .saturating_mul(3)
+            .saturating_add(near_bytes.saturating_mul(2))
+            .saturating_add(nearby.scratch_bytes()))
+    })?;
     let hits = crate::parallel::try_map_on(
         &targets,
         threads,
@@ -7047,8 +8009,12 @@ fn near_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolRes
                 let shared = if d > 0.0 { None } else { shared_point(g, &t_geo, j.geom, &j.geo) };
                 let at = shared.or_else(|| crate::join::nearest_points(g, j.geom).map(|(_, q)| q));
                 // The plane's longitudes run on past ±180°, and so can a shared point's: back within
-                // [−180°, 180°).
-                let at = at.map(|c| Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y));
+                // [−180°, 180°). (In a projected system's own plane, the point as it is.)
+                let at = if crate::convert::plane() == crate::convert::Plane::Own {
+                    at
+                } else {
+                    at.map(|c| Coord::new((c.x + 180.0).rem_euclid(360.0) - 180.0, c.y))
+                };
                 Some((near_ds.features.get(j.row)?.id, d, at))
             });
             Ok::<_, String>(hit)
@@ -7082,10 +8048,31 @@ fn spatial_join(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 }
 
 /// The targets each thread takes per batch in [`spatial_join_on`]: each target's matches are kept
-/// until the batch's rows are made, and a target can match thousands, so batches of `threads` ×
-/// this bound how many lists are held at once (on one thread, this many). Small in tests, so they
-/// cross from one batch to the next.
+/// until the batch's rows are made, and a target can match thousands. Batches hold at most
+/// `threads` × this many lists; [`join_target_batch`] shrinks them when dense matches would
+/// exceed the scratch budget. Small in tests, so they cross from one batch to the next.
 const FEATURE_BATCH: usize = if cfg!(test) { 16 } else { 256 };
+
+/// Match-vector capacity for one target: Closest/Largest Overlap keep one, other modes can
+/// keep every join feature. Vec growth can double capacity, with at least four initial slots.
+fn join_match_bytes(mode: JoinMatch, joins: usize) -> usize {
+    let matches = if joins == 0 {
+        0
+    } else if matches!(mode, JoinMatch::Closest | JoinMatch::LargestOverlap) {
+        1
+    } else {
+        joins
+    };
+    if matches == 0 { 0 } else { matches.saturating_mul(2).max(4).saturating_mul(std::mem::size_of::<(usize, Option<f64>)>()) }
+}
+
+/// Keeps retained match lists within the scratch budget beyond one target's baseline, after
+/// reserving other workers' search storage. Even one worker shrinks a high-cardinality batch;
+/// explicit thread counts skip geometry sizing but still bound the lists retained together.
+fn join_target_batch(threads: usize, worker_bytes: usize, match_bytes: usize, budget: usize) -> usize {
+    let spare = budget.saturating_sub(worker_bytes.saturating_mul(threads.saturating_sub(1)));
+    threads.max(1).saturating_mul(FEATURE_BATCH).min(1usize.saturating_add(spare / match_bytes.max(1)))
+}
 
 /// [`spatial_join`] on `threads` threads (by the number of features in each step when `None`): the
 /// join features are converted, and each target's matches found, on their own (#1252); the rows
@@ -7145,7 +8132,9 @@ fn spatial_join_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
 
     let target_rows = rows(inp, p, "target", target);
     let join_rows = rows(inp, p, "join", join);
-    if mode == JoinMatch::LargestOverlap {
+    // A ring through both poles, whose area is ambiguous, is one in longitude/latitude: a projected
+    // system's own plane has none.
+    if mode == JoinMatch::LargestOverlap && crate::convert::plane() == crate::convert::Plane::Analysis {
         for (ds, selected) in [(target, &target_rows), (join, &join_rows)] {
             if let Some(message) =
                 rustgis_data::ambiguous_area_message(selected.iter().filter_map(|&r| ds.features.get(r)?.geometry.as_ref()))
@@ -7155,12 +8144,20 @@ fn spatial_join_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
         }
     }
 
-    let threads_for = |n: usize| threads.unwrap_or_else(|| crate::parallel::threads_for(n, PARALLEL_FEATURES));
+    let mut join_bytes = None;
+    let mut join_scratch = || -> Result<usize, String> {
+        if let Some(bytes) = join_bytes {
+            return Ok(bytes);
+        }
+        let bytes = largest_geometry_bytes(join, &join_rows)?.saturating_mul(2);
+        join_bytes = Some(bytes);
+        Ok(bytes)
+    };
+    let join_threads = geometry_threads(join_rows.len(), threads, &mut join_scratch)?;
     // The join features converted: Cancel looked at, and progress counted, feature by feature.
-    crate::control::begin(join_rows.len());
     let join_geoms: Vec<Located<'_>> = crate::parallel::try_map_on(
         &join_rows,
-        threads_for(join_rows.len()),
+        join_threads,
         || (),
         |_, _, &jr| {
             let located = join.features.get(jr).and_then(|f| f.geometry.as_ref()).map(|g| {
@@ -7208,19 +8205,29 @@ fn spatial_join_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
 
     let mut total_matches = 0usize;
     let mut written_features = 0usize;
-    // Each target's matches, in the order they're joined, with their distances when measured:
-    // found on their own, on several threads when there are many (#1252), in batches of
-    // [`FEATURE_BATCH`] targets a thread, so the lists held at once stay bounded (a target can
-    // match thousands). `None` for a row with no feature. An overlap that can't be measured is
-    // that target's result, raised here in target order, so a threaded run fails at the same
-    // row as one thread does.
-    crate::control::begin(target_rows.len());
-    // A thread's candidate list can hold every join feature (the index scans them all when it has
-    // no grid), so that scratch bounds the threads too.
-    let cand_bytes = join_geoms.len().saturating_mul(std::mem::size_of::<usize>());
-    let target_threads = threads.unwrap_or_else(|| crate::parallel::threads_for_scratch(target_rows.len(), PARALLEL_FEATURES, cand_bytes));
-    for batch in target_rows.chunks(target_threads.max(1).saturating_mul(FEATURE_BATCH)) {
-        let found = crate::parallel::try_map_on(batch, target_threads, Vec::new, |cand_buf, _, &tr| {
+    // Each target's matches are found independently and replayed in target order, including
+    // overlap errors. Batches hold at most FEATURE_BATCH targets per thread, fewer when their
+    // retained match lists would use the remaining scratch budget.
+    let match_bytes = join_match_bytes(mode, join_geoms.len());
+    let mut worker_bytes = 0;
+    let target_threads = geometry_threads(target_rows.len(), threads, || {
+        // Distance searches retain a measured map and sorted distance results; other modes
+        // keep candidate indices. Converted join geometries are shared, never copied per worker.
+        let search = if by_distance {
+            nearby.scratch_bytes()
+        } else {
+            join_geoms.len().max(index.references).saturating_mul(std::mem::size_of::<usize>()).saturating_mul(2)
+        };
+        worker_bytes = search
+            .saturating_add(largest_geometry_bytes(target, &target_rows)?.saturating_mul(3))
+            .saturating_add(if mode == JoinMatch::LargestOverlap { join_scratch()? } else { 0 });
+        Ok(worker_bytes.saturating_add(match_bytes))
+    })?;
+    let batch_size = join_target_batch(target_threads, worker_bytes, match_bytes, crate::parallel::scratch_budget());
+    for batch in target_rows.chunks(batch_size) {
+        // A memory-capped batch can have fewer than BATCH targets per worker. Take one at a
+        // time so its first worker cannot claim the entire batch and leave the others idle.
+        let found = crate::parallel::try_map_each_on(batch, target_threads, Vec::new, |cand_buf, _, &tr| {
             let Some(tf) = target.features.get(tr) else { return Ok(Ok(None)) };
             let mut matches: Vec<(usize, Option<f64>)> = Vec::new();
             if let Some(tg) = tf.geometry.as_ref() {
@@ -7369,6 +8376,7 @@ fn spatial_join_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
         })
         .collect();
     let mut messages = vec![format!("Spatial Join: {written_features} features joined ({total_matches} matches)")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     // The total of `counts` and the output fields with some, or None without any.
     let counted = |counts: &[usize]| -> Option<(usize, String)> {
         let total: usize = counts.iter().sum();
@@ -7377,16 +8385,21 @@ fn spatial_join_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result
     };
     if let Some((total, names)) = counted(&overflowed) {
         let (sums, are, were) = if total == 1 { ("sum", "is", "was") } else { ("sums", "are", "were") };
-        messages.push(format!("{total} {sums} in {names} {are} past the 64-bit integer range and {were} left empty"));
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedCalculationResult,
+            text: format!("{total} {sums} in {names} {are} past the 64-bit integer range and {were} left empty"),
+        });
     }
     if let Some((total, names)) = counted(&left_out) {
         let (numbers, were) = if total == 1 { ("number", "was") } else { ("numbers", "were") };
-        messages.push(format!(
+        losses.push(rustgis_data::loss::LossMessage { code: rustgis_data::loss::LossCode::DroppedValue, text: format!(
             "{total} matched {numbers} in {names} {were} left out: a whole-number sum takes whole numbers in the 64-bit range, the other rules numbers a decimal holds"
-        ));
+        ) });
     }
-    messages.extend(rounded_notice(&rounded, &merged_fields));
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    let (said, rounded) = rounded_notice(&rounded, &merged_fields);
+    messages.extend(said);
+    losses.extend(rounded);
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -7532,10 +8545,7 @@ fn zonal_stats(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
 /// [`zonal_stats`] on `threads` threads (none: as many as pay off and the masks' memory allows).
 fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<ToolResult, String> {
-    let r_name = {
-        let n = s(p, "raster");
-        if n.is_empty() { s(p, "layer") } else { n }
-    };
+    let r_name = s(p, "raster");
     if r_name.is_empty() {
         return Err("parameter 'raster' is required".into());
     }
@@ -7543,7 +8553,7 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
     let r = r_input.raster;
     r.require_coordinates()?;
 
-    let poly_param = if !s(p, "polygons").is_empty() { "polygons" } else { "input" };
+    let poly_param = "polygons";
     let poly_ds = input(inp, p, poly_param)?;
     if poly_ds.geometry_type != GeometryType::Polygon {
         return Err(format!(
@@ -7603,6 +8613,10 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
     // bounds the threads too.
     let mask_bytes = (r.width as usize).saturating_mul(r.height as usize).saturating_mul(2);
     let threads = threads.unwrap_or_else(|| crate::parallel::threads_for_scratch(target_rows.len(), PARALLEL_FEATURES, mask_bytes));
+    // The polygons are in the run's system: their own projected one, converted to the raster's
+    // (none of it when that is the raster's too), else longitude/latitude.
+    let own = (inp.work_crs() != Crs::LonLat).then(|| ToGrid::new(inp.work_crs(), r.crs)).transpose()?;
+    let to = own.as_ref().map_or(crate::rasterops::ToWorld::LonLat(r.transformer()), crate::rasterops::ToWorld::Own);
     crate::control::begin(target_rows.len());
     // A feature's statistics by band, whether its geometry was read, its parts that couldn't be
     // projected and what went wrong.
@@ -7615,11 +8629,11 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
             let Some(f) = poly_ds.features.get(r_idx) else { return Ok((none(), false, 0, None)) };
             Ok::<_, String>(match &f.geometry {
                 Some(Geometry::Polygon(polys)) if !polys.is_empty() => {
-                    // Dataset geometry is already lon/lat; crs records the source system.
-                    match crate::rasterops::transform_feature_polygons_to_lonlat(polys, None) {
-                        Ok(polys_lonlat) => {
+                    // Checked and taken apart into rings, in the run's system as they are.
+                    match crate::rasterops::validated_polygon_parts(polys) {
+                        Ok(rings) => {
                             let mut failed_parts = Vec::new();
-                            let st = crate::rasterops::zonal_statistics_with_failures(r, &bands, &polys_lonlat, &mut failed_parts)?;
+                            let st = crate::rasterops::zonal_statistics_from(r, to, &bands, &rings, &mut failed_parts)?;
                             let detail = (!failed_parts.is_empty())
                                 .then(|| format!("feature {}: raster projection failed for polygon part(s) {failed_parts:?}", f.id));
                             (st, true, failed_parts.len(), detail)
@@ -7632,14 +8646,21 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
         },
     )?;
     let mut skipped_features = 0usize;
+    let mut without_polygon = 0usize;
     let mut skipped_parts = 0usize;
     let mut failure_details = Vec::new();
     for (&r_idx, (stats_by_band, feature_valid, failed_parts, detail)) in target_rows.iter().zip(worked) {
         let Some(f) = poly_ds.features.get(r_idx) else { continue };
         skipped_parts += failed_parts;
         failure_details.extend(detail);
+        // A polygon that couldn't be read has lost its statistics; a feature with no polygon, or
+        // none with an area, has none to lose.
         if !feature_valid {
-            skipped_features += 1;
+            if matches!(poly_ds.features.geometry(r_idx), Some(Geometry::Polygon(polys)) if crate::rasterops::has_a_ring(polys)) {
+                skipped_features += 1;
+            } else {
+                without_polygon += 1;
+            }
         }
 
         let mut attrs = f.attrs.clone();
@@ -7662,11 +8683,21 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
 
     let n_features = out.features.len();
     let mut messages = vec![format!("Calculated zonal statistics for {n_features} feature(s)")];
+    let mut losses: Vec<rustgis_data::loss::LossMessage> = Vec::new();
     if skipped_features > 0 {
-        messages.push(format!("{skipped_features} feature(s) had invalid geometry"));
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedGeometry,
+            text: format!("{skipped_features} feature(s) had invalid geometry, so their statistics are empty"),
+        });
+    }
+    if without_polygon > 0 {
+        messages.push(format!("{without_polygon} feature(s) have no polygon with an area, so their statistics are empty"));
     }
     if skipped_parts > 0 {
-        messages.push(format!("{skipped_parts} polygon part(s) could not be projected onto the raster grid; valid parts were retained"));
+        losses.push(rustgis_data::loss::LossMessage {
+            code: rustgis_data::loss::LossCode::DroppedGeometry,
+            text: format!("{skipped_parts} polygon part(s) could not be projected onto the raster grid; valid parts were retained"),
+        });
     }
     if !failure_details.is_empty() {
         for detail in failure_details.iter().take(5) {
@@ -7676,7 +8707,7 @@ fn zonal_stats_on(inp: &dyn Inputs, p: &Json, threads: Option<usize>) -> Result<
             messages.push(format!("... and {} more feature failure(s)", failure_details.len() - 5));
         }
     }
-    Ok(ToolResult { output: Output::Layer(out), messages })
+    Ok(ToolResult { losses, output: Output::Layer(out), messages })
 }
 
 /// Returns a borrowed dataset when rows match the full dataset in identity order, or a new dataset containing
@@ -7873,7 +8904,7 @@ fn join_field_tool(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
 
     let output = if out.geometry_type == rustgis_data::GeometryType::None { Output::Table(out) } else { Output::Layer(out) };
 
-    Ok(ToolResult { output, messages })
+    Ok(ToolResult { losses: Vec::new(), output, messages })
 }
 
 /// Keeps polygon boundaries in stored coordinates, including interior rings.
@@ -7886,11 +8917,14 @@ fn split_line_at_vertices(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, Stri
     geometry::split(inp, p)
 }
 
-/// Encloses each feature independently in longitude/latitude axes.
+/// Encloses each feature independently in the axes of the system the run works in: its layer's
+/// own for one held in a projected system other than Web Mercator and the other world projections,
+/// else longitude/latitude.
 fn feature_envelope_to_polygon(inp: &dyn Inputs, p: &Json) -> Result<ToolResult, String> {
     geometry::convert(inp, p, geometry::Conversion::FeatureEnvelopeToPolygon)
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     #[test]
@@ -7969,6 +9003,11 @@ mod tests {
             pts.push(Some(Geometry::Point(Coord::new(x, y))), vec![Value::Float(v)]);
         }
         Map(HashMap::from([("polys".to_string(), polys), ("pts".to_string(), pts)]))
+    }
+
+    /// What a run says: its messages, then its losses, each after its code.
+    fn said(r: &ToolResult) -> Vec<String> {
+        r.messages.iter().cloned().chain(r.losses.iter().map(|l| format!("{:?}: {}", l.code, l.text))).collect()
     }
 
     fn layer(r: ToolResult) -> Dataset {
@@ -8443,7 +9482,7 @@ mod tests {
             let input: Vec<String> = lines.features.iter().map(|f| format!("{:?}", f.geometry)).collect();
             let m = Map(HashMap::from([("lines".to_string(), lines)]));
             let res = crate::run("simplify", &m, &serde_json::json!({"input": "lines", "tolerance": tolerance})).unwrap();
-            let messages = res.messages.clone();
+            let messages = said(&res);
             (layer(res), messages, input)
         };
         let (out, messages, input) = run(true, 1.0);
@@ -8473,7 +9512,10 @@ mod tests {
             assert_eq!(&format!("{:?}", f.geometry), before, "feature {k} at 0");
         }
         assert!(!at_zero.iter().any(|m| m.contains("missing or infinite") || m.contains("past a pole")), "{at_zero:?}");
-        assert!(messages.iter().any(|m| m == "Simplify: 1 feature(s) left out: they have no geometry to simplify"), "{messages:?}");
+        assert!(
+            messages.iter().any(|m| m == "DroppedFeature: Simplify: 1 feature(s) left out: they have no geometry to simplify"),
+            "{messages:?}"
+        );
         let (_, clean, _) = run(false, 1.0);
         assert_eq!(clean.len(), 1, "{clean:?}");
     }
@@ -8654,7 +9696,7 @@ mod tests {
             let m = Map(HashMap::from([("polys".to_string(), polys)]));
             let params = serde_json::json!({"input": "polys", "field": "k", "statistics": [{"field": "v", "statistic": "SUM"}]});
             let res = crate::run("dissolve", &m, &params).unwrap();
-            let note = res.messages.iter().find(|m| m.contains("left out")).cloned();
+            let note = said(&res).into_iter().find(|m| m.contains("left out"));
             let out = layer(res);
             (out.features.len(), out.value(0, 1).as_f64(), out.value(0, 2).as_f64(), note)
         };
@@ -8663,7 +9705,7 @@ mod tests {
         assert_eq!(
             note.as_deref(),
             Some(
-                "Dissolve: 4 feature(s) left out, with their values: no geometry, an empty polygon, or a point or line rather than a polygon"
+                "DroppedFeature: Dissolve: 4 feature(s) left out, with their values: no geometry, an empty polygon, or a point or line rather than a polygon"
             )
         );
         assert_eq!(notice(false), (1, Some(2.0), Some(3.0), None));
@@ -9215,10 +10257,10 @@ mod tests {
         // it, and the tool says both, each once.
         let r = run("polys");
         assert_eq!(
-            r.messages[1..],
+            said(&r)[1..],
             [
-                "Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over",
-                "Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)"
+                "Points Along Lines: 1 vertex(es) with a latitude past a pole found (latitudes limited to the poles when measuring segments)",
+                "DroppedGeometry: Points Along Lines: 1 vertex(es) with a coordinate missing or infinite passed over"
             ],
         );
         let v = layer(r);
@@ -9231,7 +10273,10 @@ mod tests {
             Geometry::Line(vec![vec![c(0.0, 0.0), c(1.0, 0.0), c(f64::INFINITY, 5.0)]]),
         ]);
         let r = crate::run("pointsAlongLines", &lossy, &serde_json::json!({"input": "lines", "distance": 10})).unwrap();
-        assert_eq!(r.messages[1], "Points Along Lines: 2 vertex(es) with a coordinate missing or infinite passed over");
+        assert_eq!(
+            said(&r).last().map(String::as_str),
+            Some("DroppedGeometry: Points Along Lines: 2 vertex(es) with a coordinate missing or infinite passed over")
+        );
         assert!(!layer(r).features.is_empty());
         // A line whose ends are the same wild coordinate is a ring, closed without a geodesic.
         let wild = vec![c(1e308, 1e300), c(0.0, -95.0), c(-1e308, 0.0), c(1e308, 1e300)];
@@ -9248,10 +10293,10 @@ mod tests {
         let params = serde_json::json!({"input": "lines", "distance": 1});
         let result = crate::run("pointsAlongLines", &inputs, &params).unwrap();
         assert_eq!(
-            result.messages[1..],
+            said(&result)[1..],
             [
-                "Points Along Lines: 1 feature(s) without geometry skipped",
                 "Points Along Lines: 2 point feature(s) skipped; only lines and polygon rings produce points",
+                "DroppedFeature: Points Along Lines: 1 feature(s) without geometry skipped",
             ]
         );
         assert!(!layer(result).features.is_empty());
@@ -9719,6 +10764,20 @@ mod tests {
         assert_eq!(p["attributes"], serde_json::json!(true));
     }
 
+    /// In a projected system's own plane, the bound covers the walk's sum of each segment's metres:
+    /// ten one-foot segments walk 3.0480000000000005 m, where 10 ft × 0.3048 is 3.048, and a start
+    /// offset between the two would find no room for the point the walk makes there.
+    #[test]
+    fn length_bound_covers_the_walk_in_a_projected_plane() {
+        use crate::convert::{EAST_NORTH, Plane, RunPlane, install};
+        let _feet = install(RunPlane { plane: Plane::Own, unit_m: 0.3048, axes: EAST_NORTH });
+        let line = [(0..=10).map(|k| Coord::new(f64::from(k), 0.0)).collect::<Vec<_>>()];
+        let walked: f64 = segments(&line, false).map(|s| s.len).sum();
+        assert!(walked > 10.0 * 0.3048, "{walked}");
+        let bound = length_bound(&line, false);
+        assert!(bound >= walked && bound <= walked * (1.0 + 1e-8), "{walked} {bound}");
+    }
+
     #[test]
     fn length_bound_is_never_short_of_the_ellipsoid() {
         let c = Coord::new;
@@ -10006,7 +11065,18 @@ mod tests {
                 vec![],
             );
             let inputs = Map(HashMap::from([("invalid".into(), ds)]));
-            assert!(crate::run("calculateGeometry", &inputs, &serde_json::json!({"input":"invalid"})).is_ok());
+            let r = crate::run("calculateGeometry", &inputs, &serde_json::json!({"input":"invalid"})).unwrap();
+            // A latitude past 90° has no place: no measures, and a notice; a missing coordinate is
+            // measured as before, and said nothing of.
+            let beyond = bad.is_finite();
+            assert_eq!(
+                said(&r).iter().any(|m| m.starts_with("DroppedCalculationResult: ") && m.contains("weren't measured")),
+                beyond,
+                "{bad:?}: {:?}",
+                said(&r)
+            );
+            let out = layer(r);
+            assert_eq!(out.value(0, 0).is_null(), beyond, "{bad:?}");
         }
     }
 
@@ -10027,6 +11097,40 @@ mod tests {
         assert!((out.value(0, length).as_f64().unwrap() - expected).abs() < 1e-6);
         assert_eq!(out.value(1, length).as_f64(), Some(0.0));
         assert_eq!(out.features[0].geometry, ds.features[0].geometry);
+    }
+
+    /// A layer held in a projected system: a polygon is measured on the ground from its places in
+    /// longitude/latitude, as the same polygon held there is, and one with a place that has none
+    /// there gets no measures, said in a notice (#2032 C2e-5).
+    #[test]
+    fn calculate_geometry_measures_a_held_layer_on_the_ground() {
+        let (utm, c) = (Crs::Epsg(32632), Coord::new);
+        let square =
+            |x: f64, y: f64| Geometry::Polygon(vec![vec![vec![c(x, y), c(x + 0.01, y), c(x + 0.01, y + 0.01), c(x, y + 0.01), c(x, y)]]]);
+        let mut lonlat = Dataset::new("parcels", GeometryType::Polygon, vec![]);
+        lonlat.push(Some(square(11.5, 48.7)), vec![]);
+        let mut held = lonlat.clone();
+        held.hold_in(utm).unwrap();
+        // Far beyond any place on Earth in UTM.
+        held.push(Some(Geometry::Polygon(vec![vec![vec![c(1e12, 0.0), c(1e12 + 1.0, 0.0), c(1e12, 1.0), c(1e12, 0.0)]]])), vec![]);
+        let measured = |ds: Dataset| {
+            let r = crate::run(
+                "calculateGeometry",
+                &Map(HashMap::from([("parcels".to_string(), ds)])),
+                &serde_json::json!({"input": "parcels"}),
+            )
+            .unwrap();
+            let messages = said(&r);
+            let out = layer(r);
+            ((0..out.features.len()).map(|i| (out.value(i, 0).clone(), out.value(i, 1).clone())).collect::<Vec<_>>(), messages)
+        };
+        let (expected, said) = measured(lonlat);
+        assert_eq!(said.len(), 1, "{said:?}");
+        let (got, said) = measured(held);
+        let (Value::Float(a), Value::Float(b)) = (&got[0].0, &expected[0].0) else { panic!("{got:?}") };
+        assert!((a - b).abs() < 1e-9 * b, "{a} vs {b}");
+        assert_eq!(got[1], (Value::Null, Value::Null), "not measured");
+        assert!(said.iter().any(|m| m.contains("1 feature(s) of parcels") && m.contains("weren't measured")), "{said:?}");
     }
 
     /// Calculate Geometry stores full-precision values (#513): rounding to 0.01 km² gave every
@@ -10109,6 +11213,23 @@ mod tests {
                 {
                     assert!(c.contains(&d.as_str()), "{}: {} defaults to {d:?}", t.id, p.name);
                 }
+            }
+        }
+    }
+
+    /// A tool's where clause is an expression, for the Script to complete as one; no other
+    /// parameter is.
+    #[test]
+    fn where_clauses_are_expressions() {
+        let mut expressions: Vec<String> = TOOLS
+            .iter()
+            .flat_map(|t| t.params.iter().filter(|p| p.kind == K::Expression).map(move |p| format!("{} {}", t.id, p.name)))
+            .collect();
+        expressions.sort_unstable();
+        assert_eq!(expressions, ["exportFeatures where", "selectByAttributes where"]);
+        for t in TOOLS {
+            for p in t.params.iter().filter(|p| p.name == "where") {
+                assert_eq!(p.kind, K::Expression, "{}", t.id);
             }
         }
     }
@@ -10207,7 +11328,7 @@ mod tests {
                     Err(_) => match param.kind {
                         K::Number => serde_json::json!(1),
                         K::Bool => serde_json::json!(false),
-                        K::Text => serde_json::json!("a"),
+                        K::Text | K::Expression => serde_json::json!("a"),
                         K::Choice(c) => serde_json::json!(c.first().copied().unwrap_or_default()),
                         K::Field | K::NumericField | K::CoordinateField => serde_json::json!("v"),
                         K::PolygonLayer => serde_json::json!("polys"),
@@ -10371,8 +11492,7 @@ mod tests {
         pts.push(None, vec![Value::Int(-1)]);
         let m = Map(HashMap::from([("p".to_string(), pts)]));
         let r = crate::run("buffer", &m, &serde_json::json!({"input": "p", "distance": 5})).unwrap();
-        assert_eq!(r.messages.len(), 2);
-        assert_eq!(r.messages.get(1).map(String::as_str), Some("1 of 301 features lack geometry, so they have no buffer"));
+        assert_eq!(said(&r)[1..], ["DroppedFeature: 1 of 301 features lack geometry, so they have no buffer"]);
         let b = layer(r);
         assert_eq!(b.features.len(), 300);
         for (k, f) in b.features.iter().enumerate() {
@@ -10380,8 +11500,8 @@ mod tests {
             assert_eq!(f.geometry, geodesic_buffer(&Geometry::Point(at(k as i64)), 5_000.0), "feature {k}");
         }
         let r = crate::run("buffer", &m, &serde_json::json!({"input": "p", "distance": 5, "dissolve": "All"})).unwrap();
-        assert_eq!(r.messages.len(), 2);
-        assert_eq!(r.messages.get(1).map(String::as_str), Some("1 of 301 features lack geometry, so they have no buffer"));
+        // Dissolved, a feature without geometry adds nothing to lose.
+        assert_eq!(said(&r)[1..], ["1 of 301 features lack geometry, so they have no buffer"]);
         assert_eq!(layer(r).features.len(), 1);
         // Points at a negative distance have nothing left, and say so.
         let r = crate::run("buffer", &clean, &serde_json::json!({"input": "p", "distance": -5})).unwrap();
@@ -10427,6 +11547,7 @@ mod tests {
     /// The distance on WGS 84 (km) from `c` to a line, sampled every `step` metres along it.
     /// Only the samples within 1.2% of the nearest on the sphere are measured on the ellipsoid,
     /// whose distances are within 0.6% of the sphere's.
+    #[expect(clippy::disallowed_methods, reason = "tests sample on the sphere and measure the nearest samples on the ellipsoid")]
     fn km_to_every(c: Coord, line: &[Coord], step: f64) -> f64 {
         let samples: Vec<(Coord, f64)> = line
             .windows(2)
@@ -10491,6 +11612,7 @@ mod tests {
     }
 
     /// Points along the geodesic from `a` to `b` on WGS 84, at most 20 m apart.
+    #[expect(clippy::disallowed_methods, reason = "tests sample on the sphere and measure the nearest samples on the ellipsoid")]
     fn geodesic_samples(a: Coord, b: Coord) -> Vec<Coord> {
         use geo::InterpolatePoint;
         let n = (rustgis_geom::haversine_m(a, b) / 20.0).ceil().max(1.0) as usize;
@@ -10504,6 +11626,7 @@ mod tests {
     /// its nearest point is strictly between the ends: the nearest sample on the sphere (among
     /// every 50th, then its neighbours), then the nearest point on the ellipsoid along the geodesic
     /// either side of it, by golden-section search to well under a millimetre.
+    #[expect(clippy::disallowed_methods, reason = "tests sample on the sphere and measure the nearest samples on the ellipsoid")]
     fn m_to_geodesic(c: Coord, samples: &[Coord]) -> (f64, bool) {
         use geo::InterpolatePoint;
         let near = |range: std::ops::Range<usize>, step: usize| {
@@ -10851,20 +11974,26 @@ mod tests {
         let stations = Geometry::MultiPoint(vec![Coord::new(-75.0, 40.0), Coord::new(-74.99, 40.0), Coord::new(-75.0, 40.01), gap, far]);
         for group in ["All", "None"] {
             let res = run(vec![Some(stations.clone()), Some(Geometry::Point(gap)), None], group).unwrap_or_else(|e| panic!("{group}: {e}"));
-            let all = res.messages.join(" | ");
+            let all = said(&res).join(" | ");
             assert!(
                 all.contains(
                     "3 vertex(es) passed over: a coordinate missing or infinite, or so far out that the hull can't take it (past about 9 million degrees)"
                 ),
                 "{group}: {all}"
             );
-            assert!(all.contains("2 feature(s) skipped: no geometry, or no point it can use"), "{group}: {all}");
+            assert!(
+                // Coded only when each feature has a hull of its own to lose.
+                all.contains(&format!(
+                    "{}Minimum Bounding Geometry: 2 feature(s) skipped: no geometry, or no point it can use",
+                    if group == "None" { "DroppedFeature: " } else { "" }
+                )),
+                "{group}: {all}"
+            );
             let Output::Layer(out) = res.output else { panic!("{group}: not a layer") };
             assert_eq!(out.features.len(), 1, "{group}: a hull for the stations only");
             let clean = run(vec![Some(Geometry::Point(Coord::new(0.0, 0.0))), Some(Geometry::Point(Coord::new(1.0, 1.0)))], group)
-                .unwrap_or_else(|e| panic!("{group}: {e}"))
-                .messages
-                .join(" | ");
+                .unwrap_or_else(|e| panic!("{group}: {e}"));
+            let clean = said(&clean).join(" | ");
             assert!(!clean.contains("passed over") && !clean.contains("skipped"), "{group}: {clean}");
         }
         for group in ["All", "None"] {
@@ -10943,9 +12072,15 @@ mod tests {
             for dissolve in ["None", "All"] {
                 let params = serde_json::json!({"input": "l", "distance": 1, "units": "Meters", "dissolve": dissolve});
                 let res = crate::run("buffer", &m, &params).unwrap_or_else(|e| panic!("{e}"));
-                let note =
-                    res.messages.iter().find(|m| m.starts_with("1 of 1 features' buffers have outline edges left with fewer points"));
-                assert_eq!(note.is_some(), coarse, "dissolve {dissolve}: {:?}", res.messages);
+                let note = res
+                    .losses
+                    .iter()
+                    .find(|l| {
+                        l.code == rustgis_data::loss::LossCode::ApproximatedCurve
+                            && l.text.starts_with("1 of 1 features' buffers have outline edges left with fewer points")
+                    })
+                    .map(|l| &l.text);
+                assert_eq!(note.is_some(), coarse, "dissolve {dissolve}: {:?}", said(&res));
                 // The note names both reasons an edge can be left coarse.
                 assert!(
                     note.is_none_or(|m| m.contains("the points a ring may add ran out") && m.contains("halved as many times as it may be")),
@@ -11132,6 +12267,156 @@ mod tests {
             assert!(r.messages.iter().any(|m| m.starts_with("1 point(s) beyond what")), "{tool}: {:?}", r.messages);
             assert!(!r.messages.iter().any(|m| m.contains("was read in")), "{tool}: {:?}", r.messages);
         }
+    }
+
+    /// Kriging's merge of coincident points as it was before cells: the scan back through the
+    /// points kept, the reference the cells are checked against.
+    fn merge_by_scanning(mut points: Vec<(Coord, f64)>) -> Vec<(Coord, f64)> {
+        points.sort_by(|a, b| a.0.x.total_cmp(&b.0.x).then_with(|| a.0.y.total_cmp(&b.0.y)));
+        let mut kept: Vec<(Coord, f64, usize)> = Vec::new();
+        for (c, v) in points {
+            let mut joins = None;
+            for (i, (k, _, _)) in kept.iter().enumerate().rev() {
+                if c.x - k.x >= 1e-9 {
+                    break;
+                }
+                if (c.y - k.y).abs() < 1e-9 {
+                    joins = Some(i);
+                    break;
+                }
+            }
+            match joins {
+                Some(i) => {
+                    kept[i].1 += v;
+                    kept[i].2 += 1;
+                }
+                None => kept.push((c, v, 1)),
+            }
+        }
+        kept.into_iter().map(|(c, sum, count)| (c, sum / count as f64)).collect()
+    }
+
+    /// Kriging's coincident points merge as the old scan merged them, bit for bit: exact repeats,
+    /// points just inside and just outside 1e-9 of each other, runs that chain, columns sharing an
+    /// x, negative and large coordinates.
+    #[test]
+    fn kriging_merges_coincident_points_as_before() {
+        let c = Coord::new;
+        // A small generator, so the cases are the same on every run.
+        let mut seed = 0x2545_f491_4f6c_dd1d_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        let mut cases: Vec<Vec<(Coord, f64)>> = vec![
+            vec![(c(0.0, 0.0), 1.0), (c(0.0, 0.0), 3.0), (c(1.0, 1.0), 5.0)],
+            vec![(c(0.0, 0.0), 1.0), (c(0.9e-9, 0.0), 2.0), (c(1.0e-9, 0.0), 3.0), (c(0.0, 1.0e-9), 4.0), (c(0.0, 0.99e-9), 5.0)],
+            // A chain: each within 1e-9 of the one before, not of the first.
+            (0..20).map(|i| (c(f64::from(i) * 0.6e-9, 0.0), f64::from(i))).collect(),
+            vec![(c(-1.0e-9, -5.0), 1.0), (c(-0.2e-9, -5.0 + 0.5e-9), 2.0), (c(8.0e6, 1.0), 3.0), (c(8.0e6 + 1.0e-9, 1.0), 4.0)],
+            vec![(c(4.0e6, 4.0e6), 1.0), (c(4.0e6 + 9.3e-10, 4.0e6), 2.0), (c(1.0e15, 1.0e15), 3.0), (c(1.0e15, 1.0e15), 4.0)],
+            // Either side of 2^23 (a coordinate's last step there is under 1e-9), and of 2^24.
+            vec![
+                (c(8_388_607.999_999_999, 1.0), 1.0),
+                (c(8_388_608.0, 1.0), 2.0),
+                (c(1.0, 8_388_607.999_999_999), 3.0),
+                (c(1.0, 8_388_608.0), 4.0),
+            ],
+            vec![
+                (c(16_777_215.999_999_998, 0.0), 1.0),
+                (c(16_777_216.0, 0.0), 2.0),
+                (c(16_777_216.0, 0.0), 3.0),
+                (c(-16_777_216.0, -0.0), 4.0),
+            ],
+            // Zero's two signs, and a tiny negative beside them.
+            vec![(c(0.0, 0.0), 1.0), (c(-0.0, -0.0), 2.0), (c(-1.0e-12, 1.0e-12), 3.0), (c(-0.6e-9, -0.0), 4.0)],
+            // Coordinates far past any cell number, all different, and some repeated.
+            (0..2000).map(|i| (c(1.0e11 + f64::from(i % 1500) * 1.0e3, -1.0e300 + f64::from(i % 1500) * 1.0e290), 1.0)).collect(),
+        ];
+        // Columns sharing an x, with near repeats of earlier points among them.
+        for _ in 0..20 {
+            let mut points = Vec::new();
+            for _ in 0..400 {
+                let x = f64::from((next() % 4) as u32) + [0.0, 0.4e-9, 1.1e-9][(next() % 3) as usize];
+                let y = f64::from((next() % 50) as u32) * 0.7e-9;
+                points.push((c(x, y), f64::from((next() % 100) as u32)));
+            }
+            cases.push(points);
+        }
+        for (k, points) in cases.into_iter().enumerate() {
+            let want = merge_by_scanning(points.clone());
+            let got = merge_coincident(points).unwrap_or_else(|e| panic!("{e}"));
+            let bits = |v: &[(Coord, f64)]| v.iter().map(|(c, v)| (c.x.to_bits(), c.y.to_bits(), v.to_bits())).collect::<Vec<_>>();
+            assert_eq!(bits(&got), bits(&want), "case {k}");
+        }
+    }
+
+    /// Kriging's merge files coordinates far past any cell number (which once all shared the last
+    /// one, making the merge quadratic) each in a cell of its own, apart from every nearer cell.
+    #[test]
+    fn kriging_files_huge_coordinates_in_cells_of_their_own() {
+        let cells: HashSet<i64> = (0..10_000).map(|i| coincident_cell(1.0e11 + f64::from(i) * 1.0e3)).collect();
+        assert_eq!(cells.len(), 10_000);
+        let far = [16_777_216.0, -16_777_216.0, 1.0e11, -1.0e11, 1.0e300, -1.0e300, f64::MAX, -f64::MAX];
+        let near = [16_777_215.999_999_998, -16_777_215.999_999_998, 0.0, -0.0];
+        for f in far {
+            assert_ne!(coincident_cell(f), coincident_cell(-f), "{f}");
+            for n in near {
+                assert!(coincident_cell(f).abs_diff(coincident_cell(n)) > 1, "{f} {n}");
+            }
+        }
+        // 100,000 of them merge, each kept.
+        let points: Vec<(Coord, f64)> = (0..100_000).map(|i| (Coord::new(1.0e11 + f64::from(i) * 1.0e3, 1.0e11), 1.0)).collect();
+        assert_eq!(merge_coincident(points).map(|m| m.len()), Ok(100_000));
+    }
+
+    /// Kriging's preparation looks at Cancel as it reads and merges its points, not only once the
+    /// grid is worked out: 40,000 points sharing an x (the old merge's slowest case).
+    #[test]
+    fn kriging_preparation_looks_at_cancel_as_it_goes() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+        for i in 0..40_000 {
+            pts.push(Some(Geometry::Point(Coord::new(0.0, f64::from(i)))), vec![Value::Float(1.0)]);
+        }
+        let m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let params = serde_json::json!({"input": "pts", "field": "v", "extent": "0,0,1,1", "pixelSize": 1});
+        // Never cancelled: counts the looks.
+        let counting = crate::control::Control::cancelled_at_look(u64::MAX);
+        let _ = crate::run_with("kriging", &m, &params, &counting);
+        // Reading the rows and merging the points, each every 4,096: at least 20 looks before the grid.
+        assert!(counting.looked() >= 20, "{}", counting.looked());
+        // The reading's ten looks (rows 0, 4096, … 36864), the merge's ten, then the grid's few.
+        assert!(counting.looked() <= 25, "{}", counting.looked());
+        // Cancelled at the merge's fifth look, after 16,384 points merged: it stops there. (A look
+        // added to reading the rows would move this.)
+        let cancelled = crate::control::Control::cancelled_at_look(15);
+        let e = crate::run_with("kriging", &m, &params, &cancelled).unwrap_err();
+        assert!(e.contains("cancelled"), "{e}");
+        assert_eq!(cancelled.looked(), 15);
+    }
+
+    /// Kriging's preparation in a projected system looks at Cancel while it projects the points
+    /// too: 40,000 points sharing a longitude, in Web Mercator.
+    #[test]
+    fn kriging_looks_at_cancel_while_it_projects_its_points() {
+        let mut pts = Dataset::new("pts", GeometryType::Point, vec![Field::new("v", FieldType::Double)]);
+        for i in 0..40_000 {
+            pts.push(Some(Geometry::Point(Coord::new(0.0, f64::from(i) * 0.001))), vec![Value::Float(1.0)]);
+        }
+        let m = Map(HashMap::from([("pts".to_string(), pts)]));
+        let params = serde_json::json!({"input": "pts", "field": "v", "crs": "EPSG:3857", "extent": "0,0,1000,1000", "pixelSize": 1000});
+        let counting = crate::control::Control::cancelled_at_look(u64::MAX);
+        let _ = crate::run_with("kriging", &m, &params, &counting);
+        // Ten looks each reading, projecting and merging, then the grid's few: the count is what
+        // shows the projection's ten (without them it is 20 and a few).
+        assert!((30..=35).contains(&counting.looked()), "{}", counting.looked());
+        // Cancelled at its 15th look (the projection's fifth): it stops there.
+        let cancelled = crate::control::Control::cancelled_at_look(15);
+        let e = crate::run_with("kriging", &m, &params, &cancelled).unwrap_err();
+        assert!(e.contains("cancelled"), "{e}");
+        assert_eq!(cancelled.looked(), 15);
     }
 
     #[test]
@@ -11877,7 +13162,14 @@ mod tests {
         let run = |p: serde_json::Value| crate::run("xyTableToPoint", &m, &p);
 
         let r = run(serde_json::json!({"input": "stops", "x": "lon", "y": "lat"})).unwrap();
-        assert_eq!(r.messages.len(), 2, "{:?}", r.messages);
+        // Rows without numbers lose nothing; the one off the globe loses its place.
+        assert_eq!(
+            said(&r)[1..],
+            [
+                "3 of 7 rows have no numbers in both fields; they are in the table without a point",
+                "DroppedGeometry: 1 of 7 rows have coordinates with no place in EPSG:4326; they are in the table without a point"
+            ]
+        );
         let out = layer(r);
         assert_eq!((out.name.as_str(), out.geometry_type), ("stops_Points", GeometryType::Point));
         assert_eq!((out.fields.len(), out.features.len()), (3, 7));
@@ -11892,13 +13184,31 @@ mod tests {
         assert_eq!(points, [Some((-74.08, 4.6)), Some((-75.5, 6.25)), Some((-76.0, 3.0)), None, None, None, None]);
         assert_eq!(out.value(3, 0), &Value::Text("words".into()), "rows without a point keep their attributes");
 
-        // Another coordinate system, and the output's name.
+        // Another coordinate system, and the output's name: the points are kept as the table
+        // gives them, held in it, 10° east on the equator in longitude/latitude.
         let out = layer(run(serde_json::json!({"input": "metres", "x": "e", "y": "n", "crs": "EPSG:3857", "output": "East"})).unwrap());
         assert_eq!(out.name, "East");
+        assert_eq!((out.coord_crs(), out.crs), (Crs::WebMercator, Some(Crs::WebMercator)));
         match out.features.first().and_then(|f| f.geometry.as_ref()) {
+            Some(Geometry::Point(c)) => assert_eq!((c.x, c.y), (1_113_194.9, 0.0)),
+            g => panic!("{g:?}"),
+        }
+        match out.in_lonlat().unwrap().features.first().and_then(|f| f.geometry.as_ref()) {
             Some(Geometry::Point(c)) => assert!((c.x - 10.0).abs() < 1e-6 && c.y.abs() < 1e-6, "{c:?}"),
             g => panic!("{g:?}"),
         }
+        // Web Mercator holds no place beyond 85.05°: a row there gets no point.
+        let mut polar =
+            Dataset::new("polar", GeometryType::None, vec![Field::new("e", FieldType::Double), Field::new("n", FieldType::Double)]);
+        polar.push(None, vec![Value::Float(0.0), Value::Float(0.0)]);
+        polar.push(None, vec![Value::Float(0.0), Value::Float(3.0e7)]);
+        let m2 = Map(HashMap::from([("polar".to_string(), polar)]));
+        let r = crate::run("xyTableToPoint", &m2, &serde_json::json!({"input": "polar", "x": "e", "y": "n", "crs": "EPSG:3857"})).unwrap();
+        assert!(said(&r).iter().any(|m| m.starts_with("DroppedGeometry: 1 of 2 rows")), "{:?}", said(&r));
+        assert!(layer(r).features[1].geometry.is_none());
+        // Points in longitude/latitude are held there, with no system of their own, as before.
+        let lonlat = layer(run(serde_json::json!({"input": "stops", "x": "lon", "y": "lat", "crs": "EPSG:4326"})).unwrap());
+        assert_eq!((lonlat.coord_crs(), lonlat.crs), (Crs::LonLat, None));
 
         // Metres read as longitude/latitude, fields without numbers, and junk parameters.
         let e = run(serde_json::json!({"input": "metres", "x": "e", "y": "n"})).unwrap_err();
@@ -12400,6 +13710,194 @@ mod tests {
                 assert_same_clip_geometry(f.geometry.as_ref().unwrap(), g);
             }
         }
+    }
+
+    /// Polygon features inside, outside and across the masks' edges, and over several masks: the
+    /// ones clear of every edge are kept as they are or dropped without an overlay, and the rest
+    /// clip as the whole mask would (their pieces in the same order, with their own attributes).
+    #[test]
+    fn clip_keeps_polygon_features_clear_of_mask_edges_as_the_overlay_would() {
+        use geo::Area;
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        // Two squares that overlap, and a square with a hole.
+        masks.push(Some(sq(0.0, 0.0, 10.0)), vec![]);
+        masks.push(Some(sq(5.0, 5.0, 10.0)), vec![]);
+        let mut holed = sq(30.0, 0.0, 10.0);
+        if let (Geometry::Polygon(p), Geometry::Polygon(h)) = (&mut holed, sq(33.0, 3.0, 4.0))
+            && let Some(ring) = h.into_iter().flatten().next()
+        {
+            p[0].push(ring.into_iter().rev().collect());
+        }
+        masks.push(Some(holed), vec![]);
+        let clockwise = Geometry::Polygon(vec![vec![vec![
+            Coord::new(1.0, 1.0),
+            Coord::new(1.0, 2.0),
+            Coord::new(2.0, 2.0),
+            Coord::new(2.0, 1.0),
+            Coord::new(1.0, 1.0),
+        ]]]);
+        let bowtie = Geometry::Polygon(vec![vec![vec![
+            Coord::new(1.0, 1.0),
+            Coord::new(4.0, 4.0),
+            Coord::new(1.0, 4.0),
+            Coord::new(3.0, 1.0),
+            Coord::new(1.0, 1.0),
+        ]]]);
+        // (the feature, the area of what is kept)
+        let cases = [
+            ("inside one mask", sq(2.0, 2.0, 1.0), 1.0),
+            ("inside both masks", sq(6.0, 6.0, 1.0), 1.0),
+            ("inside one mask, across the other's edges", sq(9.5, 9.5, 1.0), 1.0),
+            ("across one mask's edge", sq(-0.5, 2.0, 1.0), 0.5),
+            ("across both masks' edges", sq(9.5, 4.5, 1.0), 0.75),
+            ("in the hole", sq(34.0, 4.0, 1.0), 0.0),
+            ("far from every mask", sq(20.0, 0.0, 1.0), 0.0),
+            ("inside, wound the other way", clockwise.clone(), 1.0),
+        ];
+        let mut features = Dataset::new("features", GeometryType::Polygon, vec![Field::new("row", FieldType::Integer)]);
+        for (i, (_, g, _)) in cases.iter().enumerate() {
+            features.push(Some(g.clone()), vec![Value::Int(i as i64)]);
+        }
+        // Inside one mask, but a ring that crosses itself: the overlay fills its two lobes.
+        let crossing_row = cases.len() as i64;
+        features.push(Some(bowtie.clone()), vec![Value::Int(crossing_row)]);
+        // Inside one mask, its hole touching the outline at two points: the interior is in two
+        // pieces, which the overlay returns as two polygons.
+        let split_row = crossing_row + 1;
+        let split = Geometry::Polygon(vec![vec![
+            vec![Coord::new(1.0, 1.0), Coord::new(9.0, 1.0), Coord::new(9.0, 9.0), Coord::new(1.0, 9.0), Coord::new(1.0, 1.0)],
+            vec![Coord::new(1.0, 5.0), Coord::new(5.0, 2.0), Coord::new(9.0, 5.0), Coord::new(5.0, 8.0), Coord::new(1.0, 5.0)],
+        ]]);
+        features.push(Some(split), vec![Value::Int(split_row)]);
+        let m = Map(HashMap::from([("masks".into(), masks), ("features".into(), features)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"features", "clip":"masks"})).unwrap());
+        let kept: Vec<i64> = out.features.iter().map(|f| f.attrs[0].as_f64().unwrap() as i64).collect();
+        let want: Vec<i64> =
+            cases.iter().enumerate().filter(|(_, (_, _, a))| *a > 0.0).map(|(i, _)| i as i64).chain([crossing_row, split_row]).collect();
+        assert_eq!(kept, want);
+        for f in out.features.iter().filter(|f| f.attrs[0].as_f64().unwrap() as i64 <= 7) {
+            let (name, g, area) = &cases[f.attrs[0].as_f64().unwrap() as usize];
+            let got = to_multipolygon(f.geometry.as_ref().unwrap()).unwrap().unsigned_area();
+            let plane = to_multipolygon(g).unwrap().unsigned_area();
+            // Mercator stretches the areas the same way for the piece and for the whole.
+            assert!((got / plane - area).abs() < 0.02 * area.max(1.0), "{name}: {got} of {plane}");
+        }
+        // A feature clear of the edges is kept as it is, to the projection's rounding (its
+        // vertices in the same order, wound as the overlay winds a polygon).
+        let by_row = |r: i64| out.features.iter().find(|f| f.attrs[0].as_f64().unwrap() as i64 == r).and_then(|f| f.geometry.clone());
+        let same = |a: Option<Geometry>, b: Geometry| match (a, b) {
+            (Some(Geometry::Polygon(a)), Geometry::Polygon(b)) => {
+                let (a, b): (Vec<_>, Vec<_>) = (a.into_iter().flatten().flatten().collect(), b.into_iter().flatten().flatten().collect());
+                a.len() == b.len() && a.iter().zip(&b).all(|(a, b)| (a.x - b.x).abs() < 1e-9 && (a.y - b.y).abs() < 1e-9)
+            }
+            _ => false,
+        };
+        assert!(same(by_row(0), sq(2.0, 2.0, 1.0)));
+        assert!(same(by_row(1), sq(6.0, 6.0, 1.0)));
+        assert!(same(by_row(2), sq(9.5, 9.5, 1.0)));
+        // The crossing ring is what the overlay makes of it: its two lobes, well over the net area.
+        let Some(Geometry::Polygon(pieces)) = by_row(split_row) else { panic!("not a polygon") };
+        assert_eq!(pieces.len(), 2);
+        let lobes = by_row(crossing_row).and_then(|g| to_multipolygon(&g)).unwrap().unsigned_area();
+        let whole = to_multipolygon(&bowtie).unwrap().unsigned_area();
+        assert!(lobes > 2.0 * whole, "{lobes} of {whole}");
+        let Some(Geometry::Polygon(wound)) = by_row(7) else { panic!("not a polygon") };
+        let ccw = to_multipolygon(&Geometry::Polygon(wound)).unwrap();
+        assert!(ccw.0[0].exterior().0.windows(2).map(|w| w[0].x * w[1].y - w[1].x * w[0].y).sum::<f64>() > 0.0);
+    }
+
+    /// A ring that doesn't cross itself in longitude/latitude but does in the plane the overlay
+    /// works in (Mercator stretches the north more) isn't kept as it is inside a mask: it goes
+    /// to the overlay, as it did before features clear of the edges were kept whole.
+    #[test]
+    fn clip_overlays_a_ring_that_crosses_itself_only_once_projected() {
+        let ring = Geometry::Polygon(vec![vec![vec![
+            Coord::new(0.0, 0.0),
+            Coord::new(10.0, 80.0),
+            Coord::new(0.0, 80.0),
+            Coord::new(9.0, 73.0),
+            Coord::new(0.0, 0.0),
+        ]]]);
+        assert!(crate::validity::check(Some(&ring), crate::validity::MAX_WORK).problems.is_empty());
+        let mut masks = Dataset::new("masks", GeometryType::Polygon, vec![]);
+        masks.push(Some(sq(-20.0, -20.0, 104.0)), vec![]);
+        let mut features = Dataset::new("features", GeometryType::Polygon, vec![]);
+        features.push(Some(ring.clone()), vec![]);
+        let m = Map(HashMap::from([("masks".into(), masks), ("features".into(), features)]));
+        let out = layer(crate::run("clip", &m, &serde_json::json!({"input":"features", "clip":"masks"})).unwrap());
+        let Some(Some(Geometry::Polygon(got))) = out.features.first().map(|f| f.geometry.clone()) else { panic!("no polygon") };
+        let Geometry::Polygon(was) = ring else { panic!("not a polygon") };
+        // The overlay splits it where it crosses: more than the one ring of five vertices.
+        assert_ne!(got.iter().flatten().map(Vec::len).collect::<Vec<_>>(), was.iter().flatten().map(Vec::len).collect::<Vec<_>>());
+    }
+
+    /// A feature is `Inside` or `Outside` a mask only when no edge of it is within reach of the
+    /// feature's padded box; any edge there leaves it to the overlay, and so does a feature with
+    /// no area or a coordinate that isn't finite, whatever the mask.
+    #[test]
+    fn a_feature_is_placed_without_an_overlay_only_clear_of_the_mask_edges() {
+        let mask = union_all(to_multipolygon(&sq(0.0, 0.0, 1.0)).unwrap().0.iter());
+        let edges = MaskEdges::new(&mask);
+        let place = |g: &Geometry| {
+            let whole = to_multipolygon(g).unwrap();
+            let ext = projected_extent(g).padded(0.0, 100.0);
+            place_against(&whole, &ext, &mask, &edges)
+        };
+        assert_eq!(place(&sq(0.4, 0.4, 0.1)), Place::Inside);
+        assert_eq!(place(&sq(3.0, 3.0, 0.1)), Place::Outside);
+        // Across an edge, on it, within the padding (100 m) of it, and around the whole mask.
+        assert_eq!(place(&sq(0.9, 0.4, 0.2)), Place::Edge);
+        assert_eq!(place(&sq(0.9, 0.4, 0.1)), Place::Edge);
+        assert_eq!(place(&sq(0.4, 0.4, 0.6 - 0.0005)), Place::Edge);
+        assert_eq!(place(&sq(-1.0, -1.0, 3.0)), Place::Edge);
+        // Nothing to place: no area, or a coordinate that isn't finite.
+        let fit = |g: &Geometry| fit_to_place(&to_multipolygon(g).unwrap(), &projected_extent(g).padded(0.0, 100.0));
+        assert!(fit(&sq(0.4, 0.4, 0.1)));
+        let ring = |pts: &[(f64, f64)]| pts.iter().map(|&(x, y)| Coord::new(x, y)).collect::<Vec<_>>();
+        assert!(!fit(&Geometry::Polygon(vec![vec![ring(&[(0.4, 0.4), (0.5, 0.4), (0.6, 0.4), (0.4, 0.4)])]])));
+        assert!(!fit(&Geometry::Polygon(vec![vec![ring(&[(0.4, 0.4), (0.5, f64::NAN), (0.5, 0.5), (0.4, 0.5), (0.4, 0.4)])]])));
+    }
+
+    /// The edges found near a box are the ones a scan of every edge's box finds, for a mask of
+    /// several polygons with holes, enough edges to be on a grid, and boxes everywhere around them.
+    #[test]
+    fn mask_edges_find_what_a_scan_of_the_edges_finds() {
+        let ring = |cx: f64, cy: f64, r: f64, n: usize| {
+            geo::LineString::from(
+                (0..=n)
+                    .map(|i| {
+                        let a = std::f64::consts::TAU * (i % n) as f64 / n as f64;
+                        (cx + r * a.cos(), cy + r * a.sin())
+                    })
+                    .collect::<Vec<_>>(),
+            )
+        };
+        let mask = MultiPolygon::new(vec![
+            geo::Polygon::new(ring(0.0, 0.0, 10.0, 40), vec![ring(0.0, 0.0, 4.0, 20), ring(6.0, 0.0, 1.0, 8)]),
+            geo::Polygon::new(ring(30.0, 5.0, 3.0, 12), vec![]),
+        ]);
+        let edges = MaskEdges::new(&mask);
+        let boxes: Vec<Extent> = MaskEdges::rings_of(&mask)
+            .flat_map(|(_, _, r)| {
+                r.0.windows(2).map(|w| Extent::new(w[0].x.min(w[1].x), w[0].y.min(w[1].y), w[0].x.max(w[1].x), w[0].y.max(w[1].y)))
+            })
+            .collect();
+        assert!(edges.grid.cell_size().is_some());
+        let mut seed = 7_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            f64::from(seed >> 8) / f64::from(1_u32 << 24)
+        };
+        let mut found = [0, 0];
+        for _ in 0..4000 {
+            let (x, y, w, h) = (next() * 50.0 - 12.0, next() * 30.0 - 12.0, next() * 2.0, next() * 2.0);
+            let ext = Extent::new(x, y, x + w, y + h);
+            let want = boxes.iter().any(|b| b.intersects(&ext));
+            assert_eq!(edges.near(&mask, &ext), want, "{ext:?}");
+            found[usize::from(want)] += 1;
+        }
+        // Both answers came up.
+        assert!(found.iter().all(|&n| n > 100), "{found:?}");
     }
 
     #[test]
@@ -13000,8 +14498,7 @@ mod tests {
         assert_eq!(res.messages.len(), 1, "{:?}", res.messages);
         zones.push(Some(sq(7.0, 0.0, 1.0)), vec![at("2026-03-05T14:30:00+02:00"), Value::Null]);
         let res = crate::run("update", &m(zones), &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
-        assert_eq!(res.messages.get(1).map(String::as_str), Some("Update: 'd' holds dates, so 1 update feature kept only its day"));
-        assert_eq!(res.messages.len(), 2);
+        assert_eq!(said(&res)[1..], ["DroppedTime: Update: 'd' holds dates, so 1 update feature kept only its day"]);
     }
 
     #[test]
@@ -13034,11 +14531,7 @@ mod tests {
         let m = Map(HashMap::from([("parcels".to_string(), parcels), ("zones".to_string(), zones)]));
         let res = crate::run("update", &m, &serde_json::json!({"input": "parcels", "update": "zones"})).unwrap();
         // "seven" isn't a whole number: null, and said.
-        assert_eq!(
-            res.messages.get(1).map(String::as_str),
-            Some("Update: 'n' is null in 1 update feature, whose value isn't a Long value")
-        );
-        assert_eq!(res.messages.len(), 2);
+        assert_eq!(said(&res)[1..], ["DroppedValue: Update: 'n' is null in 1 update feature, whose value isn't a Long value"]);
         let out = layer(res);
         let attrs: Vec<&[Value]> = out.features.iter().skip(1).map(|f| f.attrs.as_slice()).collect();
         assert_eq!(
@@ -13373,6 +14866,95 @@ mod tests {
         assert!((x.unwrap() - 11.0).abs() < 1e-7 && (y.unwrap() - 11.0).abs() < 1e-7, "{x:?} {y:?}");
     }
 
+    /// Explicit/small runs never size geometry, while an automatic estimate larger than the
+    /// entire scratch budget admits only the baseline worker without global test overrides.
+    #[test]
+    fn geometry_threads_skips_unused_estimates_and_limits_scratch() {
+        assert_eq!(geometry_threads(PARALLEL_FEATURES * 2, Some(3), || panic!("explicit count sized geometry")).unwrap(), 3);
+        assert_eq!(geometry_threads(PARALLEL_FEATURES - 1, None, || panic!("small run sized geometry")).unwrap(), 1);
+        let sized = std::cell::Cell::new(false);
+        assert_eq!(
+            geometry_threads(PARALLEL_FEATURES * 2, None, || {
+                sized.set(true);
+                Ok(usize::MAX)
+            })
+            .unwrap(),
+            1
+        );
+        assert_eq!(sized.get(), crate::parallel::threads_for(PARALLEL_FEATURES * 2, PARALLEL_FEATURES) > 1);
+    }
+
+    /// Coincident points retain every measured distance and hit. Compare the allowance with
+    /// those actual container capacities, including the hash table's buckets and control bytes.
+    #[test]
+    fn nearby_scratch_covers_coincident_distance_results() {
+        let point = Geometry::Point(Coord::new(0.0, 0.0));
+        let geo = to_geo(&point);
+        let feats: Vec<_> = (0..4097).map(|row| Located { row, ext: point.extent(), geo: geo.clone(), geom: &point }).collect();
+        let index = ExtentIndex::new(feats.iter().map(|f| f.ext));
+        let nearby = Nearby { feats: &feats, index: &index };
+        let mut measured = HashMap::new();
+        let near = nearby.within(&point, &point.extent(), &geo, 1.0, false, None, &mut measured);
+        assert_eq!(near.len(), feats.len());
+        assert!(near.capacity() > near.len(), "exercise distance-vector growth");
+        assert_eq!(measured.len(), feats.len());
+        let table = measured.capacity() * 2 * (std::mem::size_of::<(usize, Option<f64>)>() + 1);
+        let distances = (near.capacity() + near.len()) * std::mem::size_of::<(usize, f64)>();
+        let candidates = index.references.max(feats.len()) * std::mem::size_of::<usize>();
+        assert!(nearby.scratch_bytes() >= table + distances + candidates);
+    }
+
+    /// Dense joins shrink even a single worker's batch. Actual pushed match vectors from the
+    /// selected batch fit the budget beyond one target, unlike a fixed FEATURE_BATCH per worker.
+    #[test]
+    fn spatial_join_batches_bound_retained_dense_matches() {
+        let joins = 513;
+        let budget = 64 << 10;
+        let worker = 2048;
+        let per_target = join_match_bytes(JoinMatch::Intersects, joins);
+        for threads in [1usize, 4] {
+            let batch = join_target_batch(threads, worker, per_target, budget);
+            assert!(batch < threads * FEATURE_BATCH);
+            let lists: Vec<Vec<(usize, Option<f64>)>> = (0..batch)
+                .map(|_| {
+                    let mut list = Vec::new();
+                    for row in 0..joins {
+                        list.push((row, None));
+                    }
+                    list
+                })
+                .collect();
+            assert!(lists.iter().all(|list| list.capacity() > joins), "exercise match-vector growth");
+            let retained: usize = lists.iter().map(|list| list.capacity() * std::mem::size_of::<(usize, Option<f64>)>()).sum();
+            let baseline = lists[0].capacity() * std::mem::size_of::<(usize, Option<f64>)>();
+            assert!(retained + worker * (threads - 1) <= budget + baseline);
+        }
+    }
+
+    /// Zones may overlap each other: 64 identical masks retain 64 complete input shapes.
+    /// Counting those output coordinates catches an estimate that assumes disjoint zones.
+    #[test]
+    fn overlay_scratch_covers_repeated_inside_pieces() {
+        let ring: Vec<Coord> = (0..=1000)
+            .map(|i| {
+                let angle = (i % 1000) as f64 * std::f64::consts::TAU / 1000.0;
+                Coord::new(angle.cos(), angle.sin())
+            })
+            .collect();
+        let geometry = Geometry::Polygon(vec![vec![ring]]);
+        let mut ds = Dataset::new("input", GeometryType::Polygon, vec![]);
+        ds.push(Some(geometry.clone()), vec![]);
+        let mask = polygon_of(&sq(-2.0, -2.0, 4.0)).unwrap();
+        let zones: Vec<Zone> = (0..64).map(|row| Zone { row, ext: Extent::new(-2.0, -2.0, 2.0, 2.0), poly: mask.clone() }).collect();
+        let index = ExtentIndex::new(zones.iter().map(|z| z.ext));
+        let poles = AtPoles::new(zones.iter().map(|z| super::poles(&z.ext)));
+        let estimated = overlay_scratch(&ds, &[0], &zones, (&index, &poles), true).unwrap();
+        let (pieces, _) = cut(&geometry, &zones, (&index, &poles), false);
+        assert_eq!(pieces.len(), 64);
+        let retained: usize = pieces.iter().map(|(_, g)| coord_bytes(g)).sum();
+        assert!(estimated >= retained, "{estimated} estimated bytes, {retained} in output coordinates alone");
+    }
+
     /// Intersect, Identity, Union and Symmetrical Difference give the same rows, bit for bit, on
     /// several threads as on one (#1252): overlapping squares of two layers, overlay features of
     /// two parts, and input features without geometry.
@@ -13398,14 +14980,14 @@ mod tests {
         for op in [Overlay::Intersect, Overlay::Identity, Overlay::Union, Overlay::SymmetricalDifference] {
             let one = layer(overlay_on(&m, &p, op, Some(1)).unwrap());
             assert!(one.features.len() > 100, "{op:?}: {}", one.features.len());
-            for threads in [2, 7, 16] {
-                let many = layer(overlay_on(&m, &p, op, Some(threads)).unwrap());
-                assert_eq!(many.features.len(), one.features.len(), "{op:?}, {threads} threads");
+            for threads in [None, Some(2), Some(7), Some(16)] {
+                let many = layer(overlay_on(&m, &p, op, threads).unwrap());
+                assert_eq!(many.features.len(), one.features.len(), "{op:?}, {threads:?} threads");
                 for (a, b) in one.features.iter().zip(&many.features) {
                     assert_eq!(
                         format!("{:?}", (&a.geometry, &a.attrs)),
                         format!("{:?}", (&b.geometry, &b.attrs)),
-                        "{op:?}, {threads} threads"
+                        "{op:?}, {threads:?} threads"
                     );
                 }
             }
@@ -13556,9 +15138,9 @@ mod tests {
         let m = Map(HashMap::from([("input".to_string(), input), ("clean".to_string(), clean), ("masks".to_string(), masks)]));
         let lossy = clip(&m, &serde_json::json!({"input": "input", "clip": "masks"})).unwrap();
         assert!(
-            lossy.messages.iter().any(|m| m == "Clip: 3 feature(s) of 'input' left out: they have no geometry to clip"),
+            said(&lossy).iter().any(|m| m == "DroppedFeature: Clip: 3 feature(s) of 'input' left out: they have no geometry to clip"),
             "{:?}",
-            lossy.messages
+            said(&lossy)
         );
         let clean = clip(&m, &serde_json::json!({"input": "clean", "clip": "masks"})).unwrap();
         assert!(!clean.messages.iter().any(|m| m.contains("no geometry")), "{:?}", clean.messages);
@@ -13756,16 +15338,16 @@ mod tests {
             assert!(!one_messages.iter().any(|m| m.contains("(0 matches)")), "{name}: {one_messages:?}");
             let one = layer(one);
             assert!(one.features.len() > 50, "{name}: {}", one.features.len());
-            for threads in [2, 7, 16] {
-                let many = run(&m, &p, Some(threads)).unwrap();
-                assert_eq!(many.messages, one_messages, "{name}, {threads} threads");
+            for threads in [None, Some(2), Some(7), Some(16)] {
+                let many = run(&m, &p, threads).unwrap();
+                assert_eq!(many.messages, one_messages, "{name}, {threads:?} threads");
                 let many = layer(many);
-                assert_eq!(many.features.len(), one.features.len(), "{name}, {threads} threads");
+                assert_eq!(many.features.len(), one.features.len(), "{name}, {threads:?} threads");
                 for (a, b) in one.features.iter().zip(&many.features) {
                     assert_eq!(
                         format!("{:?}", (&a.geometry, &a.attrs)),
                         format!("{:?}", (&b.geometry, &b.attrs)),
-                        "{name}, {threads} threads"
+                        "{name}, {threads:?} threads"
                     );
                 }
             }
@@ -14562,12 +16144,26 @@ mod tests {
         assert_eq!(names, ["FREQUENCY", "SUM_value"]);
     }
 
+    /// Case fields alone count records by group: each row has the case fields and FREQUENCY, as a
+    /// count by month needs, without a statistic added only to get past a refusal.
+    #[test]
+    fn summary_statistics_counts_by_case_fields_alone() {
+        let m = parcels();
+        let out = layer(crate::run("summaryStatistics", &m, &serde_json::json!({"input": "parcels", "case": "zone"})).unwrap());
+        let names: Vec<&str> = out.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["zone", "FREQUENCY"]);
+        assert_eq!(column(&out, "FREQUENCY"), [Value::Int(1), Value::Int(1), Value::Int(4)]);
+        // An empty statistics list and an empty Statistics Field, as the Tools pane sends them, count too.
+        let pane = serde_json::json!({"input": "parcels", "case": ["zone"], "statistics": [], "field": ""});
+        assert_eq!(layer(crate::run("summaryStatistics", &m, &pane).unwrap()).features, out.features);
+    }
+
     /// Calls that can't be answered are refused with a message naming the problem.
     #[test]
     fn summary_statistics_rejects_bad_requests() {
         let m = parcels();
         for (p, says) in [
-            (serde_json::json!({"input": "parcels"}), "give the statistics"),
+            (serde_json::json!({"input": "parcels"}), "or Case Fields to count records by"),
             (serde_json::json!({"input": "parcels", "statistics": [{"field": "owner", "statistic": "MEAN"}]}), "needs a numeric field"),
             (serde_json::json!({"input": "parcels", "statistics": [{"field": "value", "statistic": "TOTAL"}]}), "must be one of"),
             (serde_json::json!({"input": "parcels", "field": "value", "case": ["zone", "ZONE"]}), "listed twice"),
@@ -15134,13 +16730,26 @@ mod tests {
         let mut zones = Dataset::new("zones", GeometryType::Polygon, vec![]);
         zones.push(Some(sq(0., 0., 2.)), vec![]);
         zones.push(None, vec![]);
+        // A ring of two points has no area; one with a point that isn't finite can't be read, and
+        // its area is lost.
+        zones.push(Some(Geometry::Polygon(vec![vec![vec![Coord::new(0., 0.), Coord::new(1., 0.)]]])), vec![]);
+        zones.push(
+            Some(Geometry::Polygon(vec![vec![vec![Coord::new(0., 0.), Coord::new(f64::NAN, 0.), Coord::new(1., 1.), Coord::new(0., 0.)]]])),
+            vec![],
+        );
         let m = RasterMap { datasets: HashMap::from([("zones".into(), zones)]), rasters: HashMap::from([("cover".into(), &raster)]) };
         let p = serde_json::json!({"raster":"cover", "zones":"zones", "unit":"m2"});
         let one = tabulate_area::run_on(&m, &p, Some(1)).unwrap();
         let many = tabulate_area::run_on(&m, &p, Some(3)).unwrap();
         assert_eq!(one.messages, many.messages);
         assert!(!one.messages.iter().any(|m| m.contains("uses the raster projection")));
-        assert!(one.messages.iter().any(|m| m.starts_with("1 zone feature(s)")));
+        assert!(said(&one).iter().any(|m| m == "2 zone feature(s) had no polygon with an area and were excluded"), "{:?}", said(&one));
+        assert!(
+            said(&one).iter().any(|m| m == "DroppedGeometry: 1 zone feature(s) had invalid polygon geometry and were excluded"),
+            "{:?}",
+            said(&one)
+        );
+        assert_eq!(one.losses, many.losses);
         let (Output::Table(a), Output::Table(b)) = (one.output, many.output) else { panic!("tables") };
         assert_eq!(a.features, b.features);
         let expected =
@@ -15538,7 +17147,12 @@ mod tests {
             rasters: HashMap::from([("elev".to_string(), &raster)]),
         };
         let res_drop_ext = crate::run("zonalStats", &m_drop_ext, &serde_json::json!({"raster": "elev", "polygons": "drop_ext"})).unwrap();
-        assert!(res_drop_ext.messages.iter().any(|m| m.contains("failed coordinate transformation") || m.contains("invalid geometry")));
+        // Its exterior has no area, so nothing is lost: said plain.
+        assert!(
+            said(&res_drop_ext).iter().any(|m| m == "1 feature(s) have no polygon with an area, so their statistics are empty"),
+            "{:?}",
+            said(&res_drop_ext)
+        );
         let out_drop_ext = layer(res_drop_ext);
         let drop_count_idx = out_drop_ext.field_index("elev_count").unwrap();
         let drop_mean_idx = out_drop_ext.field_index("elev_mean").unwrap();
@@ -15561,7 +17175,7 @@ mod tests {
             rasters: HashMap::from([("elev".to_string(), &raster)]),
         };
         let res_nan_ext = crate::run("zonalStats", &m_nan_ext, &serde_json::json!({"raster": "elev", "polygons": "nan_ext"})).unwrap();
-        assert!(res_nan_ext.messages.iter().any(|m| m.contains("failed coordinate transformation") || m.contains("invalid geometry")));
+        assert!(said(&res_nan_ext).iter().any(|m| m.contains("failed coordinate transformation") || m.contains("invalid geometry")));
         let out_nan_ext = layer(res_nan_ext);
         let nan_count_idx = out_nan_ext.field_index("elev_count").unwrap();
         let nan_mean_idx = out_nan_ext.field_index("elev_mean").unwrap();
@@ -15748,7 +17362,7 @@ mod tests {
         };
 
         let res = crate::run("zonalStats", &m, &serde_json::json!({"raster": "elev", "polygons": "mixed_zones"})).unwrap();
-        let messages = res.messages.clone();
+        let messages = said(&res);
         let out = layer(res);
 
         assert_eq!(out.features.len(), 3);
@@ -15768,7 +17382,10 @@ mod tests {
         assert!(out.value(2, mean_idx).as_f64().is_some());
 
         // Messages must explicitly report feature 102 failure
-        assert!(messages.iter().any(|m| m.contains("1 feature(s) had invalid geometry")));
+        assert!(
+            messages.iter().any(|m| m == "DroppedGeometry: 1 feature(s) had invalid geometry, so their statistics are empty"),
+            "{messages:?}"
+        );
         assert!(messages.iter().any(|m| m.contains("feature 102") && m.contains("fewer than 3 vertices")));
     }
 

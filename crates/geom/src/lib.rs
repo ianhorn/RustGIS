@@ -149,6 +149,26 @@ impl Extent {
     pub fn contains(&self, c: Coord) -> bool {
         c.x >= self.min_x && c.x <= self.max_x && c.y >= self.min_y && c.y <= self.max_y
     }
+    /// Whether a box that isn't empty reaches past longitude/latitude: beyond ±180.5° in x or
+    /// ±90.5° in y, the half degree allowing for rounding, as the readers check. A hint, not proof,
+    /// that the coordinates are projected or in no known system: longitudes unwrapped across the
+    /// antimeridian (181°) reach past it too.
+    pub fn beyond_lonlat(&self) -> bool {
+        !self.is_empty() && (self.min_x < -180.5 || self.max_x > 180.5 || self.min_y < -90.5 || self.max_y > 90.5)
+    }
+    /// `n + 1` by `n + 1` places evenly over the box, its edges and corners included, column by
+    /// column from the west: what a box taken into another system is found from, so a box the
+    /// conversion curves is followed. `n` is taken between 1 (the four corners) and 1024; no
+    /// places for an empty box.
+    pub fn samples(&self, n: usize) -> impl Iterator<Item = Coord> + '_ {
+        // A grid of at least the corners, and no larger than 1025 by 1025.
+        let n = n.clamp(1, 1024);
+        let steps = if self.is_empty() { 0 } else { n + 1 };
+        (0..steps).flat_map(move |i| {
+            (0..steps)
+                .map(move |j| Coord::new(self.min_x + self.width() * i as f64 / n as f64, self.min_y + self.height() * j as f64 / n as f64))
+        })
+    }
     /// Grows every side by `f` of the size (0.1 = 10 %), with a minimum pad for points.
     pub fn padded(&self, f: f64, min_pad: f64) -> Extent {
         if self.is_empty() {
@@ -431,6 +451,27 @@ pub fn wgs84_direct(c: Coord, azimuth_deg: f64, dist_m: f64) -> (Coord, f64) {
     (Coord::new(lon, lat), azi2)
 }
 
+/// The distance (metres) between two nearby lon/lat points on the WGS 84 ellipsoid, for the many
+/// short steps of a long line (a route's): from the ellipsoid's radii of curvature along and across
+/// the meridian at the two points' mean latitude, within a millionth of [`wgs84_distance_m`] for a
+/// step of up to 0.05° in latitude and in longitude below 89°, and [`wgs84_distance_m`] itself for
+/// any other. It costs a few operations, where a geodesic solve costs about 20 times a haversine.
+/// NaN for a coordinate that isn't finite.
+pub fn wgs84_step_m(a: Coord, b: Coord) -> f64 {
+    if !a.is_finite() || !b.is_finite() {
+        return f64::NAN;
+    }
+    let (dlat, dlon) = (b.y - a.y, wrap_lon(b.x - a.x));
+    if dlat.abs() > 0.05 || dlon.abs() > 0.05 || a.y.abs().max(b.y.abs()) > 89.0 {
+        return wgs84_distance_m(a, b);
+    }
+    let (s, c) = ((a.y + b.y) / 2.0).to_radians().sin_cos();
+    let w2 = 1.0 - WGS84_E2 * s * s;
+    let across = WGS84_A / w2.sqrt();
+    let along = across * (1.0 - WGS84_E2) / w2;
+    (along * dlat.to_radians()).hypot(across * c * dlon.to_radians())
+}
+
 /// Length of a lon/lat polyline along the WGS 84 ellipsoid's geodesics (metres): each segment is
 /// an inverse geodesic solve, so it is exact, unlike [`geodesic_length_m`]'s great circles. Long
 /// lines of many vertices cost a solve per segment (a few microseconds each).
@@ -465,13 +506,25 @@ pub fn ring_area_is_ambiguous(ring: &[Coord]) -> bool {
 }
 
 /// How many times a lon/lat ring that never reaches a pole winds around one: each step of
-/// longitude taken the short way round (within ±180°; an edge of exactly a whole turn as [`ring_lon_steps`]
-/// reads it), summed, in whole turns. A ring cut at ±180° and closed along the pole, the form
+/// longitude taken the short way round (within ±180°; an edge of a whole turn, within [`NEAR_DEG`]
+/// (about 11 m), as [`ring_lon_steps`] reads it), summed, in whole turns. A ring cut at ±180° and closed along the pole, the form
 /// RustGIS takes for a polygon around a pole, reaches the pole and gives 0; so does any ring whose
 /// steps cancel. A loop such as a parallel written all the way round (`[0, 80]`, `[30, 80]`, …,
 /// `[330, 80]`) gives ±1, and the analysis plane, which reads longitude and latitude as x and y,
-/// sees it as a line with no area. 0 for a ring with fewer than three vertices or a coordinate
-/// that isn't a longitude and latitude.
+/// sees it as a line with no area. 0 for a ring with fewer than three vertices, a coordinate that
+/// isn't finite or lies past ±90° of latitude, or a vertex at a pole (within [`NEAR_DEG`]).
+///
+/// Only the coordinates are read, as longitude and latitude, as the analysis tools that read areas
+/// in the plane take a layer's (a layer with a coordinate system is read into them): a ring whose x
+/// and y were never degrees (a layer with no coordinate system, in small units, taken for degrees)
+/// can wind too, but only with an edge more than 180 long in x, and the steps decide it, taken the
+/// short way but for an edge of 360 (within [`NEAR_DEG`]), which may be a full turn as above (`[0, 0]`,
+/// `[360, 0]`, `[360, 10]`, `[240, 10]`, `[120, 10]`, `[0, 10]` keeps its first edge as one, and
+/// gives 0).
+/// The triangle `[0, 0]`, `[300, 0]`, `[150, 80]` steps -60°, -150° and -150°, so it gives -1
+/// though as x and y it's a plain triangle; the rectangle `[0, 0]`, `[300, 0]`, `[300, 10]`,
+/// `[0, 10]` has two such edges, whose steps cancel, and gives 0; a ring as wide with no edge longer
+/// than 180 gives 0 too.
 pub fn ring_pole_turns(ring: &[Coord]) -> i64 {
     if ring.len() < 3 || !ring.iter().all(|c| c.is_finite() && c.y.abs() <= 90.0) || ring.iter().any(|c| at_pole(c.y)) {
         return 0;
@@ -566,6 +619,14 @@ fn wgs84_parallel_m(lat_deg: f64, dlon_deg: f64) -> f64 {
 /// parallel or meridian, for [`ring_lon_steps`]: a band written with coordinates rounded to four
 /// decimals or more keeps its full turns.
 const NEAR_DEG: f64 = 1e-4;
+
+/// Whether a step of longitude (degrees) is a full turn, within [`NEAR_DEG`]: an edge along a
+/// parallel or the pole written from -180° to 180°, which the area and winding measures here keep
+/// as written. Code that unwraps longitudes must agree with them, so it asks this.
+#[must_use]
+pub fn is_full_turn_step(step: f64) -> bool {
+    step.is_finite() && step.abs() >= 360.0 - NEAR_DEG
+}
 
 /// Whether a latitude is at a pole, within [`NEAR_DEG`].
 fn at_pole(lat: f64) -> bool {
@@ -695,6 +756,7 @@ fn ring_lon_steps(ring: &[Coord]) -> Vec<(f64, bool)> {
 /// [`ring_lon_steps`]), which is its whole parallel. The sphere's counterpart of
 /// [`wgs84_ring_perimeter_area_m2`]'s perimeter; [`geodesic_length_m`] of the closed ring counts
 /// a full turn as nothing, the distance between its two ends.
+#[expect(clippy::disallowed_methods, reason = "the sphere's own perimeter, for other bodies scaled by `Body`")]
 pub fn geodesic_ring_perimeter_m(ring: &[Coord]) -> f64 {
     if ring.len() < 2 {
         return 0.0;
@@ -975,9 +1037,39 @@ pub fn format_dms(c: Coord) -> String {
     format!("{} {ew}  {} {ns}", dms(c.x), dms(c.y))
 }
 
+#[expect(clippy::disallowed_methods, reason = "tests check the sphere's formulas, against the ellipsoid's among others")]
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A box past ±180.5° or ±90.5° isn't longitude/latitude; one within, or an empty one, is.
+    #[test]
+    fn a_box_beyond_lonlat_is_told() {
+        assert!(!Extent::EMPTY.beyond_lonlat());
+        assert!(!Extent::new(-180.5, -90.5, 180.5, 90.5).beyond_lonlat());
+        for e in [
+            Extent::new(-180.6, 0.0, 0.0, 1.0),
+            Extent::new(0.0, 0.0, 180.6, 1.0),
+            Extent::new(0.0, -90.6, 1.0, 1.0),
+            Extent::new(0.0, 0.0, 1.0, 90.6),
+        ] {
+            assert!(e.beyond_lonlat(), "{e:?}");
+        }
+        assert!(Extent::new(500_000.0, 4_000_000.0, 600_000.0, 4_100_000.0).beyond_lonlat());
+    }
+
+    /// A box's samples cover it evenly, corners and edges included; an empty box has none.
+    #[test]
+    fn a_box_is_sampled_over_its_edges_and_inside() {
+        let e = Extent::new(0.0, 10.0, 4.0, 12.0);
+        let s: Vec<Coord> = e.samples(2).collect();
+        assert_eq!(s.len(), 9);
+        assert_eq!((s[0], s[1], s[8]), (Coord::new(0.0, 10.0), Coord::new(0.0, 11.0), Coord::new(4.0, 12.0)));
+        assert!(s.iter().all(|c| e.contains(*c)));
+        assert_eq!(Extent::EMPTY.samples(16).count(), 0);
+        assert_eq!(e.samples(0).count(), 4);
+        assert_eq!(e.samples(usize::MAX).count(), 1025 * 1025);
+    }
 
     #[test]
     fn a_weighted_point_counts_as_that_many() {
@@ -1480,6 +1572,29 @@ mod tests {
         assert!(geodesic_destination(Coord::new(10.0, 50.0), 90.0, f64::NAN).x.is_nan());
     }
 
+    /// A short step measured from the ellipsoid's radii agrees with the geodesic solve to within a
+    /// millionth, at every latitude below 89° and across the antimeridian; a longer step, or one by
+    /// a pole, is the solve itself.
+    #[test]
+    fn wgs84_steps_agree_with_the_geodesic() {
+        let mut worst: f64 = 0.0;
+        for lat in (-89..=88).map(f64::from) {
+            for (dx, dy) in [(0.05, 0.0), (0.0, 0.05), (0.05, 0.05), (-0.03, 0.01), (1e-5, -2e-5)] {
+                for lon in [-179.98, -12.0, 0.0, 179.99] {
+                    let (a, b) = (Coord::new(lon, lat), Coord::new(lon + dx, lat + dy));
+                    let exact = wgs84_distance_m(a, b);
+                    worst = worst.max((wgs84_step_m(a, b) - exact).abs() / exact);
+                }
+            }
+        }
+        assert!(worst < 1e-6, "{worst}");
+        let far = (Coord::new(10.0, 40.0), Coord::new(10.2, 40.0));
+        assert_eq!(wgs84_step_m(far.0, far.1), wgs84_distance_m(far.0, far.1));
+        let polar = (Coord::new(10.0, 89.5), Coord::new(10.01, 89.5));
+        assert_eq!(wgs84_step_m(polar.0, polar.1), wgs84_distance_m(polar.0, polar.1));
+        assert!(wgs84_step_m(Coord::new(f64::NAN, 0.0), Coord::new(0.0, 0.0)).is_nan());
+    }
+
     #[test]
     fn geodesic_length_matches_summed_haversine_across_the_antimeridian() {
         let poly = [Coord::new(0.0, 0.0), Coord::new(10.0, 20.0), Coord::new(179.0, -30.0), Coord::new(-179.0, -31.0)];
@@ -1850,5 +1965,29 @@ mod tests {
         }
         assert_eq!(ring_pole_turns(&missing), 0, "a coordinate missing");
         assert_eq!(ring_pole_turns(&[Coord::new(0.0, 80.0), Coord::new(180.0, 80.0)]), 0, "too short");
+        // Coordinates are read as longitude and latitude, as the analysis tools that read areas in
+        // the plane take a layer's: a plain triangle of x and y with an edge more than 180 long
+        // winds once when its steps are taken the short way. As degrees that's what it does, so
+        // this records the reading, not a slip.
+        let wide = [(0.0, 0.0), (300.0, 0.0), (150.0, 80.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&wide.map(|(x, y)| Coord::new(x, y))), -1);
+        // A layer in meters is read into degrees before any tool sees it; one that never was has
+        // a y past 90 almost at once, and gives 0: a 1 km triangle doesn't wind.
+        let meters = [(0.0, 0.0), (1000.0, 0.0), (500.0, 800.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&meters.map(|(x, y)| Coord::new(x, y))), 0);
+        // An edge of exactly 360 between a step north and a step south is a full turn, not folded:
+        // the short-way steps would sum to -360, but this ring gives 0.
+        let full = [(0.0, 0.0), (360.0, 0.0), (360.0, 10.0), (240.0, 10.0), (120.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&full.map(|(x, y)| Coord::new(x, y))), 0);
+        // Two edges more than 180 long whose steps cancel: no winding. An edge that long is
+        // needed, not enough.
+        let rect = [(0.0, 0.0), (300.0, 0.0), (300.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&rect.map(|(x, y)| Coord::new(x, y))), 0);
+        // As wide, but no edge longer than 180: no winding. Nor within 180.
+        let stepped =
+            [(0.0, 0.0), (100.0, 0.0), (200.0, 0.0), (300.0, 0.0), (300.0, 10.0), (200.0, 10.0), (100.0, 10.0), (0.0, 10.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&stepped.map(|(x, y)| Coord::new(x, y))), 0);
+        let narrow = [(0.0, 0.0), (150.0, 0.0), (75.0, 80.0), (0.0, 0.0)];
+        assert_eq!(ring_pole_turns(&narrow.map(|(x, y)| Coord::new(x, y))), 0);
     }
 }

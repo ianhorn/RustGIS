@@ -134,6 +134,10 @@ pub struct TileLayer {
     /// hillshade).
     #[serde(default, skip_serializing_if = "is_normal")]
     pub blend: crate::effects::Blend,
+    /// How its pictures are drawn at a size other than their own: smooth (bilinear), as every
+    /// tile layer was before, or crisp, each of the picture's pixels a block (#2804).
+    #[serde(default = "smooth", skip_serializing_if = "is_smooth")]
+    pub resampling: crate::raster::Resampling,
     /// The catalog entry it came from (`osm`, `esri-imagery`), when it came from one.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub id: String,
@@ -171,6 +175,10 @@ pub struct TileLayer {
     /// can be saved, should projects keep it.
     #[serde(skip)]
     pub feature_info: Option<rustgis_data::ogc::FeatureInfo>,
+    /// `feature_info` was learned from a document read from the internet: the request it makes is
+    /// asked only there, whatever the addresses' records say later. For the session only, as it is.
+    #[serde(skip)]
+    pub feature_info_public: bool,
     /// Its legend pictures (a WMS or WMTS layer's, from its service's default style, or given to
     /// `map.addTiles`): the Layers pane shows the one for the map's scale under it, as ArcGIS
     /// Pro's Contents pane does. Web addresses only, at most [`MAX_LEGENDS`](rustgis_data::ogc::MAX_LEGENDS).
@@ -331,6 +339,14 @@ fn one() -> f32 {
 fn is_false(b: &bool) -> bool {
     !*b
 }
+fn smooth() -> crate::raster::Resampling {
+    crate::raster::Resampling::Bilinear
+}
+
+fn is_smooth(r: &crate::raster::Resampling) -> bool {
+    *r == smooth()
+}
+
 fn is_normal(b: &crate::effects::Blend) -> bool {
     *b == crate::effects::Blend::Normal
 }
@@ -403,6 +419,7 @@ impl TileLayer {
             overlay: false,
             over: None,
             blend: crate::effects::Blend::Normal,
+            resampling: smooth(),
             id: String::new(),
             layers: Vec::new(),
             style_layers: String::new(),
@@ -413,6 +430,7 @@ impl TileLayer {
             time_hidden: false,
             error: None,
             feature_info: None,
+            feature_info_public: false,
             legends: Vec::new(),
             connection: String::new(),
             anonymous: false,
@@ -521,7 +539,8 @@ impl TileLayer {
     /// Applies the same checks, returning losses for a reader or command to report on success.
     pub fn repair_counted(&mut self) -> Result<TileRepairs, String> {
         let mut repairs = TileRepairs::default();
-        repairs.text += usize::from(self.url.trim().len() != self.url.len());
+        // Spaces round the address or the name are trimmed without a word: only text cut short
+        // is counted.
         let dated = self.time_urls.len() + usize::from(self.time_url.is_some());
         self.url = self.url.trim().to_string();
         // A dated address is a web address whose date is filled in after the scheme and host.
@@ -547,7 +566,7 @@ impl TileLayer {
         } else {
             check_url(&self.url)?;
         }
-        repairs.text += usize::from(self.name.trim().len() != self.name.len() || self.name.chars().nth(120).is_some());
+        repairs.text += usize::from(self.name.trim().chars().nth(120).is_some());
         self.name = self.name.trim().chars().take(120).collect();
         if self.name.is_empty() {
             let file = || {
@@ -696,6 +715,7 @@ impl TileLayer {
             overlay: _,
             over: _,
             blend: _,
+            resampling: _,
             id: _,
             layers: _,
             style_layers: _,
@@ -706,6 +726,7 @@ impl TileLayer {
             time_hidden: _,
             error: _,
             feature_info: _,
+            feature_info_public: _,
             legends,
             connection: _,
             anonymous: _,
@@ -861,6 +882,18 @@ mod tests {
         for bad in ["file:///etc/passwd", "ftp://x/{z}", "https://", "https:// x.com/{z}", "javascript:alert(1)"] {
             assert!(TileLayer::new("x", TileKind::Raster, bad).repair().is_err(), "{bad}");
         }
+    }
+
+    /// Spaces round a name or an address are trimmed without counting as text shortened; a name
+    /// cut to its limit is counted.
+    #[test]
+    fn trimming_isnt_counted_as_shortening() {
+        let mut padded = TileLayer::new("  Streets  ", TileKind::Raster, "  https://a.tile.example.com/{z}/{x}/{y}.png ");
+        assert_eq!(padded.repair_counted().map(|r| r.text), Ok(0));
+        assert_eq!((padded.name.as_str(), padded.url.as_str()), ("Streets", "https://a.tile.example.com/{z}/{x}/{y}.png"));
+        let mut long = TileLayer::new(format!(" {} ", "n".repeat(121)), TileKind::Raster, "https://a.tile.example.com/{z}/{x}/{y}.png");
+        assert_eq!(long.repair_counted().map(|r| r.text), Ok(1));
+        assert_eq!(long.name.chars().count(), 120);
     }
 
     #[test]

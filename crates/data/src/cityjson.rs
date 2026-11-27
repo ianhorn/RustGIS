@@ -279,8 +279,9 @@ pub(crate) fn read_member(file_name: &str, bytes: &[u8], given: Option<Crs>) -> 
 /// Reads a CityJSON document; with `keep_named`, the system it names, when RustGIS knows it, goes
 /// before `given`.
 fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool) -> Result<Vec<(Dataset, ReadReport)>> {
-    if bytes.len() as u64 > crate::io::MAX_BYTES {
-        return Err(DataError::Format(format!("file is too large ({} bytes)", bytes.len())));
+    let max = crate::io::max_bytes();
+    if bytes.len() as u64 > max {
+        return Err(DataError::Format(crate::io::file_size_error(file_name, max)));
     }
     let text = std::str::from_utf8(bytes).map_err(|_| DataError::Format(format!("{file_name} is not UTF-8 text")))?;
     let leaf = std::path::Path::new(file_name).file_stem().and_then(|s| s.to_str()).unwrap_or("");
@@ -304,7 +305,7 @@ fn read_with(file_name: &str, bytes: &[u8], given: Option<Crs>, keep_named: bool
     for v in &mut vertices {
         *v = [v[0] * s[0] + t[0], v[1] * s[1] + t[1], v[2] * s[2] + t[2]];
     }
-    let mut notes = Vec::new();
+    let mut notes = crate::loss::Notes::new();
     // A compound URN is read by its horizontal part; its vertical part, said when its heights
     // aren't metres upward, gives the heights' unit.
     let system = named_system(doc.metadata.as_ref());

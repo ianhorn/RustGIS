@@ -13,9 +13,11 @@ mod agentthreads;
 mod analysispane;
 mod approvalcard;
 mod arcgisui;
+pub mod assistant;
 #[cfg(not(target_arch = "wasm32"))]
 mod assistantkeys;
 mod assistantpane;
+mod assistantpictures;
 mod autosave;
 mod backstage;
 mod bookmarkpane;
@@ -23,11 +25,14 @@ mod catalogsui;
 mod chrome;
 mod comets;
 mod completion;
+mod conflictsui;
 mod connectiontree;
 mod connectionui;
 #[cfg(not(target_arch = "wasm32"))]
 mod connectui;
 mod coordreadout;
+mod copernicusui;
+mod crspicker;
 mod cswui;
 mod cubesui;
 mod diagnosticlog;
@@ -45,9 +50,12 @@ mod extensionsui;
 mod failureui;
 mod fieldlists;
 mod fieldmenu;
+mod fieldvalues;
 #[cfg(not(target_arch = "wasm32"))]
 mod filedialog;
 mod fill_editor;
+#[cfg(not(target_arch = "wasm32"))]
+mod fontloading;
 mod geocodeui;
 mod geolibreui;
 mod geometrycalc;
@@ -65,6 +73,9 @@ mod localagents;
 mod mapgpu;
 mod mapmenu;
 mod mapview;
+mod markerimages;
+mod markerpick;
+pub use markerpick::{MarkerImage, marker_file_too_large};
 mod measure_units;
 mod modelbuilder;
 mod navui;
@@ -77,6 +88,7 @@ mod pluginstart;
 mod pluginsui;
 mod popupmedia;
 mod portalsui;
+mod publicationwizard;
 #[cfg(not(target_arch = "wasm32"))]
 mod readjob;
 #[cfg(not(target_arch = "wasm32"))]
@@ -89,6 +101,7 @@ pub enum Landed {
     Ran(Result<Value, String>),
     NotRun(String),
 }
+mod annotation;
 mod boxedit;
 mod circleedit;
 #[cfg(not(target_arch = "wasm32"))]
@@ -102,9 +115,12 @@ mod s3ui;
 mod saveprompt;
 mod scriptcolor;
 mod scriptcomplete;
+mod scriptfind;
+pub use scriptfind::FindChords;
 mod searchbox;
 mod serviceui;
 mod sessionlog;
+mod shapeconvert;
 mod shortcutfile;
 mod shortcutui;
 mod showme;
@@ -132,6 +148,7 @@ mod zarrui;
 
 use rustgis_engine::cmd::service_added::Removal;
 use rustgis_engine::render::rustgis_tiles::failure::Failure;
+use rustgis_engine::render::rustgis_tiles::{address::Reach, cache};
 use rustgis_engine::{Project, Session};
 use serde_json::{Value, json};
 
@@ -139,9 +156,10 @@ use serde_json::{Value, json};
 pub use autosave::FolderStore;
 pub use autosave::{Recovery, RecoveryStore};
 pub use chrome::{DoubleClick, TitlebarMetrics};
-pub use coordreadout::CoordReadout;
+pub use coordreadout::{CoordReadout, MapSystem};
 pub use rustgis_assistant;
 pub use rustgis_engine;
+pub use vertexedit::unplaced_feature_notice;
 pub use widgets::big_split_menu;
 
 /// Reconciles only command-result wrappers, not parameters or other arbitrary JSON.
@@ -193,6 +211,36 @@ pub const TOOL_FILE_PURPOSE: &str = "toolfile:";
 /// Marks a returned shortcut picker file; cancellation leaves no pending routing state.
 pub const SHORTCUT_PICK: &str = "\u{1}shortcuts:";
 
+/// Starts the name of a script file the shell's `"script"` picker put in the inbox, for the
+/// Script pane's Load….
+pub const SCRIPT_PICK: &str = "\u{1}script:";
+
+/// Starts the name of an image the shell's `"marker:<id>"` picker put in the inbox, followed by
+/// `<id>:`: it goes to the marker whose «Image…» asked for it, and only a file so marked, for the
+/// request still waiting, does.
+pub const MARKER_PICK: &str = "\u{1}marker:";
+
+/// Starts the name of a picture the shell's `"assistantPicture"` picker put in the inbox: it is
+/// attached to the AI Assistant's next message, not opened on the map.
+pub const ASSISTANT_PICK: &str = "\u{1}assistantPicture:";
+
+/// The largest picture file the AI Assistant takes; the browser's and the phone's shells refuse a
+/// larger one before reading it.
+pub const ASSISTANT_FILE_MAX_BYTES: usize = rustgis_assistant::attach::MAX_FILE_BYTES;
+
+/// The largest image file a marker takes: one whose base64 fits the engine's limit
+/// ([`rustgis_engine::map::symbology::MAX_PICTURE_BYTES`]). The browser's and the phone's shells
+/// refuse a larger one before reading it.
+pub const MARKER_FILE_MAX_BYTES: usize = rustgis_engine::map::symbology::MAX_PICTURE_BYTES / 4 * 3;
+
+/// The files «Image…» lists for a marker, on the computer and in the browser (the phone's picker
+/// lists every file).
+pub const MARKER_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "svg"];
+
+/// The largest script file the Script pane's Load… reads, as the assistant's command file; the
+/// browser's shell refuses a larger one before reading it.
+pub const SCRIPT_FILE_MAX_BYTES: usize = 1024 * 1024;
+
 /// Maximum portable shortcut document size: saved overrides plus room for version metadata.
 pub const SHORTCUT_FILE_MAX_BYTES: usize = keymap::MAX_PREF_BYTES + 100;
 
@@ -209,6 +257,44 @@ const LAYOUT_ARRANGEMENTS_PREF: &str = "layout_saved_arrangements";
 
 /// A result an asynchronous service fills in when it's done (the app polls it each frame).
 pub type Slot<T> = std::sync::Arc<std::sync::Mutex<Option<T>>>;
+
+/// Runs `work` on a thread of its own named `name`, off the frame. When the system refuses one,
+/// `slot` gets the refusal as its error instead and `work` is dropped unrun, so the job ends with
+/// an error rather than the app (AGENTS.md › Use the threads). In the browser, which has no
+/// threads, that is every time.
+pub(crate) fn work_off_frame<T, E: From<String>>(name: &str, slot: &Slot<Result<T, E>>, work: impl FnOnce() + Send + 'static) {
+    work_off_frame_with(|work| std::thread::Builder::new().name(name.into()).spawn(work).map(drop), slot, work);
+}
+
+/// [`work_off_frame`], its thread started by `spawn`, which a test can make refuse.
+fn work_off_frame_with<T, E: From<String>>(
+    spawn: impl FnOnce(Box<dyn FnOnce() + Send>) -> std::io::Result<()>,
+    slot: &Slot<Result<T, E>>,
+    work: impl FnOnce() + Send + 'static,
+) {
+    if let Err(e) = spawn(Box::new(work)) {
+        let why = i18n::fmt("The system refused a thread to do this on ({error}); try again", &[("error", &e.to_string())]);
+        *slot.lock().unwrap_or_else(|e| e.into_inner()) = Some(Err(E::from(why)));
+    }
+}
+
+#[cfg(test)]
+mod work_off_frame_tests {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A thread the system refuses ends the job with the refusal in its slot, its work unrun.
+    #[test]
+    fn a_refused_thread_ends_the_job_with_an_error() {
+        let slot: super::Slot<Result<(), String>> = super::Slot::default();
+        let ran = Arc::new(AtomicBool::new(false));
+        let r = ran.clone();
+        super::work_off_frame_with(|_| Err(std::io::Error::other("no threads left")), &slot, move || r.store(true, Ordering::Relaxed));
+        let landed = slot.lock().unwrap().take();
+        assert!(landed.is_some_and(|r| r.is_err_and(|e| e.contains("no threads left"))));
+        assert!(!ran.load(Ordering::Relaxed));
+    }
+}
 
 /// One window is read off the frame at a time, however many have started: each may hold 256 MB
 /// and more. A read keeps its turn until the frame has taken what it read, so a frame that stalls
@@ -234,6 +320,8 @@ pub struct Download {
     pub slot: Slot<Result<Vec<u8>, String>>,
     /// How far it has come (the status bar's).
     pub progress: std::sync::Arc<rustgis_engine::render::rustgis_tiles::cache::Progress>,
+    /// Where it connected, for a GeoLibre project ([`rustgis_engine::Session::download_read_at`]).
+    pub reach: Slot<Reach>,
 }
 
 /// A download or a window's read under way, for the status bar ([`RustGisApp::downloads_under_way`]).
@@ -246,6 +334,10 @@ pub(crate) struct UnderWay {
     /// How far a whole file's download has come; `None` for a window's read, which isn't counted.
     pub progress: Option<std::sync::Arc<rustgis_engine::render::rustgis_tiles::cache::Progress>>,
 }
+
+/// Where a PDF download's bytes and drawn page land ([`UiState::page_reads`]).
+#[cfg(not(target_arch = "wasm32"))]
+type PageRead = Slot<Result<(Vec<u8>, rustgis_engine::data::raster::Raster), String>>;
 
 /// See [`UiState::window_reads`].
 #[cfg(not(target_arch = "wasm32"))]
@@ -269,6 +361,29 @@ fn window_turn(left: &std::sync::atomic::AtomicBool) -> Option<std::sync::MutexG
             Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(std::time::Duration::from_millis(20)),
         }
     }
+}
+
+/// Reads a downloaded PDF's page or GRIB file ([`read_download_shared_page`]) on the calling thread, with
+/// `left` as its Cancel: the reader's progress checks look at it there, between messages and
+/// before each band is laid out, so a GRIB file's read stops once the message or band under way
+/// is done (one message's decode, of at most `max_samples` values, isn't stopped) and gives up
+/// its turn. A bug is said, not left to end the
+/// thread (no command's catch reaches it).
+///
+/// [`read_download_shared_page`]: rustgis_engine::cmd::raster::read_download_shared_page
+#[cfg(not(target_arch = "wasm32"))]
+fn read_download(
+    name: &str,
+    bytes: &std::sync::Arc<Vec<u8>>,
+    page: Option<&str>,
+    place: bool,
+    left: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> Result<rustgis_engine::data::raster::Raster, String> {
+    let _probe = rustgis_engine::data::progress::install(Some(std::sync::Arc::new(syncmark::Stop(left.clone()))));
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rustgis_engine::cmd::raster::read_download_shared_page(name, bytes.clone(), page, place)
+    }))
+    .unwrap_or_else(|_| Err(tl!("Reading the download failed unexpectedly").to_string()))
 }
 
 /// A shell's overrides of the Settings › Start-up preferences for one launch.
@@ -380,6 +495,12 @@ pub struct Services {
     /// Offers bytes as a download named `file_name`; success means submission to the host's
     /// download mechanism. Browsers do not expose confirmation that the file was saved.
     pub download: Option<Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>>>,
+    /// Starts saving a project on a phone: written back to the document given (one the project
+    /// was opened from or last saved as, with leave to write it), or through the native picker
+    /// when there is none. The shell reports the eventual result through
+    /// [`RustGisApp::complete_project_save`], and a document a picker save may write back to later
+    /// through [`RustGisApp::project_document`] before it.
+    pub save_project: Option<Box<dyn Fn(&str, Vec<u8>, Option<&str>) -> Result<(), String>>>,
     pub inbox: Option<Inbox>,
     /// Reads a saved preference (`language`, …).
     pub load_pref: Option<Box<dyn Fn(&str) -> Option<String>>>,
@@ -401,7 +522,7 @@ pub struct Services {
     /// Makes an HTTP request (the AI assistant's calls to its model) and puts the response, of any
     /// status, in the slot (the browser's fetch; the desktop sends it on a thread).
     pub http: Option<Box<dyn Fn(rustgis_assistant::HttpRequest, Slot<Result<rustgis_assistant::HttpResponse, rustgis_assistant::Error>>)>>,
-    /// Where autosave keeps the recovery copy of unsaved work (the desktop's recovery folder).
+    /// Where autosave keeps the recovery copy of unsaved work (the native app's recovery folder).
     /// `None` turns autosave off: the browser for now, and a second copy of the desktop app
     /// running alongside the first, which mustn't touch its copy.
     pub recovery: Option<Box<dyn RecoveryStore>>,
@@ -409,10 +530,18 @@ pub struct Services {
     /// which may ask the user first), for a text field's Paste; `None` where the window sends
     /// it (the desktop) or the browser can't read it (a page not served over HTTPS).
     pub read_clipboard: Option<Box<dyn Fn(Slot<Result<String, String>>)>>,
+    /// Opens a text field of the system's for a field an interface draws as a box showing its
+    /// value (a phone's, `rustgis_engine::platform::Platform::enter_text`): what is typed arrives
+    /// in [`RustGisApp::typed`]. `None` where the interface's own fields take the system's typing.
+    pub enter_text: Option<Box<dyn Fn(&rustgis_engine::platform::TextEntry) -> Result<(), String>>>,
     /// Signs in to an ArcGIS portal (its address and an OAuth client id, either blank for ArcGIS
     /// Online and RustGIS's own app) in a pop-up window, putting who signed in, or why not, in the
     /// slot (the browser; the desktop runs `arcgis.signIn`).
     pub arcgis_sign_in: Option<Box<dyn Fn(String, String, Slot<Result<String, String>>)>>,
+    /// Signs in to Copernicus Data Space with a username, a password and a one-time code (blank
+    /// for an account without two-factor authentication), putting who signed in, or why not, in
+    /// the slot (the browser, which sends the request itself; the desktop runs `copernicus.login`).
+    pub copernicus_sign_in: Option<Box<dyn Fn(String, String, String, Slot<Result<String, String>>)>>,
 }
 
 /// A new private folder for one print job: unique, created fresh (never an existing path) and,
@@ -556,7 +685,9 @@ pub struct TilesResolve {
     pub vector: bool,
     /// The usual-path template, when the advertised one can't be read.
     pub fallback: String,
-    pub slot: Slot<Result<Vec<u8>, String>>,
+    /// The document's answer, with the reach it was read at: what it names is judged by that,
+    /// whatever the address's record says by the time it lands.
+    pub slot: Slot<Result<(Vec<u8>, Reach), String>>,
 }
 
 /// A service layer waiting on a document before it is added. `dialog` tells whether the add came
@@ -568,7 +699,14 @@ pub enum ServiceStep {
     Tiles { resolve: TilesResolve, dialog: bool, origin: Option<String>, opened: u64 },
     /// A WCS coverage whose description is being read before it is asked for: `service.coverage`'s
     /// parameters and the description on its way.
-    Coverage { params: Value, slot: Slot<Result<Vec<u8>, String>>, dialog: bool, origin: Option<String>, opened: u64 },
+    Coverage {
+        params: Value,
+        describe: String,
+        slot: Slot<Result<(Vec<u8>, Reach), String>>,
+        dialog: bool,
+        origin: Option<String>,
+        opened: u64,
+    },
 }
 
 impl ServiceStep {
@@ -591,14 +729,82 @@ pub(crate) fn fetch_into(url: &str) -> Slot<Result<Vec<u8>, String>> {
     fetch_into_limited(url, rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD)
 }
 
-/// Like [`fetch_into`], with what is known of a failure (#509).
+/// Fetches a service's document as [`fetch_into`] does, with what is known of a failure (#509).
+/// One that came from the internet, wherever its name pointed, is recorded so
+/// ([`restrict_to_public`](rustgis_engine::render::rustgis_tiles::cache::restrict_to_public)):
+/// the documents it links to and the layers it lists are then fetched only from there.
 pub(crate) fn fetch_detailed_into(url: &str) -> Slot<Result<Vec<u8>, Failure>> {
-    let slot: Slot<Result<Vec<u8>, Failure>> = Slot::default();
+    fetch_document_as(url, |failure| failure)
+}
+
+/// [`fetch_detailed_into`], with a failure's message alone.
+pub(crate) fn fetch_document_into(url: &str) -> Slot<Result<Vec<u8>, String>> {
+    fetch_document_as(url, |failure| failure.message)
+}
+
+/// [`fetch_detailed_into`], its failure told as `told` gives it.
+fn fetch_document_as<E: Send + 'static>(url: &str, told: fn(Failure) -> E) -> Slot<Result<Vec<u8>, E>> {
+    let slot: Slot<Result<Vec<u8>, E>> = Slot::default();
     let land = slot.clone();
-    rustgis_engine::render::rustgis_tiles::cache::download_detailed(
+    let asked = url.to_string();
+    cache::download_detailed_with_origin(
         url,
-        rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD,
-        Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+        cache::MAX_DOWNLOAD,
+        Box::new(move |r| {
+            let r = r.map_err(told).map(|fetched| {
+                if fetched.origin.reach() == Reach::Public {
+                    cache::restrict_to_public(&asked);
+                }
+                fetched.bytes
+            });
+            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+        }),
+    );
+    slot
+}
+
+/// Fetches an address off the frame, connecting no wider than `ceiling`: the reach of the
+/// document that named it, as that document's fetch observed it (`Reach::Local` for the user's own
+/// address). It lands with the bytes and the reach it was read at, which the addresses it names in
+/// turn are fetched within. Nothing is recorded for its address, so a long chain of reads (a
+/// service's feature pages, a catalogue's results) adds nothing to the restricted addresses
+/// ([`cache::restrict_to_public`]). Native downloads end at `timeout`, if it has one (the usual
+/// download's otherwise); the browser's late answer is discarded by the polling read.
+pub(crate) fn fetch_within(
+    url: &str,
+    max: usize,
+    timeout: Option<std::time::Duration>,
+    ceiling: Reach,
+) -> Slot<Result<(Vec<u8>, Reach), String>> {
+    let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
+    let land = slot.clone();
+    let done: cache::FetchedDone = Box::new(move |r| {
+        let r = r.map(|fetched| (fetched.bytes, fetched.origin.reach()));
+        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+    });
+    cache::download_limited_reaching_with_origin(url, max, timeout, ceiling, done);
+    slot
+}
+
+/// [`fetch_document_into`], landing with the reach the document was read at (recorded too, if
+/// from the internet), for a step that judges what the document names when it lands.
+pub(crate) fn fetch_document_reaching(url: &str) -> Slot<Result<(Vec<u8>, Reach), String>> {
+    let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
+    let land = slot.clone();
+    let asked = url.to_string();
+    cache::download_detailed_with_origin(
+        url,
+        cache::MAX_DOWNLOAD,
+        Box::new(move |r| {
+            let r = r.map_err(|failure| failure.message).map(|fetched| {
+                let reach = fetched.origin.reach();
+                if reach == Reach::Public {
+                    cache::restrict_to_public(&asked);
+                }
+                (fetched.bytes, reach)
+            });
+            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+        }),
     );
     slot
 }
@@ -654,6 +860,7 @@ pub enum RightPane {
     Symbology,
     History,
     Editing,
+    Annotation,
     Design,
     Workflows,
     Script,
@@ -757,6 +964,12 @@ pub struct UiState {
     pub start_with: StartWith,
     /// Whether a file holding several layers asks which to add (#934), or adds them all.
     pub ask_layers: bool,
+    /// Whether datum grids a coordinate system needs are downloaded from PROJ's grid server
+    /// (#2032 A4): off unless turned on, as it reaches a server.
+    pub download_grids: bool,
+    /// Whether raster tiles and single pictures are fetched for a HiDPI display's own pixels
+    /// (#2390): on unless turned off.
+    pub sharp_tiles: bool,
     /// Key combinations the native menu bar keeps for itself (macOS: Quit, Close Window, Hide…):
     /// a shortcut on one would never reach the app, so the shortcut editor refuses them.
     pub reserved_shortcuts: Vec<egui::KeyboardShortcut>,
@@ -773,6 +986,9 @@ pub struct UiState {
     pub start_projection_input: String,
     /// The coordinate system typed in View › Graticule's menu for the measured grid.
     pub graticule_crs_input: String,
+    /// The coordinate systems last chosen in a coordinate system box, the latest first
+    /// (`crspicker::RECENT_PREF`).
+    pub recent_crs: Vec<String>,
     /// Start-up preference: the extent the map opens on, `[minLon, minLat, maxLon, maxLat]`;
     /// `None` for the full extent.
     pub start_extent: Option<[f64; 4]>,
@@ -783,6 +999,7 @@ pub struct UiState {
     /// A minimized ribbon temporarily opened from its tab strip.
     pub ribbon_peek: bool,
     pub command_search: Option<String>,
+    command_search_composing: bool,
     /// A ribbon button being shown by a task step's Show Me.
     pub show_me: Option<showme::ShowMe>,
     pub about: bool,
@@ -801,6 +1018,7 @@ pub struct UiState {
     pub hidden_tabs: Vec<String>,
     /// Extra Quick Access Toolbar commands.
     pub quick_access: Vec<String>,
+    pub(crate) history_jump: Option<chrome::HistoryJump>,
     /// Whether a layout's PDF georeferences its map frames (Layout › Export › Georeference PDF).
     pub(crate) pdf_georeference: bool,
     /// The native title bar the header is drawn into; set by the desktop app on macOS.
@@ -843,9 +1061,9 @@ pub struct UiState {
     /// Data downloading from web addresses (Home › Add › Add Data › From URL).
     pub downloads: Vec<Download>,
     /// A project downloading from its web address (`ui.openUrl`, a `?project=` link): the
-    /// session's download id, the address and where the download lands. A later one replaces it;
-    /// opening another project meanwhile drops it.
-    pub project_download: Option<(u64, String, Slot<Result<Vec<u8>, String>>)>,
+    /// session's download id, the address and where the download lands, with the reach it was
+    /// read at. A later one replaces it; opening another project meanwhile drops it.
+    pub project_download: Option<(u64, String, Slot<Result<(Vec<u8>, Reach), String>>)>,
     /// The SQL pane's editor, results and history.
     pub sql: sqlpane::State,
     /// GeoTIFFs, FlatGeobufs and GeoParquets by address whose headers are being read: those
@@ -857,6 +1075,16 @@ pub struct UiState {
     /// its project was closed.
     #[cfg(not(target_arch = "wasm32"))]
     pub window_reads: Vec<WindowRead>,
+    /// PDF downloads whose page is being drawn on a thread before it is added (#2336): the
+    /// download, where its bytes and page land, and whether it was cancelled (or its project
+    /// closed). They take their turns with the windows' reads, and count against their limit.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) page_reads: Vec<(serviceui::Landed, PageRead, std::sync::Arc<std::sync::atomic::AtomicBool>)>,
+    /// PDF downloads waiting for a place among [`UiState::page_reads`] (past
+    /// [`MAX_WINDOW_READS`] reads under way), oldest first: the download, its bytes, and its page
+    /// to draw ([`rustgis_engine::cmd::raster::download_page`]).
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) page_queue: Vec<(serviceui::Landed, Vec<u8>, (String, Option<String>, bool))>,
     /// Service layers whose features are being read page by page (an ArcGIS layer's description
     /// first).
     pub service_pages: Vec<serviceui::PageRead>,
@@ -907,6 +1135,8 @@ pub struct UiState {
     pub session_log: sessionlog::State,
     /// NASA Earthaccess: the dataset, the granules found and the request under way.
     pub earthaccess: earthaccessui::State,
+    /// Copernicus Data Space: the sign-in being typed and what the last one said.
+    pub copernicus: copernicusui::State,
     /// Add From Service › Sign in to ArcGIS.
     pub arcgis: arcgisui::State,
     /// USGS NLDI: the point traced, its COMID, the navigation and the request under way.
@@ -948,6 +1178,9 @@ pub struct UiState {
     pub pending_layout_picture: bool,
     /// The corners of a picture graphic waiting for its image file.
     pub pending_picture: Option<Vec<rustgis_engine::geom::Coord>>,
+    /// A marker whose «Image…» waits for its file (web and phone), which comes back marked
+    /// ([`MARKER_PICK`]).
+    pub pending_marker_image: Option<MarkerImage>,
     /// The value picked under Edit › Dynamic Text (a token such as `{scale}`): the text tool's
     /// dialog starts with it. Cleared when the tool changes.
     pub dynamic_text: Option<&'static str>,
@@ -1019,17 +1252,21 @@ impl Default for UiState {
             worldview_fetch: None,
             start_with: StartWith::Sample,
             ask_layers: true,
+            download_grids: false,
+            sharp_tiles: true,
             reserved_shortcuts: Vec::new(),
             choosing: Vec::new(),
             last_project: None,
             start_projection: String::new(),
             start_projection_input: String::new(),
             graticule_crs_input: String::new(),
+            recent_crs: Vec::new(),
             start_extent: None,
             start_view: None,
             ribbon_minimized: false,
             ribbon_peek: false,
             command_search: None,
+            command_search_composing: false,
             show_me: None,
             about: false,
             shortcuts: false,
@@ -1043,6 +1280,7 @@ impl Default for UiState {
             open_url: None,
             copy_image: None,
             pending_picture: None,
+            pending_marker_image: None,
             pending_layout_picture: false,
             pending_open: None,
             web_file: None,
@@ -1057,6 +1295,10 @@ impl Default for UiState {
             cog_probes: Vec::new(),
             #[cfg(not(target_arch = "wasm32"))]
             window_reads: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            page_reads: Vec::new(),
+            #[cfg(not(target_arch = "wasm32"))]
+            page_queue: Vec::new(),
             service_pages: Vec::new(),
             link_zoomed: false,
             service: None,
@@ -1080,6 +1322,7 @@ impl Default for UiState {
             cubes: Default::default(),
             session_log: Default::default(),
             earthaccess: Default::default(),
+            copernicus: Default::default(),
             arcgis: Default::default(),
             nldi: Default::default(),
             geocode: Default::default(),
@@ -1101,6 +1344,7 @@ impl Default for UiState {
             geolibre_zarr: Vec::new(),
             hidden_tabs: Vec::new(),
             quick_access: Vec::new(),
+            history_jump: None,
             pdf_georeference: true,
             titlebar: None,
             pane_sets: Vec::new(),
@@ -1146,23 +1390,72 @@ const CAPTURE_MIN_DPI: f64 = 36.0;
 pub const FIXES_KEPT: usize = 200_000;
 
 impl RustGisApp {
-    /// Keeps a position the shell reported: the last one in [`RustGisApp::position`], and each in
-    /// [`RustGisApp::fixes`] until an interface takes them (the oldest dropped past
-    /// [`FIXES_KEPT`]).
+    /// Updates the live position if this fix is recent and accurate enough. Queues every fix
+    /// for tracking and averaging (the oldest dropped past [`FIXES_KEPT`]).
     pub fn report_position(&mut self, fix: rustgis_engine::platform::Fix) {
-        self.position = Some(fix);
+        if self.position.is_none_or(|current| replaces_live_position(current, fix)) {
+            self.position = Some(fix);
+        }
         if self.fixes.len() >= FIXES_KEPT {
             self.fixes.pop_front();
             self.fixes_dropped += 1;
         }
         self.fixes.push_back(fix);
     }
+
+    /// The system is short of memory (a phone says so): drops what is kept only to draw again
+    /// sooner ([`Session::release_memory`], the map's drapes, and its textures and buffers on the
+    /// graphics card), and says so the first time.
+    pub fn release_memory(&mut self) {
+        // The map first: it stops the frames being drawn, which would keep more.
+        self.map.release_memory();
+        self.session.release_memory();
+        if !std::mem::replace(&mut self.said_low_memory, true) {
+            self.session.warn(tl!(
+                "The device is low on memory: RustGIS dropped the map tiles and drawings it kept to draw faster. They are made or downloaded again when needed."
+            ));
+        }
+    }
+}
+
+/// Whether `fix` replaces the shown position: not when it is older, nor when it is much less
+/// accurate and the shown one is recent. Android compares its monotonic time, which a change to
+/// the wall clock doesn't move. iOS has only the fix's UTC timestamp: a fix a little behind the
+/// shown one is a late one and is dropped, while one further behind than the hold means the clock
+/// was set back, and it is taken rather than freezing the position until the clock catches up.
+fn replaces_live_position(current: rustgis_engine::platform::Fix, fix: rustgis_engine::platform::Fix) -> bool {
+    use std::time::Duration;
+    const HOLD: Duration = Duration::from_secs(5);
+
+    let age = match (current.elapsed_realtime_nanos, fix.elapsed_realtime_nanos) {
+        (Some(current), Some(new)) => match new.checked_sub(current) {
+            Some(age) => Duration::from_nanos(age),
+            None => return false,
+        },
+        (None, None) => match current.time.zip(fix.time) {
+            Some((current, new)) if new >= current => Duration::from_millis(new.abs_diff(current)),
+            Some((current, new)) => return Duration::from_millis(new.abs_diff(current)) >= HOLD,
+            None => return true,
+        },
+        _ => return true,
+    };
+    // At the usual one fix per second this bridges a brief GPS dropout. After five seconds a
+    // walking crew may already be outside the old fix's accuracy radius.
+    if age >= HOLD {
+        return true;
+    }
+    // Held back only when much worse (a network fix after a GPS one), so the usual jitter of a
+    // few metres in GPS accuracy still moves the marker with every fix.
+    let shown = current.accuracy.unwrap_or(f64::INFINITY);
+    fix.accuracy.unwrap_or(f64::INFINITY) <= shown * 2.0
 }
 
 pub struct RustGisApp {
     pub session: Session,
     pub(crate) boxes: boxedit::State,
     pub(crate) circles: circleedit::State,
+    pub(crate) conversion: shapeconvert::State,
+    pub(crate) annotation: annotation::State,
     pub ui: UiState,
     pub map: mapview::MapView,
     pub dialogs: dialogs::Dialogs,
@@ -1186,16 +1479,18 @@ pub struct RustGisApp {
     /// bar (the touch interface, `rustgis-ui-touch`). `None` is the desktop interface. Dialogs
     /// and the Project menu's page are drawn either way.
     pub chrome: Option<Chrome>,
+    /// The touch interface a phone's shell offers (`rustgis-ui-touch`), kept while the desktop
+    /// interface is in its place so `ui.touchInterface` can bring it back. `None` elsewhere.
+    pub touch: Option<Chrome>,
     /// Whether the user wants the device's position shown: a shell that can report one (a
     /// phone's) starts and stops its positioning by this, and fills in [`RustGisApp::position`].
     pub locate: bool,
-    /// Where the device is, as the shell last reported it; `None` until it has, and again once
-    /// positioning is off. An interface draws it on the map and can capture at it.
+    /// The selected live fix for the marker and capture cross, if positioning is on and a fix
+    /// has arrived.
     pub position: Option<rustgis_engine::platform::Fix>,
-    /// Every position the shell reported since an interface last took them, oldest first (at most
-    /// [`FIXES_KEPT`]: the oldest go first). [`RustGisApp::position`] is only the last: a track
-    /// or an average needs each, including those that arrived together after the app was out of
-    /// sight.
+    /// Every fix the shell reported since an interface last took them, in arrival order (at most
+    /// [`FIXES_KEPT`]). A track or average needs each, including those that arrived together after
+    /// the app was out of sight.
     pub fixes: std::collections::VecDeque<rustgis_engine::platform::Fix>,
     /// Whether the interface wants positions while the app is out of sight too (a track being
     /// recorded): a phone's shell keeps them coming then, with the notice its system requires.
@@ -1203,9 +1498,14 @@ pub struct RustGisApp {
     /// Photos the camera took ([`Services::take_photo`]), by where they were written, until an
     /// interface takes them.
     pub photos: Vec<std::path::PathBuf>,
+    /// What the system's text fields sent back ([`Services::enter_text`]), oldest first, until
+    /// an interface takes it.
+    pub typed: Vec<rustgis_engine::platform::Typed>,
     /// How many positions were dropped from [`RustGisApp::fixes`] past [`FIXES_KEPT`] since an
     /// interface last took them: the interface says so when a track or an average missed them.
     pub fixes_dropped: usize,
+    /// Whether [`RustGisApp::release_memory`] has said so, which it does once.
+    said_low_memory: bool,
     /// Watches linked local files for changes made outside RustGIS and offers Reload Data
     /// (the desktop app; see [`diskwatch`]). Off for tests, unless one turns it on (as `ui_shot`'s
     /// `watchFiles` does).
@@ -1230,7 +1530,7 @@ pub struct RustGisApp {
     pub reports: reportpane::ReportState,
     pub docs: docpanes::DocState,
     /// The AI Assistant's conversation and settings.
-    pub assistant: assistantpane::AssistantState,
+    pub assistant: assistant::AssistantState,
     /// "Let your Agents Control RustGIS" (desktop).
     #[cfg(not(target_arch = "wasm32"))]
     pub connect: connectui::ConnectState,
@@ -1295,6 +1595,14 @@ pub struct RustGisApp {
     fonts_requested: Vec<String>,
     /// Downloads that failed; cleared when a language is picked, which retries them.
     fonts_failed: Vec<String>,
+    /// Fallbacks asked for by data/widget text, independent of the interface language.
+    fonts_for_data: Vec<rustgis_engine::render::fonts::ScriptFont>,
+    /// Non-CJK misses already handled with the current font stack; suppress repeated wakes.
+    other_scripts_handled: Vec<rustgis_engine::render::fonts::ScriptFont>,
+    /// CJK scripts `ensure_data_cjk_font` has dealt with: a face asked for, or none to be had said.
+    cjk_scripts_handled: Vec<rustgis_engine::render::fonts::CjkScript>,
+    /// CJK scripts whose characters the downloaded face lacks, said once each.
+    cjk_lacking_said: Vec<rustgis_engine::render::fonts::CjkScript>,
     /// Fonts were installed this frame: `set_fonts` only takes effect on the next one.
     fonts_pending: bool,
     /// Whether the installed font families were indexed by a frame (see `families::warm_up`).
@@ -1302,6 +1610,9 @@ pub struct RustGisApp {
     /// The language the interface is drawn in. It trails the chosen one until a font for its
     /// script is active, so switching to Chinese never draws a frame of missing-glyph boxes.
     shown_lang: i18n::Lang,
+    /// Coverage of the last chosen catalog in the active font stack. Cleared when fonts change
+    /// or a language is picked again, so checking thousands of letters is never a per-frame loop.
+    language_coverage: Option<(i18n::Lang, bool)>,
     /// The project path last seen, so a change (whoever opened or saved it) updates Last Project.
     seen_project: Option<std::path::PathBuf>,
 }
@@ -1339,7 +1650,10 @@ impl RustGisApp {
             Some(Value::Number(_) | Value::String(_)) => {}
             // Not taken for the active layer: with replaceTable that would overwrite a table.
             Some(other) => {
-                return Err(crate::i18n::fmt("\"layer\" must be a layer's id or name, not {value}", &[("value", &other.to_string())]));
+                return Err(crate::i18n::fmt(
+                    "\"layer\" must be a layer's id or name, not {value}",
+                    &[("value", &crate::theme::clip(&other.to_string()))],
+                ));
             }
         }
         let id = self.session.layer_id(p)?;
@@ -1357,6 +1671,7 @@ impl RustGisApp {
     /// The Ctrl (⌘) shortcuts the keymap takes, as (Alt, Shift, key), the clipboard's left out:
     /// in a browser, what the web app keeps from the browser's own shortcuts (⌘D bookmarking
     /// the page, ⌘Y opening its history, ⌘= zooming it), as design tools in the browser do.
+    /// While Command Search is open, ⌘1 … ⌘9 and ⌘0 too: they run its rows, not switch tabs.
     pub fn command_keys(&self) -> Vec<(bool, bool, egui::Key)> {
         let mut keys: Vec<(bool, bool, egui::Key)> = self
             .ui
@@ -1367,9 +1682,18 @@ impl RustGisApp {
             .filter(|c| c.command && !keymap::is_clipboard(*c))
             .map(|c| (c.alt, c.shift, c.key))
             .collect();
+        if self.ui.command_search.is_some() {
+            keys.extend(chrome::NUMBER_KEYS.iter().map(|&key| (false, false, key)));
+        }
         keys.sort_by_key(|k| (k.0, k.1, k.2 as u32));
         keys.dedup();
         keys
+    }
+
+    /// The chords the Script box and its find bar take now, none while neither has the focus: with
+    /// [`Self::command_keys`], what the web app keeps from the browser's own shortcuts.
+    pub fn script_find_keys(&self, ctx: &egui::Context) -> FindChords {
+        scriptfind::browser_keys(ctx, &self.workflow.script_find)
     }
 
     /// The keyboard shortcuts of a command run without parameters, in the keymap's order, for a
@@ -1399,10 +1723,17 @@ impl RustGisApp {
         widgets::enabled(self, command)
     }
 
+    /// Whether `command` belongs to an extension that is off, so that a menu offering it leaves
+    /// it out.
+    pub fn command_hidden(&self, command: &str) -> bool {
+        extensionsui::hidden(self, command)
+    }
+
     /// A fingerprint of the keymap's key combinations and what they run: cheap to take every
     /// frame (no allocation), it changes when a shortcut is added, removed or rebound (to
-    /// another key or another command), so a caller can rebuild [`RustGisApp::command_keys`]
-    /// only then.
+    /// another key or another command), Command Search opens or closes, or an extension is
+    /// turned on or off, so a caller can rebuild [`RustGisApp::command_keys`], or a menu, only
+    /// then.
     pub fn shortcuts_fingerprint(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = std::collections::hash_map::DefaultHasher::new();
@@ -1426,6 +1757,11 @@ impl RustGisApp {
             }
         }
         self.ui.keymap.bindings.len().hash(&mut h);
+        // Command Search takes the number keys while it is open.
+        self.ui.command_search.is_some().hash(&mut h);
+        for e in rustgis_engine::extensions::ALL {
+            self.session.extensions().is_on(e.id).hash(&mut h);
+        }
         h.finish()
     }
 
@@ -1450,6 +1786,9 @@ impl RustGisApp {
         let mut s = session;
         // A time slider move doesn't wait for a Zarr step to be read (#1291 step 3).
         s.zarr_off_frame = cfg!(not(target_arch = "wasm32"));
+        // This front end has the Download Datum Grids setting, so a note about a missing grid can
+        // point to it.
+        s.offers_grid_downloads = true;
         if s.active_layer.is_none() {
             s.active_layer = s.map().layers.first().map(|l| l.id);
         }
@@ -1465,6 +1804,8 @@ impl RustGisApp {
             session: s,
             boxes: boxedit::State::default(),
             circles: circleedit::State::default(),
+            conversion: shapeconvert::State::default(),
+            annotation: annotation::State::default(),
             ui,
             map: mapview::MapView::default(),
             dialogs: dialogs::Dialogs::default(),
@@ -1480,12 +1821,15 @@ impl RustGisApp {
             reads: readjob::Reads::default(),
             reads_off_frame: false,
             chrome: None,
+            touch: None,
             locate: false,
             position: None,
             fixes: std::collections::VecDeque::new(),
             keep_locating: false,
             photos: Vec::new(),
+            typed: Vec::new(),
             fixes_dropped: 0,
+            said_low_memory: false,
             #[cfg(not(target_arch = "wasm32"))]
             watch_files: false,
             #[cfg(not(target_arch = "wasm32"))]
@@ -1500,7 +1844,7 @@ impl RustGisApp {
             update: update::UpdateState::default(),
             reports: reportpane::ReportState::default(),
             docs: docpanes::DocState::default(),
-            assistant: assistantpane::AssistantState::default(),
+            assistant: assistant::AssistantState::default(),
             fonts_frames: 0,
             frame_start: None,
             applied_theme: None,
@@ -1537,9 +1881,14 @@ impl RustGisApp {
             fonts_dirty: false,
             fonts_requested: Vec::new(),
             fonts_failed: Vec::new(),
+            fonts_for_data: Vec::new(),
+            other_scripts_handled: Vec::new(),
+            cjk_scripts_handled: Vec::new(),
+            cjk_lacking_said: Vec::new(),
             fonts_pending: false,
             label_fonts_indexed: false,
             shown_lang: i18n::Lang::EN,
+            language_coverage: None,
             seen_project: None,
             autosave: Default::default(),
             save_prompt: Default::default(),
@@ -1553,6 +1902,7 @@ impl RustGisApp {
         // store, installed before prefs.
         self.session.database_logins.set_store(services.secrets.clone());
         rustgis_engine::render::rustgis_tiles::earthdata::set_secret_store(services.secrets.clone());
+        rustgis_engine::render::rustgis_tiles::copernicus::set_secret_store(services.secrets.clone());
         self.services = services;
         shortcutui::load(&mut self);
         sourcespane::load_connections(&mut self);
@@ -1602,6 +1952,10 @@ impl RustGisApp {
         }
         self.ui.last_project = self.services.load_pref.as_ref().and_then(|load| load("last_project")).filter(|p| !p.trim().is_empty());
         self.ui.ask_layers = self.services.load_pref.as_ref().and_then(|load| load("ask_file_layers")).is_none_or(|v| v != "off");
+        self.ui.download_grids = self.services.load_pref.as_ref().and_then(|load| load("download_datum_grids")).is_some_and(|v| v == "on");
+        rustgis_engine::grids::set_enabled(self.ui.download_grids);
+        self.ui.sharp_tiles = self.services.load_pref.as_ref().and_then(|load| load("sharp_tiles")).is_none_or(|v| v != "off");
+        rustgis_engine::render::rustgis_tiles::template::set_sharp(self.ui.sharp_tiles);
         // A stored projection this version can't use means Web Mercator.
         if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load("start_projection"))
             && let Ok(p) = rustgis_engine::map::Projection::from_code(&code)
@@ -1609,6 +1963,13 @@ impl RustGisApp {
             self.ui.start_projection = p.code();
         }
         self.ui.start_extent = self.services.load_pref.as_ref().and_then(|load| load("start_extent")).and_then(|v| parse_extent(&v));
+        self.ui.recent_crs = self
+            .services
+            .load_pref
+            .as_ref()
+            .and_then(|load| load(crspicker::RECENT_PREF))
+            .map(|v| crspicker::from_pref(&v))
+            .unwrap_or_default();
         // How new single-band rasters are drawn (Save as Default in the raster Symbology pane).
         if let Some(d) = self.services.load_pref.as_ref().and_then(|load| load(RASTER_DEFAULTS_PREF))
             && let Ok(d) = serde_json::from_str::<rustgis_engine::map::RasterDefaults>(&d)
@@ -1678,15 +2039,15 @@ impl RustGisApp {
             .unwrap_or_else(|| "Meters".into());
         self.ui.measurement_imperial =
             self.services.load_pref.as_ref().and_then(|load| load("measurement_units")).as_deref() == Some("imperial");
-        // The pointer's coordinate format; a missing one reads as decimal degrees. One this
-        // version doesn't know (a newer RustGIS may have saved it) is said and read as decimal
-        // degrees too. It stays saved until the user picks a format (`ui.coordinateFormat`).
+        // The pointer's coordinate format; a missing one reads in the map's coordinates. One this
+        // version doesn't know (a newer RustGIS may have saved it) is said and read in the map's
+        // coordinates too. It stays saved until the user picks a format (`ui.coordinateFormat`).
         if let Some(code) = self.services.load_pref.as_ref().and_then(|load| load(coordreadout::PREF)) {
             match CoordReadout::from_code(&code) {
                 Some(format) => self.map.coord_format = format,
                 None => {
                     self.session
-                        .notify(tl!("The saved coordinate format isn't known to this version, so decimal degrees are shown."), false);
+                        .notify(tl!("The saved coordinate format isn't known to this version, so map coordinates are shown."), false);
                 }
             }
         }
@@ -1737,15 +2098,83 @@ impl RustGisApp {
         i18n::Lang::from_pref(&self.ui.language)
     }
 
-    /// Whether the interface can be drawn in `lang` this frame: its script needs no extra font, or
-    /// that font is installed and active (fonts installed this very frame aren't yet). A web app
-    /// waits for the download; a failed one keeps the previous language. A desktop without the
-    /// font has nothing to wait for.
-    fn can_draw(&self, lang: i18n::Lang) -> bool {
-        let Some(region) = Self::script_region(lang.script()) else { return true };
-        let have = self.extra_fonts.iter().any(|(_, _, r)| *r == Some(region));
-        let can_fetch = self.services.fetch_font.is_some() && rustgis_engine::render::fonts::script_font_url(region).is_some();
-        (have || !can_fetch) && !self.fonts_pending && self.installed_region == Some(region)
+    /// Enables cached native font downloads for an interactive shell. Hosts opt in at setup,
+    /// so headless tests and embedded applications do not start network work implicitly.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn enable_native_font_downloads(&mut self, ctx: &egui::Context) {
+        fontloading::install(&mut self.services, ctx);
+    }
+
+    /// Waits for a requested face and the frame that activates it, then checks the actual
+    /// catalog's letters in every UI family. With no usable font, keep the readable language
+    /// and say why once; a failed download or an absent native font must not activate boxes.
+    fn can_draw(&mut self, ctx: &egui::Context, lang: i18n::Lang) -> bool {
+        if self.fonts_pending && Self::script_region(lang.script()).is_some() {
+            return false;
+        }
+        if let Some(region) = Self::script_region(lang.script()) {
+            if self.installed_region != Some(region) {
+                return false;
+            }
+            let name = format!("script-{region:?}");
+            let have = self.extra_fonts.iter().any(|(_, _, r)| *r == Some(region));
+            if !have
+                && self.fonts_requested.contains(&name)
+                && !self.fonts_failed.contains(&name)
+                && self.services.fetch_font.is_some()
+                && rustgis_engine::render::fonts::script_font_url(region).is_some()
+            {
+                return false;
+            }
+        }
+        let families = [egui::FontFamily::Proportional, egui::FontFamily::Name("semibold".into()), egui::FontFamily::Monospace];
+        // Text laid out by the host can defer our font install until the next pass. An undefined
+        // family is pending, not proof that the catalog is unsupported.
+        if ctx.fonts_mut(|fonts| families.iter().any(|family| !fonts.definitions().families.contains_key(family))) {
+            ctx.request_repaint();
+            return false;
+        }
+        if let Some((_, covered)) = self.language_coverage.filter(|(checked, _)| *checked == lang) {
+            return covered;
+        }
+        let covered = ctx.fonts_mut(|fonts| {
+            families.into_iter().all(|family| {
+                let font = egui::FontId::new(14.0, family);
+                lang.letters().iter().all(|c| fonts.has_glyph(&font, *c))
+            })
+        });
+        // The host may have defined these families before our deferred install. Their old
+        // coverage is usable for this frame, but must not become a cached result or a warning.
+        if self.fonts_pending {
+            ctx.request_repaint();
+            return covered;
+        }
+        if !covered
+            && let Some(region) = Self::script_region(lang.script())
+            && let (Some(fetch), Some(url)) = (&self.services.fetch_font, rustgis_engine::render::fonts::script_font_url(region))
+        {
+            let downloading = format!("download-{region:?}");
+            let failed = format!("script-{region:?}");
+            let downloaded = self.extra_fonts.iter().any(|(name, _, script)| name.starts_with("web-") && *script == Some(region));
+            if !downloaded && !self.fonts_failed.contains(&failed) {
+                if !self.fonts_requested.contains(&downloading) {
+                    self.fonts_requested.push(downloading);
+                    fetch(url);
+                }
+                return false;
+            }
+        }
+        self.language_coverage = Some((lang, covered));
+        if !covered {
+            self.session.notify(
+                i18n::fmt(
+                    "The available fonts can't display {language}. The interface stays in {previous}; choose the language again to retry.",
+                    &[("language", lang.english()), ("previous", self.shown_lang.english())],
+                ),
+                true,
+            );
+        }
+        covered
     }
 
     /// On the desktop, an installed CJK face as a last-resort fallback, so CJK text (language names
@@ -1758,8 +2187,7 @@ impl RustGisApp {
         }
         let found = [CjkRegion::SimplifiedChinese, CjkRegion::Japanese, CjkRegion::Korean].into_iter().find_map(cjk_font);
         if let Some((bytes, index)) = found {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, true);
             self.extra_fonts.push(("cjk-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1772,8 +2200,7 @@ impl RustGisApp {
             return;
         }
         if let Some((bytes, index)) = rustgis_engine::render::fonts::symbol_font() {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, false);
             self.extra_fonts.push(("symbol-fallback".into(), std::sync::Arc::new(face), None));
         }
     }
@@ -1795,6 +2222,7 @@ impl RustGisApp {
             i18n::Script::Bengali => Some(ScriptFont::Bengali),
             i18n::Script::Lao => Some(ScriptFont::Lao),
             i18n::Script::Alphabetic => None,
+            i18n::Script::LatinExtended => Some(ScriptFont::Latin),
         }
     }
 
@@ -1814,8 +2242,7 @@ impl RustGisApp {
         }
         self.fonts_requested.push(name.clone());
         if let Some((bytes, index)) = script_font(region) {
-            let mut face = egui::FontData::from_static(bytes);
-            face.index = *index;
+            let face = theme::installed_face(bytes, *index, matches!(region, rustgis_engine::render::fonts::ScriptFont::Cjk(_)));
             self.extra_fonts.push((name, std::sync::Arc::new(face), Some(region)));
             self.fonts_dirty = true;
         } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(region)) {
@@ -1823,6 +2250,224 @@ impl RustGisApp {
         } else {
             log::warn!("no {region:?} font installed; text in that script may not display");
         }
+    }
+
+    /// Missing non-CJK text can come from any UI widget or renderer, regardless of interface
+    /// language. Load one fallback per supported script and report a terminal missing-font case.
+    fn ensure_other_script_fonts(&mut self, ctx: &egui::Context) {
+        use rustgis_engine::render::fonts::{ScriptFont, script_font, script_font_url, take_missing_text};
+        if self.fonts_dirty || self.fonts_pending {
+            return;
+        }
+        for (script, chars) in take_missing_text().into_iter().filter(|(s, _)| !matches!(s, ScriptFont::Cjk(_))) {
+            // A preceding script may just have queued a native face. Keep the remaining
+            // reports until it is active; one face can cover more than one script.
+            if self.fonts_dirty || self.fonts_pending {
+                for c in chars {
+                    rustgis_engine::render::fonts::note_missing_script(c);
+                }
+                continue;
+            }
+            if !text_still_missing(ctx, &chars) {
+                continue;
+            }
+            if !self.other_scripts_handled.contains(&script) {
+                self.other_scripts_handled.push(script);
+            }
+            let script_name = fallback_script_name(script);
+            if !self.fonts_for_data.contains(&script) {
+                self.fonts_for_data.push(script);
+            }
+            let name = format!("script-{script:?}");
+            let loaded = self.extra_fonts.iter().any(|(_, _, s)| *s == Some(script));
+            if loaded {
+                let downloaded = self.extra_fonts.iter().any(|(n, _, s)| n.starts_with("web-") && *s == Some(script));
+                let request = format!("download-{script:?}");
+                if !downloaded
+                    && !self.fonts_failed.contains(&name)
+                    && let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(script))
+                {
+                    if !self.fonts_requested.contains(&request) {
+                        self.fonts_requested.push(request);
+                        fetch(url);
+                    }
+                } else {
+                    let lacking = format!("lacking-{script:?}");
+                    if !self.fonts_failed.contains(&lacking) {
+                        self.fonts_failed.push(lacking);
+                        self.session.notify(
+                            i18n::fmt(
+                                "At least one character in the {script} text is missing from the available fonts.",
+                                &[("script", script_name)],
+                            ),
+                            true,
+                        );
+                    }
+                }
+                continue;
+            }
+            if self.fonts_requested.contains(&name) || self.fonts_failed.contains(&name) {
+                continue;
+            }
+            self.fonts_requested.push(name.clone());
+            if let Some((bytes, index)) = script_font(script) {
+                self.extra_fonts.push((name, std::sync::Arc::new(theme::installed_face(bytes, *index, false)), Some(script)));
+                self.fonts_dirty = true;
+            } else if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(script)) {
+                fetch(url);
+                self.session.notify(
+                    i18n::fmt(
+                        "Downloading a fallback font for {script} text. That text may be missing until the font arrives.",
+                        &[("script", script_name)],
+                    ),
+                    false,
+                );
+            } else {
+                self.fonts_failed.push(name);
+                self.session.notify(i18n::fmt("No available font draws the {script} text.", &[("script", script_name)]), true);
+            }
+        }
+    }
+
+    /// In the browser, downloads a CJK face for the CJK text the renderer met with none to draw it
+    /// in (map labels, a layout's text, an export), whatever the interface language: the browser
+    /// has no installed fonts, and the interface downloads one only for its own language. Once the
+    /// face arrives, the map and the layout page are drawn again with it, and the interface draws
+    /// that text with it too.
+    ///
+    /// Either way it says so, once a script: the text is left out until the face arrives (an image
+    /// exported meanwhile lacks it), or for good where nothing can be downloaded (a desktop with no
+    /// CJK font installed).
+    fn ensure_data_cjk_font(&mut self, ctx: &egui::Context) {
+        use rustgis_engine::render::fonts::{CjkRegion, CjkScript, ScriptFont, script_font_url, take_missing_cjk};
+        if self.fonts_dirty || self.fonts_pending {
+            return;
+        }
+        let samples = rustgis_engine::render::fonts::peek_missing_text();
+        let missing: Vec<_> = take_missing_cjk()
+            .into_iter()
+            .filter(|script| {
+                let chars: Vec<char> =
+                    samples.iter().flat_map(|(_, chars)| chars.iter().copied()).filter(|c| CjkScript::of(*c) == Some(*script)).collect();
+                chars.is_empty() || text_still_missing(ctx, &chars)
+            })
+            .collect();
+        if missing.is_empty() {
+            return;
+        }
+        let han = if missing.contains(&CjkScript::Han) { self.han_region() } else { CjkRegion::SimplifiedChinese };
+        let fetching = self.services.fetch_font.is_some();
+        if !fetching {
+            for script in missing {
+                if self.cjk_scripts_handled.contains(&script) {
+                    continue;
+                }
+                self.cjk_scripts_handled.push(script);
+                let language = Self::cjk_language(cjk_downloads(&[script], han, |_| false).first().copied().unwrap_or(han));
+                let msg = i18n::fmt(
+                    "No available font draws the {language} text, so those characters cannot be displayed or exported.",
+                    &[("language", language.english())],
+                );
+                self.session.notify(msg, false);
+            }
+            return;
+        }
+        let name = |r| format!("script-{:?}", ScriptFont::Cjk(r));
+        let asked = |r| {
+            let n = name(r);
+            self.fonts_requested.contains(&n)
+                || self.fonts_failed.contains(&n)
+                || self.extra_fonts.iter().any(|(_, _, x)| *x == Some(ScriptFont::Cjk(r)))
+        };
+        let wanted = cjk_downloads(&missing, han, asked);
+        // Characters the face for their script, already loaded, still lacks (rare ideographs past
+        // its coverage, say) are left out: said once a script.
+        for script in &missing {
+            let region = cjk_downloads(&[*script], han, |_| false).first().copied().unwrap_or(han);
+            let loaded = self.extra_fonts.iter().any(|(_, _, x)| *x == Some(ScriptFont::Cjk(region)));
+            if loaded {
+                let downloadable = ScriptFont::Cjk(region);
+                let downloaded = self.extra_fonts.iter().any(|(n, _, s)| n.starts_with("web-") && *s == Some(downloadable));
+                let request = format!("download-{downloadable:?}");
+                if !downloaded
+                    && !self.fonts_failed.contains(&name(region))
+                    && let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(downloadable))
+                {
+                    if !self.fonts_requested.contains(&request) {
+                        self.fonts_requested.push(request);
+                        fetch(url);
+                    }
+                    if !self.fonts_for_data.contains(&ScriptFont::Cjk(region)) {
+                        self.fonts_for_data.push(ScriptFont::Cjk(region));
+                    }
+                    continue;
+                }
+            }
+            if loaded && !self.cjk_lacking_said.contains(script) {
+                self.cjk_lacking_said.push(*script);
+                let msg = i18n::fmt(
+                    "Some characters of the {language} text aren't in its downloaded font, so they cannot be displayed or exported.",
+                    &[("language", Self::cjk_language(region).english())],
+                );
+                self.session.notify(msg, false);
+            }
+        }
+        for script in missing {
+            if !self.cjk_scripts_handled.contains(&script) {
+                self.cjk_scripts_handled.push(script);
+            }
+        }
+        for region in wanted {
+            self.fonts_requested.push(name(region));
+            if !self.fonts_for_data.contains(&ScriptFont::Cjk(region)) {
+                self.fonts_for_data.push(ScriptFont::Cjk(region));
+            }
+            if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(ScriptFont::Cjk(region))) {
+                fetch(url);
+            }
+            let msg = i18n::fmt(
+                "Downloading the font for the {language} text. Those characters may be missing until the font arrives.",
+                &[("language", Self::cjk_language(region).english())],
+            );
+            self.session.notify(msg, false);
+        }
+    }
+
+    /// Asks again for the fallback faces that data text requested and failed to download: picking a
+    /// language is the retry the failure notice offers, and text measured before (its widths
+    /// cached) notes nothing again to ask for them.
+    fn retry_data_fonts(&mut self, failed: &[String]) {
+        use rustgis_engine::render::fonts::script_font_url;
+        for script in self.fonts_for_data.clone() {
+            let name = format!("script-{script:?}");
+            let loaded = self.extra_fonts.iter().any(|(_, _, x)| *x == Some(script));
+            let request = if loaded { format!("download-{script:?}") } else { name.clone() };
+            if (loaded && !failed.contains(&name)) || self.fonts_requested.contains(&request) {
+                continue;
+            }
+            self.fonts_requested.push(request);
+            if let (Some(fetch), Some(url)) = (&self.services.fetch_font, script_font_url(script)) {
+                fetch(url);
+            }
+            let msg = i18n::fmt(
+                "Downloading the font for the {script} text. Those characters may be missing until the font arrives.",
+                &[("script", fallback_script_name(script))],
+            );
+            self.session.notify(msg, false);
+        }
+    }
+
+    /// The interface language whose script is `region`'s, to name a CJK face in a notice.
+    fn cjk_language(region: rustgis_engine::render::fonts::CjkRegion) -> i18n::Lang {
+        use rustgis_engine::render::fonts::ScriptFont;
+        i18n::Lang::all().find(|l| Self::script_region(l.script()) == Some(ScriptFont::Cjk(region))).unwrap_or(i18n::Lang::EN)
+    }
+
+    /// The face ideographs in data are downloaded in: the interface's own CJK region, else that of
+    /// the first CJK language among the system's (the browser's) preferred ones, so a Taiwanese
+    /// browser gets Traditional Chinese forms, else Simplified Chinese, the renderer's first choice.
+    fn han_region(&self) -> rustgis_engine::render::fonts::CjkRegion {
+        han_region_for(self.current_region(), sys_locale::get_locales().take(16))
     }
 
     /// Adds the waiting picture graphic with its image (`path` or base64 `image`).
@@ -1869,14 +2514,46 @@ impl RustGisApp {
     /// Opens a file from the inbox: one the `"text"` picker marked ([`DELIMITED_PICK`]) opens Add
     /// Delimited Text for it, or is read with a script's options; one the tool file picker marked
     /// ([`TOOL_FILE_PICK`]) goes to the Tools pane. Source-CRS picks carry [`SHAPEFILE_PICK`];
-    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; DXF picks
-    /// carry [`DXF_PICK`] and open Import DXF.
+    /// shortcut picks carry [`SHORTCUT_PICK`] and open the validated merge preview; script picks
+    /// carry [`SCRIPT_PICK`] and open in the Script pane; marker picks carry [`MARKER_PICK`] and
+    /// become the waiting marker's image; DXF picks carry [`DXF_PICK`] and open Import DXF.
     pub fn open_picked(&mut self, name: &str, bytes: &[u8]) -> Result<Value, String> {
         if name.starts_with(SHORTCUT_PICK) {
             return shortcutfile::picked(self, bytes);
         }
+        if let Some(name) = name.strip_prefix(SCRIPT_PICK) {
+            // An answer with no name is a cancelled picker.
+            return if name.is_empty() { Ok(Value::Null) } else { analysispane::script_picked(self, name, bytes) };
+        }
+        if let Some(picked) = name.strip_prefix(MARKER_PICK) {
+            // Only the request still waiting takes its answer: an earlier one's file, still on its
+            // way when another «Image…» was clicked, is dropped, and said. An answer with no name
+            // is a cancelled picker, which ends the wait.
+            let (id, name) = picked.split_once(':').unwrap_or_default();
+            if self.ui.pending_marker_image.as_ref().is_none_or(|m| m.request.to_string() != id) {
+                if !name.is_empty() {
+                    self.session.notify(tl!("An image picked for an earlier Image… was dropped: pick it again for that marker"), true);
+                }
+                return Ok(Value::Null);
+            }
+            return match self.ui.pending_marker_image.take() {
+                Some(marker) if !name.is_empty() => marker.apply(self, bytes),
+                _ => Ok(Value::Null),
+            };
+        }
         if let Some(name) = name.strip_prefix(TOOL_FILE_PICK) {
             panes::received_file(self, name, bytes);
+            return Ok(Value::Null);
+        }
+        if let Some(name) = name.strip_prefix(ASSISTANT_PICK) {
+            // An answer with no name is a cancelled picker.
+            if !name.is_empty() {
+                if extensionsui::hidden(self, "ui.pane.assistant") {
+                    self.assistant.late_pictures += 1;
+                } else {
+                    assistantpictures::received(self, name, bytes.to_vec());
+                }
+            }
             return Ok(Value::Null);
         }
         if let Some(name) = name.strip_prefix(SHAPEFILE_PICK) {
@@ -1890,6 +2567,11 @@ impl RustGisApp {
                 self.session.notify(error.clone(), true);
                 return Err(error);
             };
+            // Remembered once a file is picked, as on the desktop, not when the picker opened.
+            if let Some(crs) = options.get("crs").and_then(Value::as_str) {
+                let crs = crs.to_string();
+                self.remember_crs_if_listed(&crs);
+            }
             return self.open_bytes_with(name, bytes, Some(options));
         }
         if let Some(picked) = name.strip_prefix(DXF_PICK) {
@@ -2089,8 +2771,8 @@ impl RustGisApp {
             return Err(tl!("this build saves projects with Save As").into());
         }
         let stem: String = stem.chars().take(200).collect();
-        // Not an undoable edit: saving names the project, as `project.saveAs` does, once the
-        // browser takes the file.
+        // Not an undoable edit: saving names the project, as `project.saveAs` does. The name
+        // stays set while the download is offered, and goes back if the download fails.
         let construction_notes = self.session.construction_output_notes()?;
         let old = std::mem::replace(&mut self.session.project.name, stem.clone());
         let (text, report) = match self.session.project.saved_text(None) {
@@ -2109,18 +2791,13 @@ impl RustGisApp {
             // Save As changed the document even when it began clean. Offering a download
             // cannot confirm that this renamed document reached a file.
             self.session.mark_unsaved();
+            self.ui.history_jump = None;
         }
-        // On Android the file is written once the user has chosen its place, and the shell
-        // says then whether it was.
-        let offered = if cfg!(any(target_os = "android", target_os = "ios")) {
-            crate::i18n::fmt("Choose where to save {name}.", &[("name", &file)])
-        } else {
-            crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)])
-        };
+        let offered = crate::i18n::fmt("Download offered: {name}. The browser doesn't say whether it saved the file.", &[("name", &file)]);
         self.session.notify(offered, false);
         report.notify(&mut self.session);
         for note in construction_notes {
-            self.session.notify(note, false);
+            self.session.say(note);
         }
         self.ui.web_file = Some(file);
         Ok(())
@@ -2266,6 +2943,30 @@ impl RustGisApp {
                 ),
                 false,
             );
+        }
+    }
+
+    /// Notes `code` as the latest coordinate system used, for the coordinate system boxes, and
+    /// keeps the list.
+    fn remember_crs(&mut self, code: &str) {
+        if crspicker::remember(&mut self.ui.recent_crs, code) {
+            self.save_pref(crspicker::RECENT_PREF, &self.ui.recent_crs.join("\n"));
+        }
+    }
+
+    /// Forgets the recently used coordinate systems.
+    pub(crate) fn clear_recent_crs(&mut self) {
+        self.ui.recent_crs.clear();
+        self.save_pref(crspicker::RECENT_PREF, "");
+    }
+
+    /// [`Self::remember_crs`] for a code the catalog lists (`EPSG:2056`), not a preset or a
+    /// PROJ string, which the coordinate system boxes offer otherwise or can't name.
+    pub(crate) fn remember_crs_if_listed(&mut self, code: &str) {
+        // As the catalog spells it, so `epsg: 2056` and `EPSG:2056` are one system.
+        if let Some(found) = rustgis_engine::data::raster::crs_search::lookup(code) {
+            let code = found.code.clone();
+            self.remember_crs(&code);
         }
     }
 
@@ -2490,10 +3191,26 @@ impl RustGisApp {
         }
     }
 
+    /// Enables foreground recovery for a phone. The store must be in the app's private storage
+    /// and must be installed before the first frame, so it can offer the last run's copy.
+    /// Call this after [`Self::with_services`], which replaces the entire service bundle.
+    pub fn with_edit_recovery(mut self, store: Box<dyn RecoveryStore>) -> Self {
+        self.services.recovery = Some(store);
+        self.autosave.phone = true;
+        autosave::next_offer(&mut self);
+        self
+    }
+
     /// A clean exit (the desktop app's `on_exit`): the recovery copy of this run's unsaved work
     /// is removed, as recovery is for a run that didn't close. Call it once, as the app closes.
     pub fn end_autosave(&mut self) {
         autosave::end(self);
+    }
+
+    /// The phone's activity ending (Back): submit the latest edit and give the writer a short
+    /// chance to finish. The last complete copy stays available for the next launch.
+    pub fn finish_recovery_copy(&mut self) {
+        autosave::finish(self);
     }
 
     /// The app closing (the desktop app's `on_exit`): an export still writing is cancelled and
@@ -2504,8 +3221,9 @@ impl RustGisApp {
         readjob::stop(self, std::time::Duration::from_secs(5));
     }
 
-    /// Draws the map into `ui`, with its own controls (zoom, compass, scale bar): for a shell
-    /// that lays out its own interface ([`RustGisApp::chrome`]).
+    /// Draws the map into `ui`, with its compass and scale bar: for a shell that lays out its own
+    /// interface ([`RustGisApp::chrome`]). With one in place, the map has no zoom buttons and no
+    /// view tabs: the shell offers what it needs of them.
     pub fn map_view(&mut self, ui: &mut egui::Ui) {
         mapview::show(self, ui);
     }
@@ -2525,7 +3243,8 @@ impl RustGisApp {
         chrome::background_busy(self)
     }
 
-    /// Draws that work's progress and Cancel into `ui`, as the desktop's status bar does.
+    /// Draws that work's progress and Cancel into `ui`, as the desktop's status bar does; with a
+    /// shell's interface in place ([`RustGisApp::chrome`]), at a finger's size.
     pub fn background_status(&mut self, ui: &mut egui::Ui) {
         chrome::background_status(self, ui);
     }
@@ -2576,6 +3295,15 @@ impl RustGisApp {
         if id.starts_with(rustgis_engine::plugins::PREFIX) {
             return self.ask_plugin(id, params).map(|()| Value::Null);
         }
+        if id == "raster.imageGrid" {
+            #[cfg(not(target_arch = "wasm32"))]
+            if self.reads_off_frame {
+                return readjob::run_then(self, "raster.imageGrid", params, Some(annotation::show_grid_result));
+            }
+            let result = self.run(id, params);
+            annotation::show_grid_result(self, Landed::Ran(result.clone()));
+            return result;
+        }
         self.run(id, params)
     }
 
@@ -2589,11 +3317,13 @@ impl RustGisApp {
     /// Imports a peer's project without going through User command dispatch or restore memory.
     pub fn open_peer_text(&mut self, text: &str) -> Result<(), String> {
         let report = self.session.open_peer_text(rustgis_engine::Peer::Embedder, text)?;
-        assistantpane::peer_replaced(self);
+        assistant::peer_replaced(self);
         self.ui.web_file = None;
         self.map.deleting = None;
         // A spectral profile's points were read on the old project's rasters.
         self.workflow.spectral.clear();
+        crate::analysispane::forget_similar(&mut self.workflow);
+        (self.workflow.result, self.workflow.error) = (None, None);
         self.retire_cog_probes();
         if let Some(steps) = self.ws.recording.take() {
             self.session.notify(
@@ -2622,6 +3352,19 @@ impl RustGisApp {
         }
     }
 
+    /// Says that the open field package's rows couldn't be kept (`offline.keepRows` was refused,
+    /// for `why`), and what that means for its return, and lets go of the rows it held for them.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn keep_refused(&mut self, why: &str) {
+        let name = self.session.project.name.clone();
+        self.session.forget_field_rows();
+        let text = i18n::fmt(
+            "The rows field package '{name}' gave couldn't be kept on this device ({why}): Send Field Package sends its whole map, which Bring Back refuses if its offline area has been brought back or synced since the package was made",
+            &[("name", &name), ("why", why)],
+        );
+        self.session.notify(text, true);
+    }
+
     /// Runs a command by id: `ui.*` here, everything else in the engine.
     pub fn run(&mut self, id: &str, params: Value) -> Result<Value, String> {
         #[cfg(not(target_arch = "wasm32"))]
@@ -2631,7 +3374,7 @@ impl RustGisApp {
             if id == "service.layers" {
                 return readjob::run(self, "service.layers", params);
             }
-            if id == "service.add" && params.get("text").and_then(Value::as_str).is_some() {
+            if id == "service.add" {
                 return readjob::run(self, "service.add", params);
             }
             if id == "layer.repairSource" {
@@ -2660,10 +3403,27 @@ impl RustGisApp {
             if id == "source.syncState" {
                 return readjob::run_then(self, "source.syncState", params, Some(sync_state_said));
             }
-            // Counting a column goes over every row of the layer: on a thread of its own, and the
-            // answer shown once it lands (the table's Statistics window).
+            // Direct desktop callers receive a queue acknowledgement; callbacks receive the frame.
+            // Script lines use engine dispatch and consume their prepared worker results instead.
+            if id == "raster.imageGrid" {
+                return readjob::run(self, "raster.imageGrid", params);
+            }
+            if id == "edit.previewShapeConversion" {
+                return readjob::run_shape_conversion(self, params);
+            }
+            // Counting a column goes over every row: the Statistics window shows the landed answer.
             if id == "table.statistics" {
                 return readjob::run_then(self, "table.statistics", params, Some(table::statistics_landed));
+            }
+            if id == "data.similar" {
+                return readjob::run(self, "data.similar", params);
+            }
+            if id == "layer.sizeBy" {
+                return readjob::run(self, "layer.sizeBy", params);
+            }
+            // Reading a style's file and its images' files: on a thread of its own, with Cancel.
+            if id == "style.importQgis" {
+                return readjob::run(self, "style.importQgis", params);
             }
             // Publishing hashes, reads and writes the whole file: on a thread of its own, with
             // progress and Cancel, as an export is.
@@ -2674,10 +3434,26 @@ impl RustGisApp {
                 let mark = self.session.notice_mark();
                 return exportjob::start(self, "source.publish", params).inspect_err(|e| self.command_failed(id, e, mark));
             }
-            // Ordering and writing a standalone table grows with its rows, like Export Features.
-            if id == "share.exportTable" {
+            // A block's model waits for elevation tiles and draws its texture (#2319).
+            if id == "map.exportBlock" {
                 let mark = self.session.notice_mark();
-                return exportjob::start(self, "share.exportTable", params).inspect_err(|e| self.command_failed(id, e, mark));
+                return exportjob::start(self, "map.exportBlock", params).inspect_err(|e| self.command_failed(id, e, mark));
+            }
+            // Table exports and field packages can both read and write large inputs.
+            if matches!(id, "share.exportTable" | "offline.package") {
+                let command = if id == "offline.package" { "offline.package" } else { "share.exportTable" };
+                let mark = self.session.notice_mark();
+                return exportjob::start(self, command, params).inspect_err(|e| self.command_failed(id, e, mark));
+            }
+            // A command that makes a raster grows with its input: on a thread of its own, its
+            // progress and Cancel in the Workflows pane, when asked here (Command Search; the
+            // Assistant runs its commands on the session). Run again with what it made (`ran`),
+            // it adds the raster here.
+            if params.get("ran").is_none_or(Value::is_null)
+                && let Some((command, name)) = rustgis_engine::cmd::workflows::runs_in_background(id)
+            {
+                let mark = self.session.notice_mark();
+                return analysispane::start_from_dispatch(self, command, name, params).inspect_err(|e| self.command_failed(id, e, mark));
             }
             // Converting the labels of a layer read in place reads all of its source first, on a
             // thread of its own, whoever asks (a click, the assistant).
@@ -2717,7 +3493,15 @@ impl RustGisApp {
             self.ui.ribbon_peek = false;
         }
         // Read before the command runs: removing or renaming the active layer changes it.
-        let active = if self.ws.recording.is_some() { self.layer_acted_on(id, &params) } else { None };
+        let active = match &dispatch {
+            _ if self.ws.recording.is_none() => None,
+            // A read on a thread bound to its layer's id (`readjob`): the step names the layer, as
+            // every step does, so it replays on that layer by name. One given no layer names the
+            // layer it acts on, as a command run here does.
+            #[cfg(not(target_arch = "wasm32"))]
+            AppDispatch::Read(_) => self.layer_named(&params).or_else(|| self.layer_acted_on(id, &params)),
+            _ => self.layer_acted_on(id, &params),
+        };
         // A step being edited is known by its place in the task: Undo or Redo of a move or a
         // deletion would leave that place naming another step.
         // What is compared: the task's length and the step at the edit's place (its words and
@@ -2777,10 +3561,22 @@ impl RustGisApp {
         // Nested commands (including scripts) can replace rows too; never retarget a chosen
         // vertex or held gesture to the replacement feature at the same row.
         crate::vertexedit::cancel_stale_drag(self);
+        annotation::sync(self);
         crate::boxedit::cancel_stale(self);
         crate::circleedit::cancel_stale(self);
         if let Err(e) = &r {
             self.command_failed(id, e, notice_mark);
+        }
+        // A field package from home opened: the rows it gave are kept on a thread of their own,
+        // with progress and Cancel, rather than as it opens.
+        #[cfg(not(target_arch = "wasm32"))]
+        if r.is_ok()
+            && id == "project.open"
+            && self.reads_off_frame
+            && self.session.field_rows_waiting()
+            && let Err(e) = readjob::run(self, "offline.keepRows", json!({}))
+        {
+            self.keep_refused(&e);
         }
         // Commands can replace the project, switch maps or change the renderer while the pane
         // is closed. A field picked for the old context must not overwrite the new renderer.
@@ -2795,6 +3591,8 @@ impl RustGisApp {
             self.map.deleting = None;
             // Nor are a spectral profile's points read on a namesake raster of the new one.
             self.workflow.spectral.clear();
+            crate::analysispane::forget_similar(&mut self.workflow);
+            (self.workflow.result, self.workflow.error) = (None, None);
             // A recording's steps name the old project's layers: it ends here, and says so.
             if let Some(steps) = self.ws.recording.take() {
                 let n = steps.len().to_string();
@@ -2930,6 +3728,17 @@ impl RustGisApp {
         if id.starts_with("edit.") && params.get("table").is_some_and(|t| !t.is_null()) {
             return None;
         }
+        // Coordinate entry uses only a loaded point layer; a fallback must not record the
+        // incompatible selection as an explicit target that replay would refuse.
+        if id == "edit.addPoint"
+            && !self
+                .session
+                .active_layer
+                .and_then(|id| self.session.map().layer(id))
+                .is_some_and(rustgis_engine::cmd::edit::accepts_coordinate_point)
+        {
+            return None;
+        }
         let spec = self.session.registry.get(id).filter(|c| c.mutates && params.get("layer").is_none_or(Value::is_null)).copied()?;
         if !spec.param_keys().is_some_and(|k| k.contains(&"layer")) {
             return None;
@@ -2943,6 +3752,16 @@ impl RustGisApp {
         }
         let map = self.session.map();
         let name = active.and_then(|l| map.layer(l)).map(|l| l.name.clone())?;
+        let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
+        Some((name, shared))
+    }
+
+    /// The name of the layer `params` gives by id, and whether another layer shares it.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn layer_named(&self, params: &Value) -> Option<(String, bool)> {
+        let map = self.session.map();
+        let id = params.get("layer").and_then(Value::as_u64).and_then(|id| u32::try_from(id).ok())?;
+        let name = map.layer(id)?.name.clone();
         let shared = map.layers.iter().filter(|l| l.name.eq_ignore_ascii_case(&name)).count() > 1;
         Some((name, shared))
     }
@@ -3033,6 +3852,10 @@ impl RustGisApp {
         // Export Table writes a file without changing the project, but remains a replayable
         // task step. Other exports keep their existing recording behavior.
         let Some(spec) = self.session.registry.get(id).filter(|c| c.mutates || id == "share.exportTable").copied() else { return };
+        if id == "edit.applyShapeConversion" {
+            self.session.notify(tl!("Shape conversion isn't recorded: its preview belongs to this session. Convert the polygon explicitly after reopening the project."), false);
+            return;
+        }
         // Downloaded data is kept for this session only, and adding it uses it up: a task
         // couldn't add it again.
         // A result handed over by the app (`ran`: a summary worked out on a thread) is used up
@@ -3189,6 +4012,10 @@ impl RustGisApp {
 
     /// Runs a `ui.*` command: panes, dialogs and the app's own settings.
     fn run_ui(&mut self, id: &str, p: &Value) -> Result<Value, String> {
+        // A pane of an extension that is off says so, as its other commands do (#1752).
+        if let Some(why) = self.session.extensions().blocks(id) {
+            return Err(why);
+        }
         // A pane's command toggles it; `{"close": true}` closes it, in view or not (a tab's ✕),
         // whatever else the command is given (SQL to run, a question to ask).
         if p.get("close").and_then(Value::as_bool) == Some(true) && panes::close_pane_of(self, id) {
@@ -3224,6 +4051,23 @@ impl RustGisApp {
                     return self.run_ui("ui.pane.layerProperties", &json!({"tab": "source", "layer": layer}));
                 }
             }
+            "ui.pane.annotation" => {
+                if self.ui.right == Some(RightPane::Annotation) {
+                    self.ui.close_right(RightPane::Annotation);
+                } else {
+                    annotation::open(self)?;
+                }
+            }
+            "ui.annotationImage" => annotation::select_image(self, p)?,
+            "ui.annotationFilename" => {
+                annotation::filename_option(self, p.get("on").and_then(Value::as_bool).ok_or_else(|| tl!("on is required").to_string())?)
+            }
+            "ui.annotationGrid" => annotation::select_grid(
+                self,
+                p.get("pixels").and_then(Value::as_bool).ok_or_else(|| tl!("pixels is required").to_string())?,
+            )?,
+            "ui.annotationCancel" => annotation::cancel_read(self),
+            "ui.annotationLayer" => annotation::select_layer(self, p)?,
             "ui.pane.editing" => toggle_right(&mut self.ui, RightPane::Editing),
             "ui.pane.design" => toggle_right(&mut self.ui, RightPane::Design),
             "ui.pane.script" => toggle_right(&mut self.ui, RightPane::Script),
@@ -3322,9 +4166,14 @@ impl RustGisApp {
                 self.workflow.pick = None;
                 match section.and_then(|s| analysispane::SECTIONS.iter().find(|x| x.0 == s)) {
                     Some((id, _)) => {
+                        // Opening the same Similar section preserves its pending/completed result,
+                        // including when the pane was hidden while the worker finished.
+                        if *id != "similar" || self.workflow.section != *id {
+                            analysispane::forget_similar(&mut self.workflow);
+                            self.workflow.result = None;
+                            self.workflow.error = None;
+                        }
                         self.workflow.section = id;
-                        self.workflow.result = None;
-                        self.workflow.error = None;
                         self.ui.open_right(RightPane::Workflows);
                     }
                     None => toggle_right(&mut self.ui, RightPane::Workflows),
@@ -3350,7 +4199,12 @@ impl RustGisApp {
                     return Err(format!("unknown language '{code}'"));
                 }
                 self.ui.language = code.to_ascii_lowercase();
-                self.fonts_failed.clear();
+                let failed_fonts = std::mem::take(&mut self.fonts_failed);
+                self.language_coverage = None;
+                self.other_scripts_handled.clear();
+                self.fonts_requested
+                    .retain(|n| n.strip_prefix("download-").is_none_or(|script| !failed_fonts.contains(&format!("script-{script}"))));
+                self.retry_data_fonts(&failed_fonts);
                 self.save_pref("language", &self.ui.language);
                 self.map.invalidate();
             }
@@ -3410,6 +4264,40 @@ impl RustGisApp {
                     save("ask_file_layers", if self.ui.ask_layers { "on" } else { "off" });
                 }
                 return Ok(json!({"on": self.ui.ask_layers}));
+            }
+            // Whether datum grids are downloaded from PROJ's grid server (#2032 A4).
+            "ui.datumGrids" => {
+                // Without `on` it toggles; a value that isn't true or false is refused.
+                self.ui.download_grids = match p.get("on") {
+                    None | Some(Value::Null) => !self.ui.download_grids,
+                    Some(v) => v.as_bool().ok_or("on must be true or false")?,
+                };
+                rustgis_engine::grids::set_enabled(self.ui.download_grids);
+                // Turned on: the grids the systems in use already lack are got now, not only those
+                // a note says later.
+                if self.ui.download_grids {
+                    self.session.want_grids_in_use();
+                }
+                if let Some(save) = &self.services.save_pref {
+                    save("download_datum_grids", if self.ui.download_grids { "on" } else { "off" });
+                }
+                return Ok(json!({"on": self.ui.download_grids}));
+            }
+            // Whether raster tiles are sharp on a HiDPI display (#2390).
+            "ui.sharpTiles" => {
+                // Without `on` it toggles; a value that isn't true or false is refused.
+                self.ui.sharp_tiles = match p.get("on") {
+                    None | Some(Value::Null) => !self.ui.sharp_tiles,
+                    Some(v) => v.as_bool().ok_or("on must be true or false")?,
+                };
+                rustgis_engine::render::rustgis_tiles::template::set_sharp(self.ui.sharp_tiles);
+                if let Some(save) = &self.services.save_pref {
+                    save("sharp_tiles", if self.ui.sharp_tiles { "on" } else { "off" });
+                }
+                // The map and an open layout page are drawn again with tiles at the new detail.
+                self.map.invalidate();
+                self.layout.redraw();
+                return Ok(json!({"on": self.ui.sharp_tiles}));
             }
             "ui.recover" => return autosave::recover(self, p),
             "ui.startup" => {
@@ -3561,8 +4449,8 @@ impl RustGisApp {
                 let format = match p.get("format") {
                     None | Some(Value::Null) => self.map.coord_format.next(),
                     Some(Value::String(v)) => CoordReadout::from_code(v)
-                        .ok_or_else(|| tl!("The coordinate format must be decimal, dms, utm or mgrs").to_string())?,
-                    _ => return Err(tl!("The coordinate format must be decimal, dms, utm or mgrs").into()),
+                        .ok_or_else(|| tl!("The coordinate format must be map, layer, decimal, dms, utm or mgrs").to_string())?,
+                    _ => return Err(tl!("The coordinate format must be map, layer, decimal, dms, utm or mgrs").into()),
                 };
                 self.map.coord_format = format;
                 self.save_pref(coordreadout::PREF, format.code());
@@ -3598,6 +4486,12 @@ impl RustGisApp {
             }
             "ui.commandSearch" => self.ui.command_search = Some(String::new()),
             "ui.about" => self.ui.about = true,
+            // Back from the desktop interface to the phone's, which the shell left in `touch`.
+            "ui.touchInterface" => match (self.chrome, self.touch) {
+                (Some(_), _) => {}
+                (None, Some(touch)) => self.chrome = Some(touch),
+                (None, None) => return Err(tl!("There is no touch interface to go back to: it is on phones.").into()),
+            },
             "ui.checkUpdate" => self.update.check(),
             // The MCP relay for `rustgis-cli mcp --attach`: starts a loopback listener off until
             // asked. Running the command again reports its address; the app owns its lifetime.
@@ -3787,16 +4681,20 @@ impl RustGisApp {
                 let url = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()).ok_or("url is required")?;
                 let url = rustgis_engine::map::geolibre::download_url(url);
                 let url = url.as_str();
-                let slot: Slot<Result<Vec<u8>, String>> = Slot::default();
+                let slot: Slot<Result<(Vec<u8>, Reach), String>> = Slot::default();
                 let land = slot.clone();
-                rustgis_engine::render::rustgis_tiles::cache::download_limited(
+                // With where it was read: what the project names reaches no wider.
+                rustgis_engine::render::rustgis_tiles::cache::download_detailed_with_origin(
                     url,
                     if rustgis_engine::map::geolibre::is_project_file(url) {
                         rustgis_engine::map::geolibre::MAX_TEXT
                     } else {
                         rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
                     },
-                    Box::new(move |r| *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r)),
+                    Box::new(move |r| {
+                        let r = r.map(|fetched| (fetched.bytes, fetched.origin.reach())).map_err(|failure| failure.message);
+                        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                    }),
                 );
                 self.session.notify(i18n::fmt("Opening {url}…", &[("url", &rustgis_engine::sources::address_in_message(url))]), false);
                 let id = self.session.download_started();
@@ -3833,6 +4731,19 @@ impl RustGisApp {
                 } else {
                     connectionui::open_new(self, p.get("kind").and_then(Value::as_str).unwrap_or("service"))?;
                 }
+                // An enterprise geodatabase: SQL Server's form (server, sign-in, database), filled
+                // with what is given, or from a .sde file. A file that is refused says why in the
+                // form, which stays open to enter the connection by hand.
+                if p.get("form").and_then(Value::as_bool) == Some(true) && self.ui.connection.kind == "sqlserver" {
+                    let text = |key: &str| p.get(key).and_then(Value::as_str).map(str::trim).filter(|v| !v.is_empty());
+                    if let Err(e) = connectionui::use_form(&mut self.ui.connection, text("server"), text("database")) {
+                        self.dialogs.error = Some(e);
+                    } else if let Some(file) = text("sdeFile")
+                        && let Err(e) = connectionui::fill_from_sde(self, file)
+                    {
+                        self.dialogs.error = Some(e);
+                    }
+                }
                 if p.get("test").and_then(Value::as_bool) == Some(true) {
                     connectionui::start_test(self);
                 }
@@ -3848,6 +4759,13 @@ impl RustGisApp {
                 let Some(url) = p.get("url").and_then(Value::as_str).map(str::trim).filter(|u| !u.is_empty()) else {
                     return self.run("ui.dialog", json!({"name": "addService"}));
                 };
+                // An address a document read from the internet named (`fromDocument`, below) may not
+                // point into the local network: refused before anything opens.
+                let from_document = p.get("fromDocument").and_then(Value::as_bool) == Some(true);
+                if from_document {
+                    rustgis_engine::render::rustgis_tiles::address::check_reach(url, Reach::Public)
+                        .map_err(|e| connectionui::translated(&e))?;
+                }
                 let connection = p
                     .get("connection")
                     .and_then(Value::as_str)
@@ -3860,6 +4778,11 @@ impl RustGisApp {
                     }
                     self.dialogs.mode = "csw";
                     self.dialogs.connection = connection;
+                    // A catalogue a document read from the internet named is searched only there
+                    // (its requests follow its record, `cswui::search`).
+                    if from_document {
+                        cache::restrict_to_public(url);
+                    }
                     self.ui.csw.url = url.to_string();
                     self.ui.csw.query = p.get("query").and_then(Value::as_str).unwrap_or("").to_string();
                     self.ui.csw.use_view = p.get("bbox").and_then(Value::as_str) == Some("view");
@@ -3893,6 +4816,14 @@ impl RustGisApp {
                 let resolved_connection = bound.get("connection").and_then(Value::as_str).map(str::to_string);
                 let url = bound.get("url").and_then(Value::as_str).unwrap_or(url);
                 let caps = rustgis_engine::data::ogc::capabilities_url(url, (kind != "auto").then_some(kind));
+                // An address a document read from the internet named (a catalogue's or a portal's
+                // entry, `fromDocument`) leads only there: its capabilities, the documents they
+                // link to and the layers they list (`service.layers` reads the address's record).
+                // It can only narrow what the address may reach.
+                if from_document {
+                    cache::restrict_to_public(url);
+                    cache::restrict_to_public(&caps);
+                }
                 // A refusal is told with what the server said (#509).
                 let slot = fetch_detailed_into(&caps);
                 // The dialog shows the address connected to, however the connection was asked for.
@@ -3929,6 +4860,8 @@ impl RustGisApp {
                     }
                     open("shapefile");
                 } else if let Some(path) = dialogs::pick_open(&["shp", "zip"], tl!("Shapefile")) {
+                    let text = text.to_string();
+                    self.remember_crs_if_listed(&text);
                     // Read on a thread of its own, as Add Data's other files are.
                     #[cfg(not(target_arch = "wasm32"))]
                     return readjob::run(self, "layer.addData", json!({"path": path, "crs": text}));
@@ -3998,10 +4931,19 @@ impl RustGisApp {
                             "tif",
                             "tiff",
                             "asc",
+                            // GRIB weather and climate model output.
+                            "grb",
+                            "grib",
+                            "grb2",
+                            "grib2",
                         ][..],
+                        // SRTM height tiles and DTED, read natively.
+                        &rustgis_engine::data::raster::ELEVATION_EXTENSIONS[..],
                         // Rasters GDAL reads (every one it is asked to read).
                         #[cfg(not(target_arch = "wasm32"))]
                         rustgis_engine::data::raster::gdal::EXTENSIONS,
+                        // PDF pages, GeoPDFs placed by their coordinates, where this build reads them (#2336).
+                        if rustgis_engine::data::raster::PDF_PAGES { &["pdf"][..] } else { &[][..] },
                     ]
                     .concat(),
                     tl!("Vector and raster data"),
@@ -4040,6 +4982,11 @@ impl RustGisApp {
                     }
                     return r;
                 }
+            }
+            // Save writes back to the document the project came from, where the phone allows it;
+            // Save As, and a project with no such document, ask where.
+            "ui.save" | "ui.saveAs" if self.services.save_project.is_some() => {
+                saveprompt::start_project_save(self, id == "ui.save")?;
             }
             // The browser can't write a file in place: Save downloads the project again under the
             // file name it was saved or opened as, and Save As (or a first Save) asks for one.
@@ -4143,8 +5090,8 @@ impl RustGisApp {
                 let li = self.session.active_layout.ok_or("open a layout first")?;
                 let l = self.session.project.layouts.get(li).cloned().ok_or("open a layout first")?;
                 if self.services.download.is_some() {
-                    let text = serde_json::to_string_pretty(&l).map_err(|e| e.to_string())?;
-                    self.download(&format!("{}.rgislayout", l.name), text.into_bytes());
+                    let bytes = rustgis_engine::project::layout_file_bytes(&l)?;
+                    self.download(&format!("{}.rgislayout", l.name), bytes);
                 } else if let Some(path) = dialogs::pick_save(&format!("{}.rgislayout", l.name), &["rgislayout"], tl!("RustGIS layout")) {
                     return self.run("layout.save", json!({"layout": li, "path": path}));
                 }
@@ -4179,8 +5126,37 @@ impl RustGisApp {
                 }
             }
             // Project items: save (a file dialog, or a download on the web) and open.
+            "ui.previewShapeConversion" => {
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    return readjob::run_shape_conversion(self, p.clone());
+                }
+                #[cfg(target_arch = "wasm32")]
+                {
+                    let result = self.run("edit.previewShapeConversion", p.clone());
+                    shapeconvert::landed(self, p.get("request").and_then(Value::as_u64), Landed::Ran(result.clone()));
+                    return result;
+                }
+            }
+            "ui.convertShape" => {
+                shapeconvert::open(self, p)?;
+            }
             "ui.saveItem" => {
                 let kind = p.get("kind").and_then(Value::as_str).ok_or("kind is required")?;
+                #[cfg(not(target_arch = "wasm32"))]
+                if kind == "fieldPackage" && self.reads_off_frame && self.services.download.is_none() {
+                    exportjob::idle(self)?;
+                    let name = rustgis_engine::cmd::field::suggested_name(&self.session, p);
+                    let Some(path) = dialogs::pick_save(&name, &["rgisfield"], tl!("RustGIS field package")) else {
+                        return Ok(Value::Null);
+                    };
+                    let mut params = p.clone();
+                    if let Some(fields) = params.as_object_mut() {
+                        fields.remove("kind");
+                        fields.insert("path".into(), json!(path));
+                    }
+                    return self.run("offline.package", params);
+                }
                 // A field package makes an offline area first: one not saved after all goes again.
                 let areas = self.session.project.offline_areas.len();
                 let session = &mut self.session;
@@ -4196,7 +5172,7 @@ impl RustGisApp {
                     // Not handed over (the failure is said): the area made for it goes too.
                     if self.download(&name, bytes) {
                         for note in notes {
-                            self.session.notify(note, false);
+                            self.session.say(note);
                         }
                     } else {
                         rustgis_engine::cmd::field::forget_new_areas(&mut self.session, areas);
@@ -4211,7 +5187,7 @@ impl RustGisApp {
                                 return Err(e.to_string());
                             }
                             for note in notes {
-                                self.session.notify(note, false);
+                                self.session.say(note);
                             }
                             self.session.notify(i18n::fmt("Saved {name}", &[("name", &path)]), false);
                         }
@@ -4409,7 +5385,10 @@ impl RustGisApp {
             "ui.pane.assistant" => match p.get("ask").and_then(Value::as_str).map(str::trim).filter(|t| !t.is_empty()) {
                 Some(text) => {
                     self.ui.open_right(RightPane::Assistant);
+                    // A message still waiting isn't lost to this one: it goes back to the box.
+                    assistant::unqueue(&mut self.assistant);
                     self.assistant.queued = Some(text.to_string());
+                    self.assistant.queued_from_box = false;
                 }
                 None => toggle_right(&mut self.ui, RightPane::Assistant),
             },
@@ -4653,65 +5632,81 @@ impl RustGisApp {
             "ui.exportLayer" if p.get("format").and_then(Value::as_str).is_none() => {
                 self.dialogs.open("exportLayer", &self.session)?;
             }
-            "ui.exportLayer" if self.services.download.is_some() => {
+            "ui.exportLayer" | "ui.annotationExport" if self.services.download.is_some() => {
+                let annotation_export = id == "ui.annotationExport";
                 let id = self.export_target(p)?;
                 let construction_notes = self.session.layer_construction_output_notes(id)?;
                 let l = self.session.map().layer(id).ok_or_else(|| tl!("select a layer in the Layers pane first").to_string())?;
                 // Any format the dialog offers here (`dialogs::export_formats`): not GeoPackage or
                 // FlatGeobuf, which the data crate refuses in the browser.
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
+                let download_ext = if ext == "shp" { "zip".to_string() } else { ext.clone() };
+                let name = annotation::export_name(self, id, &download_ext, annotation_export)?;
                 rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 // A streamed layer exports its whole source, not the features read for the view.
-                let (whole, lost) = if l.is_streamed() {
-                    let (ds, lost) = l.load_all_counted()?;
-                    (Some(ds), lost)
+                use std::borrow::Cow;
+                let (mut ds, lost) = if l.is_streamed() {
+                    let (dataset, lost) = l.load_all_counted()?;
+                    (Cow::Owned(dataset), lost)
                 } else {
-                    (None, Default::default())
+                    (Cow::Borrowed(&l.dataset), Default::default())
                 };
+                let query_report =
+                    rustgis_engine::data::export::filter_dataset(&mut ds, l.definition_query.as_deref()).map_err(|e| e.to_string())?;
+                let layer_name = l.name.clone();
                 // In the layer's own coordinate system, as share.exportLayer writes a file.
-                let ds = whole.as_ref().unwrap_or(&l.dataset);
                 use rustgis_engine::data::io;
-                let crs = io::default_export_crs(ds, &ext);
-                let written = io::write_bytes_in(ds, &ext, crs).map_err(|e| e.to_string());
-                let (bytes, left_out) = match written {
+                let (crs, default_note) = io::default_export_in(&ds, &name, self.session.project.coordinate_system);
+                let written = io::write_bytes_noted(&ds, &ext, crs, &name).map_err(|e| e.to_string());
+                let (bytes, left_out, unplaced, extent) = match written {
                     Ok(w) => w,
                     Err(e) => {
                         self.session.notify(e.clone(), true);
                         return Err(e);
                     }
                 };
-                let ext = if ext == "shp" { "zip".to_string() } else { ext };
-                let name = format!("{}.{ext}", l.name);
-                // The features written, read whole, give their own extent (not a raster's, or the
-                // one a streamed layer's source declares).
-                let mut notes = rustgis_engine::data::export_notes([(ds, ds.extent())], &name, crs);
-                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, ds, &lost);
-                let mut dbf_notes = Vec::new();
+                let ext = download_ext;
+                // The features written, read whole, give their own extent, in longitude/latitude
+                // (not a raster's, or the one a streamed layer's source declares), taken from the
+                // places converted for the download when it is written there.
+                let mut notes: rustgis_engine::data::loss::Notes = rustgis_engine::data::export_notes([(ds.as_ref(), extent)], &name, crs);
+                rustgis_engine::cmd::share::coalesce_read_zm(&mut notes, &name, &ds, &lost);
+                notes.extend(unplaced);
+                // Which system it is written in, where that isn't the layer's own, as share.exportLayer says.
+                notes.extend(default_note);
+                let mut dbf_notes = rustgis_engine::data::loss::Notes::new();
                 if ext == "zip" {
                     dbf_notes.extend(io::shapefile_names_note(&ds.fields, &name));
-                    dbf_notes.extend(io::shapefile_values_notes(ds, &name));
-                    dbf_notes.extend(io::shapefile_geometry_notes(ds, &name, crs));
+                    dbf_notes.extend(io::shapefile_values_notes(&ds, &name));
+                    dbf_notes.extend(io::shapefile_geometry_notes(&ds, &name, crs));
                 }
                 if matches!(ext.as_str(), "parquet" | "geoparquet") {
-                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(ds, &name));
+                    dbf_notes.extend(rustgis_engine::data::source::parquet::values_note(&ds, &name));
                 }
                 dbf_notes.extend(io::dates_as_text_note(&ds.fields, &name));
-                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(ds, &ext, &name));
+                dbf_notes.extend(rustgis_engine::cmd::share::gpkg_dates_note(&ds, &ext, &name));
                 if lost.rows > 0 {
-                    dbf_notes.push(format!("{name}: {} rows couldn't be read and were left out", lost.rows));
+                    dbf_notes.push(rustgis_engine::cmd::whole::unread_note(&name, lost.rows));
                 }
                 dbf_notes.extend(rustgis_engine::cmd::share::read_notes(&name, &l.name, &lost));
-                // CSV holds a point a row, GPX a name for each feature and no areas.
-                dbf_notes.extend(io::export_losses_notes(ds, &ext, io::name_field(ds), &name));
-                if let Some(note) = io::left_out_note(&name, &ext, left_out) {
-                    self.session.notify(note, false);
-                }
+                // CSV holds a point a row, GPX a name for each feature and no areas; reading text back, CSV reads blanks as null and KML and GPX trim it.
+                dbf_notes.extend(io::export_losses_notes(&ds, &ext, io::name_field(&ds), &name).map_err(|e| e.to_string())?);
+                // NaN and infinities, which GeoJSON can't hold, written as null.
+                let null_numbers = rustgis_engine::data::export::numbers_written_as_null(&ds.features, &ds.fields, &ext);
+                drop(ds);
+                // Said only once the download is taken, as the other notes are.
+                dbf_notes.extend(io::left_out_note(&name, &ext, left_out));
                 if ext == "zip" && rustgis_engine::data::raster::wkt::to_wkt(crs).is_none() {
-                    self.session.notify(format!("{name}: no .prj written, as {} has no WKT form", crs.label()), false);
+                    dbf_notes.push(rustgis_engine::data::loss::Note::loss(
+                        rustgis_engine::data::loss::LossCode::DroppedCrsName,
+                        format!("{name}: no .prj written, as {} has no WKT form", crs.label()),
+                    ));
                 }
                 if self.download(&name, bytes) {
+                    rustgis_engine::cmd::share::notify_export_query(&mut self.session, &name, &layer_name, &query_report);
+                    rustgis_engine::cmd::share::notify_null_numbers(&mut self.session, &name, null_numbers);
                     for note in notes.into_iter().chain(dbf_notes).chain(construction_notes) {
-                        self.session.notify(note, false);
+                        self.session.say(note);
                     }
                 }
             }
@@ -4798,7 +5793,8 @@ impl RustGisApp {
                     return self.run("share.exportMap", args);
                 }
             }
-            "ui.exportLayer" => {
+            "ui.exportLayer" | "ui.annotationExport" => {
+                let annotation_export = id == "ui.annotationExport";
                 let ext = p.get("format").and_then(Value::as_str).unwrap_or("geojson").to_ascii_lowercase();
                 let label = dialogs::EXPORT_FORMATS
                     .iter()
@@ -4809,6 +5805,7 @@ impl RustGisApp {
                 // Checked as the command checks them, before a file is asked for; then passed on.
                 let gpkg = rustgis_engine::cmd::share::gpkg_table(p, &ext)?;
                 let id = self.export_target(p)?;
+                let name = annotation::export_name(self, id, &ext, annotation_export)?;
                 let with_table = |mut args: Value| {
                     for key in ["mode", "tableName"] {
                         if let Some(v) = p.get(key) {
@@ -4827,7 +5824,6 @@ impl RustGisApp {
                     }
                     return Ok(Value::Null);
                 }
-                let name = self.session.map().layer(id).map(|l| format!("{}.{ext}", l.name)).unwrap_or_default();
                 if let Some(path) = dialogs::pick_save(&name, &[ext.as_str()], label) {
                     // The format chosen decides: its extension is added unless it was typed (a dot
                     // in the name, as in "U.S. Cities", isn't taken for one).
@@ -4884,6 +5880,20 @@ impl RustGisApp {
                     let id = self.session.layer_id(p)?;
                     let form = geometrycalc::Form::new(&self.session, id)?;
                     self.dialogs = dialogs::Dialogs { open: Some("calculateGeometry"), geometry: Some(form), ..Default::default() };
+                    return Ok(Value::Null);
+                }
+                if which == "publicationWizard" {
+                    // Opened again while open, it keeps what was entered.
+                    if self.dialogs.open != Some("publicationWizard") || self.dialogs.publication.is_none() {
+                        let draft = publicationwizard::Draft::new(&self.session);
+                        self.dialogs = dialogs::Dialogs { open: Some("publicationWizard"), publication: Some(draft), ..Default::default() };
+                    }
+                    return Ok(Value::Null);
+                }
+                if which == "offlineConflicts" {
+                    let area = p.get("area").and_then(Value::as_str).ok_or_else(|| tl!("Name the offline area.").to_string())?;
+                    let form = conflictsui::Form::new(&self.session, area)?;
+                    self.dialogs = dialogs::Dialogs { open: Some("offlineConflicts"), conflicts: Some(form), ..Default::default() };
                     return Ok(Value::Null);
                 }
                 if matches!(which, "repairSource" | "repairTiles") {
@@ -5029,7 +6039,13 @@ impl RustGisApp {
                 }
                 return self.poll_data_downloads();
             }
-            if let Err(e) = r.and_then(|bytes| self.open_project_bytes(project_file_name(&url), &bytes)) {
+            // Opened as received from where it was read: what it names reaches no wider.
+            if let Err(e) = r.and_then(|(bytes, reach)| {
+                let was = self.session.receiving(Some(reach));
+                let r = self.open_project_bytes(project_file_name(&url), &bytes);
+                self.session.receiving(was);
+                r
+            }) {
                 self.session.notify(rustgis_engine::sources::message_with_address(&url, &e), true);
             }
         }
@@ -5144,6 +6160,9 @@ impl RustGisApp {
             if public || check_origin.is_some() || claim.is_none() {
                 rustgis_engine::cmd::layer::mark_url_reach(bound_url, check_origin, public);
             }
+            // A byte range of a GRIB file (`"bytes"`), checked as the command checks it: only that
+            // range is downloaded (below), never probed, and read as the file.
+            let range = rustgis_engine::cmd::layer::byte_range(p, url)?;
             // A window of a cloud-optimised GeoTIFF is read off the frame (below), with no
             // probe: it is refused unless it is one. In the browser the command refuses it.
             let window = cfg!(not(target_arch = "wasm32")) && p.get("bbox").is_some_and(|v| !v.is_null());
@@ -5176,7 +6195,7 @@ impl RustGisApp {
                 && !tiff
                 && rustgis_engine::cmd::layer::is_unnamed_url(url)
                 && ["service", "coverage"].iter().all(|k| p.get(*k).and_then(Value::as_bool) != Some(true));
-            if !window && (remote || tiff || unnamed) && !scan && p.get("whole").and_then(Value::as_bool) != Some(true) {
+            if range.is_none() && !window && (remote || tiff || unnamed) && !scan && p.get("whole").and_then(Value::as_bool) != Some(true) {
                 let slot: Slot<Result<bool, String>> = Slot::default();
                 let land = slot.clone();
                 if remote {
@@ -5214,13 +6233,21 @@ impl RustGisApp {
                 self.ui.cog_probes.push((probe, claim, slot));
                 return Ok(Value::Null);
             }
-            let url = address;
+            let url = match range {
+                Some(r) => rustgis_engine::cmd::layer::ranged_address(&address, r),
+                None => address,
+            };
             // The request receipt is correlation only; its admitted claim stays outside JSON.
             let mut q = json!({"url": url});
             for k in ["name", "layer", "crs", "connection", "from"] {
                 if let Some(v) = p.get(k).filter(|v| v.as_str().is_some_and(|s| !s.trim().is_empty())) {
                     q[k] = v.clone();
                 }
+            }
+            // A PDF's page may be given as a number too (#2336): any other value is passed on as
+            // given, for `layer.addDownload` to refuse rather than open the first page.
+            if let Some(v) = p.get("layer").filter(|v| !v.is_null() && !v.is_string()) {
+                q["layer"] = v.clone();
             }
             // How the bytes are read, as `layer.addData` takes it (a command asking by
             // address, such as a plugin's: the dialog gives none of these).
@@ -5246,6 +6273,11 @@ impl RustGisApp {
                 if p.get(k).and_then(Value::as_bool) == Some(true) {
                     q[k] = json!(true);
                 }
+            }
+            // A coverage's own system it was asked for in (`service.coverage`'s "crs"), for an
+            // answer that doesn't say it.
+            if let Some(crs) = p.get("coverageCrs").filter(|v| v.is_string()) {
+                q["coverageCrs"] = crs.clone();
             }
             if let Some(from_document) = p.get("fromDocument").and_then(Value::as_bool) {
                 q["fromDocument"] = json!(from_document);
@@ -5283,14 +6315,39 @@ impl RustGisApp {
             let watch = std::sync::Arc::downgrade(&slot);
             let wanted: rustgis_engine::render::rustgis_tiles::cache::Still = std::sync::Arc::new(move || watch.strong_count() > 1);
             let progress = std::sync::Arc::<rustgis_engine::render::rustgis_tiles::cache::Progress>::default();
+            let reach: Slot<Reach> = Slot::default();
+            let read_at = reach.clone();
+            let project = q.get("geolibreProject").and_then(Value::as_bool) == Some(true);
             // A Shapefile address brings its companion parts under the same download owner.
             rustgis_engine::render::rustgis_tiles::cache::with_still(wanted, || {
                 rustgis_engine::render::rustgis_tiles::cache::with_progress(Some(progress.clone()), || {
+                    // A GeoLibre project, with where it was read: what it names reaches no wider.
+                    if project && !public {
+                        return rustgis_engine::render::rustgis_tiles::cache::download_detailed_with_origin(
+                            &url,
+                            rustgis_engine::map::geolibre::MAX_TEXT,
+                            Box::new(move |r| {
+                                let r = r
+                                    .map(|fetched| {
+                                        *read_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(fetched.origin.reach());
+                                        fetched.bytes
+                                    })
+                                    .map_err(|failure| failure.message);
+                                *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r);
+                            }),
+                        );
+                    }
+                    if project {
+                        *read_at.lock().unwrap_or_else(|e| e.into_inner()) = Some(Reach::Public);
+                    }
                     rustgis_engine::cmd::layer::download_data_from(
                         &url,
                         public,
                         if q.get("geolibreProject").and_then(Value::as_bool) == Some(true) {
                             rustgis_engine::map::geolibre::MAX_TEXT
+                        } else if let Some((first, last)) = range {
+                            // A range's answer may be no longer than the range.
+                            usize::try_from(last - first + 1).unwrap_or(usize::MAX)
                         } else {
                             rustgis_engine::render::rustgis_tiles::cache::MAX_DOWNLOAD
                         },
@@ -5298,7 +6355,7 @@ impl RustGisApp {
                     )
                 })
             });
-            self.ui.downloads.push(Download { id, url, params: q, slot, progress });
+            self.ui.downloads.push(Download { id, url, params: q, slot, progress, reach });
 
             Ok(Value::Null)
         })
@@ -5381,18 +6438,80 @@ impl RustGisApp {
             }
         }
         let mut landed = Vec::new();
+        let mut read_at = Vec::new();
         self.ui.downloads.retain(|d| match d.slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
             Some(r) => {
                 landed.push((d.id, d.url.clone(), d.params.clone(), r));
+                if let Some(reach) = d.reach.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                    read_at.push((d.id, reach));
+                }
                 false
             }
             None => true,
         });
+        for (id, reach) in read_at {
+            self.session.download_read_at(id, reach);
+        }
         for (id, url, mut p, r) in landed {
             let origin = connectiontree::take_origin_key(&mut p);
+            // A range's answer shorter than the range is refused, never read as the record.
+            let r = r
+                .map_err(|e| rustgis_engine::cmd::layer::range_failed(&url, e))
+                .and_then(|bytes| rustgis_engine::cmd::layer::check_range_answer(&url, &bytes).map(|()| bytes));
             match r {
-                Ok(bytes) => self.add_landed(serviceui::Landed { id, url, params: p, origin }, bytes),
+                Ok(bytes) => {
+                    let landed = serviceui::Landed { id, url, params: p, origin };
+                    // A PDF's page is drawn, and a GRIB file read, on a thread first, so a large one
+                    // doesn't hold the window.
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if let Some(page) = rustgis_engine::cmd::raster::download_page(&landed.url, &landed.params, &bytes) {
+                        self.draw_page(landed, bytes, page);
+                        continue;
+                    }
+                    self.add_landed(landed, bytes);
+                }
                 Err(e) => self.landed_failed(id, &url, &p, e),
+            }
+        }
+        // PDF pages drawn (and GRIB files read) on threads, added with their downloads' bytes.
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let mut drawn = Vec::new();
+            for (landed, slot, left) in std::mem::take(&mut self.ui.page_reads) {
+                let read = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+                match read {
+                    Some(r) => drawn.push((landed, r)),
+                    None => {
+                        left.store(!self.session.download_under_way(landed.id), std::sync::atomic::Ordering::Relaxed);
+                        self.ui.page_reads.push((landed, slot, left));
+                    }
+                }
+            }
+            for (landed, r) in drawn {
+                match r {
+                    Ok((bytes, page)) => {
+                        let current = self.session.download_landed_page(landed.id, bytes, page);
+                        self.add_download(landed, current);
+                    }
+                    Err(e) => self.landed_failed(landed.id, &landed.url, &landed.params, e),
+                }
+            }
+            // One waiting whose project was closed meanwhile is given up, and said, rather than
+            // drawn for nothing while it holds the turn.
+            let (waiting, gone): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut self.ui.page_queue).into_iter().partition(|(l, ..)| self.session.download_under_way(l.id));
+            self.ui.page_queue = waiting;
+            for (landed, ..) in gone {
+                let why = tl!("given up before it was read: its project was closed, or more than 64 downloads started after it");
+                self.landed_failed(landed.id, &landed.url, &landed.params, why.to_string());
+            }
+            // Those waiting take the places freed, oldest first.
+            while !self.ui.page_queue.is_empty() && self.ui.page_reads.len() + self.ui.window_reads.len() < MAX_WINDOW_READS {
+                let (landed, bytes, page) = self.ui.page_queue.remove(0);
+                // Not started (no thread to be had): it waits at the front for a later frame.
+                if !self.draw_page(landed, bytes, page) {
+                    break;
+                }
             }
         }
         // Windows read on threads, added as a download is.
@@ -5432,7 +6551,10 @@ impl RustGisApp {
         };
         let downloads = self.ui.downloads.iter().map(|d| shown(d.id, &d.url, Some(&d.progress)));
         #[cfg(not(target_arch = "wasm32"))]
-        let downloads = downloads.chain(self.ui.window_reads.iter().map(|(id, url, ..)| shown(*id, url, None)));
+        let downloads = downloads
+            .chain(self.ui.window_reads.iter().map(|(id, url, ..)| shown(*id, url, None)))
+            .chain(self.ui.page_reads.iter().map(|(l, ..)| shown(l.id, &l.url, None)))
+            .chain(self.ui.page_queue.iter().map(|(l, ..)| shown(l.id, &l.url, None)));
         let mut under_way: Vec<_> = downloads.collect();
         under_way.sort_by_key(|d| d.id);
         under_way
@@ -5454,6 +6576,22 @@ impl RustGisApp {
             let (_, url, p, _, left) = self.ui.window_reads.remove(i);
             left.store(true, std::sync::atomic::Ordering::Relaxed);
             Some((url, p))
+        });
+        // A PDF page or GRIB file waiting for its turn gives it up; a GRIB file being read stops
+        // once the message or band under way is done ([`read_download`]), and a page being drawn
+        // is left to finish, its page dropped (drawing a page is one step that can't be stopped).
+        #[cfg(not(target_arch = "wasm32"))]
+        let cancelled = cancelled.or_else(|| {
+            let i = self.ui.page_reads.iter().position(|(l, ..)| l.id == id)?;
+            let (landed, _, left) = self.ui.page_reads.remove(i);
+            left.store(true, std::sync::atomic::Ordering::Relaxed);
+            Some((landed.url, landed.params))
+        });
+        #[cfg(not(target_arch = "wasm32"))]
+        let cancelled = cancelled.or_else(|| {
+            let i = self.ui.page_queue.iter().position(|(l, ..)| l.id == id)?;
+            let (landed, ..) = self.ui.page_queue.remove(i);
+            Some((landed.url, landed.params))
         });
         let Some((url, mut p)) = cancelled else { return };
         connectiontree::take_origin_key(&mut p);
@@ -5490,7 +6628,8 @@ impl RustGisApp {
         seen: Option<[f64; 4]>,
     ) -> Result<Value, String> {
         let asked = rustgis_engine::cmd::layer::window_asked_in(&self.session, p, seen).and_then(|asked| {
-            if self.ui.window_reads.len() >= MAX_WINDOW_READS {
+            // PDF pages being drawn take places too.
+            if self.ui.window_reads.len() + self.ui.page_reads.len() >= MAX_WINDOW_READS {
                 return Err(i18n::fmt(
                     "{url}: {count} windows are being read already: ask again once one has been added",
                     &[("url", &rustgis_engine::sources::address_in_message(&url)), ("count", &MAX_WINDOW_READS.to_string())],
@@ -5508,7 +6647,7 @@ impl RustGisApp {
         })?;
         // What a task needs to read it again, as the download itself can't be (`record_step`).
         let mut window = json!({});
-        for k in ["bbox", "cellSize", "cog"] {
+        for k in rustgis_engine::policy::WINDOW_KEYS {
             if let Some(v) = p.get(k).filter(|v| !v.is_null()) {
                 window[k] = v.clone();
             }
@@ -5567,6 +6706,63 @@ impl RustGisApp {
         let id = claim.unwrap_or_else(|| self.session.download_started());
         self.ui.window_reads.push((id, url, q, slot, left));
         Ok(Value::Null)
+    }
+
+    /// Draws a downloaded PDF's page, or reads a downloaded GRIB file, on a thread
+    /// ([`rustgis_engine::cmd::raster::read_download_shared_page`]),
+    /// to be added with its bytes once drawn ([`UiState::page_reads`]). `page`: its file name, page
+    /// and whether it is placed ([`download_page`]). Drawn one at a time with the windows' reads;
+    /// past [`MAX_WINDOW_READS`] under way, or where the OS gives no thread, it waits in
+    /// [`UiState::page_queue`] and is tried again each frame: held, listed under way and
+    /// cancellable, until a thread can be had (never drawn on the frame, and the download isn't
+    /// lost). Whether it started now. Cancel takes it
+    /// off the list and gives up its turn; a GRIB file's read under way stops once the message or
+    /// band it is on is done ([`read_download`]), and a drawing under way (one step the renderer
+    /// can't stop) finishes, its page dropped.
+    ///
+    /// [`download_page`]: rustgis_engine::cmd::raster::download_page
+    #[cfg(not(target_arch = "wasm32"))]
+    fn draw_page(&mut self, landed: serviceui::Landed, bytes: Vec<u8>, (name, page, place): (String, Option<String>, bool)) -> bool {
+        if self.ui.page_reads.len() + self.ui.window_reads.len() >= MAX_WINDOW_READS {
+            self.ui.page_queue.push((landed, bytes, (name, page, place)));
+            return false;
+        }
+        let asked = (name.clone(), page.clone(), place);
+        let slot: PageRead = Slot::default();
+        let land = slot.clone();
+        let left = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let leaving = left.clone();
+        // Kept here too, so a thread the OS refuses doesn't take the download with it.
+        let bytes = std::sync::Arc::new(bytes);
+        let mine = bytes.clone();
+        let spawned = std::thread::Builder::new().name("download-read".into()).spawn(move || {
+            let turn = window_turn(&leaving);
+            let read = match turn {
+                // On a thread no command's catch reaches: a bug must not leave it running forever.
+                Some(_) => read_download(&name, &bytes, page.as_deref(), place, &leaving),
+                None => Err(tl!("given up before it was read: it was cancelled, or its project was closed").to_string()),
+            };
+            let bytes = std::sync::Arc::try_unwrap(bytes).unwrap_or_else(|shared| (*shared).clone());
+            *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(read.map(|r| (bytes, r)));
+            // As a window's read: the next read waits for the frame to take this one (or for it to
+            // be cancelled, or the app to be gone), so one read raster at most waits to be added.
+            while std::sync::Arc::strong_count(&land) > 1 && land.lock().unwrap_or_else(|e| e.into_inner()).is_some() {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            drop(turn);
+        });
+        match spawned {
+            Ok(_) => {
+                drop(mine);
+                self.ui.page_reads.push((landed, slot, left));
+            }
+            Err(_) => {
+                let bytes = std::sync::Arc::try_unwrap(mine).unwrap_or_else(|shared| (*shared).clone());
+                self.ui.page_queue.insert(0, (landed, bytes, asked));
+                return false;
+            }
+        }
+        true
     }
 
     /// Adds a download that landed (`layer.addDownload`), named in Recent after the connection it
@@ -5717,7 +6913,14 @@ impl RustGisApp {
                         self.ui.service_steps.push(ServiceStep::Tiles { resolve, dialog, origin, opened });
                         continue;
                     };
-                    let next = r.ok().and_then(|body| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
+                    // Where the document was read, as its fetch observed it (one that failed: what
+                    // it was asked within). Recorded again for one read from the internet, so
+                    // `service.add` sees it whatever the record says by now.
+                    let read_at = r.as_ref().map_or_else(|_| cache::ceiling_for(&resolve.doc), |(_, reach)| *reach);
+                    if read_at == Reach::Public {
+                        cache::restrict_to_public(&resolve.doc);
+                    }
+                    let next = r.ok().and_then(|(body, _)| resolve_tiles(&resolve.list, &resolve.doc, &body, resolve.vector));
                     let next = next.map(|resolved| {
                         resolve.withheld_addresses = resolve.withheld_addresses.saturating_add(resolved.withheld_addresses);
                         resolved.step
@@ -5727,12 +6930,18 @@ impl RustGisApp {
                             resolve.read += 1;
                             // The resolver already carried the current document's binding, or
                             // its absence. A saved connection must not restore it after a hop.
-                            match rustgis_engine::render::rustgis_tiles::address::check(&next, Some(&resolve.doc)) {
+                            // Judged by where the list was read (its record), not by how its
+                            // address is spelled: a public-looking name may connect on the local network.
+                            match rustgis_engine::render::rustgis_tiles::address::check_reach(&next, read_at) {
                                 Ok(()) => {
                                     resolve.crossed_origin |= rustgis_engine::render::rustgis_tiles::logins::origin(&resolve.doc)
                                         != rustgis_engine::render::rustgis_tiles::logins::origin(&next);
+                                    // A tile set document read from the internet leads only there.
+                                    if read_at == Reach::Public {
+                                        cache::restrict_to_public(&next);
+                                    }
                                     resolve.doc = next;
-                                    resolve.slot = fetch_into(&resolve.doc);
+                                    resolve.slot = fetch_document_reaching(&resolve.doc);
                                 }
                                 Err(e) => {
                                     self.notice_service_query_loss(resolve.withheld_addresses);
@@ -5749,6 +6958,11 @@ impl RustGisApp {
                             rustgis_engine::render::rustgis_tiles::logins::inner(&resolve.fallback),
                         ),
                     };
+                    // After a tile set document read from the internet, the tiles come only from
+                    // there: the template it names, or the usual one in its place.
+                    if read_at == Reach::Public {
+                        cache::restrict_to_public(&template);
+                    }
                     resolve.crossed_origin |= rustgis_engine::render::rustgis_tiles::logins::origin(&resolve.doc)
                         != rustgis_engine::render::rustgis_tiles::logins::origin(&template);
                     self.notice_service_query_loss(resolve.withheld_addresses);
@@ -5768,7 +6982,7 @@ impl RustGisApp {
                     self.report_step(dialog, pending.as_deref(), r);
                     self.map.invalidate();
                 }
-                ServiceStep::Coverage { mut params, slot, dialog, origin, opened } => {
+                ServiceStep::Coverage { mut params, describe, slot, dialog, origin, opened } => {
                     if !self.service_read_current(
                         opened,
                         params.get("url").and_then(Value::as_str).unwrap_or(""),
@@ -5777,17 +6991,30 @@ impl RustGisApp {
                         continue;
                     }
                     let Some(r) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() else {
-                        self.ui.service_steps.push(ServiceStep::Coverage { params, slot, dialog, origin, opened });
+                        self.ui.service_steps.push(ServiceStep::Coverage { params, describe, slot, dialog, origin, opened });
                         continue;
                     };
                     let title = params["name"].as_str().unwrap_or("").to_string();
-                    let r = r.and_then(|bytes| {
+                    let r = r.and_then(|(bytes, reach)| {
+                        // Recorded again for one read from the internet, so `service.coverage`
+                        // holds the request built from it there whatever the record says by now.
+                        if reach == Reach::Public {
+                            cache::restrict_to_public(&describe);
+                        }
                         params["describe"] = json!(String::from_utf8_lossy(&bytes));
                         // Not `self.run`: an error belongs where the step reports, not the notices.
                         let c = self.session.run("service.coverage", &params)?;
                         let connection = params.as_object_mut().and_then(|p| p.remove("connection"));
                         let get = c.get("url").and_then(Value::as_str).unwrap_or("").to_string();
                         let mut p = json!({"url": get, "name": title, "coverage": true});
+                        // The system it was asked in, for an answer that doesn't say it.
+                        if let Some(crs) = c.get("coverageCrs").and_then(Value::as_str) {
+                            p["coverageCrs"] = json!(crs);
+                        }
+                        // Its service's document came from the internet: so does the coverage.
+                        if cache::ceiling_for(&get) == Reach::Public {
+                            p["fromDocument"] = json!(true);
+                        }
                         if params.get("anonymous").and_then(Value::as_bool) == Some(true)
                             || c.get("anonymous").and_then(Value::as_bool) == Some(true)
                         {
@@ -5865,17 +7092,32 @@ impl RustGisApp {
 
     /// Per-frame work that doesn't draw (theme, fonts, files that arrived).
     pub fn logic(&mut self, ctx: &egui::Context) {
+        annotation::sync(self);
         #[cfg(not(target_arch = "wasm32"))]
         self.session.statistics_need_read_ahead(self.reads_off_frame);
+        // A field package opened by a way other than `run` (a script on the file bridge) has its
+        // rows kept as one opened here does: the read takes them, so this starts it once.
+        #[cfg(not(target_arch = "wasm32"))]
+        if self.reads_off_frame
+            && self.session.field_rows_waiting()
+            && let Err(e) = readjob::run(self, "offline.keepRows", json!({}))
+        {
+            self.keep_refused(&e);
+        }
         let _diagnostics = self.session.diagnostics.enter();
         // What this thread draws (an image, a print, a page, a preview, an agent's snapshot)
         // never waits for cast shadows still being worked out: it says they were (Never hold the
         // window). Exports drawn off it wait for them.
         rustgis_engine::render::on_the_interface_thread();
+        // Layers landed from a background read meanwhile learn their map's system too.
+        self.session.note_shown_systems();
         // A pass egui asks to repeat is the same frame: `ui` sets the delay once, from the first pass.
         if ctx.current_pass_index() == 0 {
             self.frame_start = Some(web_time::Instant::now());
         }
+        // An extension turned off while the last frame was drawn stops its work first: the AI
+        // Assistant's agent threads lose their relay access before the relay runs anything.
+        extensionsui::persist(self);
         // The MCP relay: what attached agents sent runs here, on this session, before the frame
         // draws (Session lives on this thread; the listener only queues messages).
         #[cfg(not(target_arch = "wasm32"))]
@@ -5983,9 +7225,9 @@ impl RustGisApp {
         if self.session.plugin_retries_waiting() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
-        // A window's read lands after its last tile, with nothing to wake the frame.
+        // A window's read, or a PDF page's drawing, lands with nothing to wake the frame.
         #[cfg(not(target_arch = "wasm32"))]
-        if !self.ui.window_reads.is_empty() {
+        if !self.ui.window_reads.is_empty() || !self.ui.page_reads.is_empty() || !self.ui.page_queue.is_empty() {
             ctx.request_repaint_after(std::time::Duration::from_millis(100));
         }
         // Zarr steps the time slider moved to, read off the frame, show once they land.
@@ -6030,44 +7272,65 @@ impl RustGisApp {
         geolibreui::poll(self, ctx);
         pluginsui::poll(self, ctx);
         extensionsui::persist(self);
-        assistantpane::poll(self, ctx);
+        assistant::poll(self, ctx);
         // A project the MCP relay, the assistant or a plugin opened or saved this frame (they run
         // on the session directly) becomes Last Project now, not a frame later the app may not
         // reach.
         self.note_last_project();
         saveprompt::close_requested(self, ctx);
-        autosave::tick(self, ctx);
+        if !self.autosave.phone {
+            autosave::tick(self, ctx);
+        }
         #[cfg(not(target_arch = "wasm32"))]
         if self.watch_files {
             diskwatch::tick(self, ctx);
         }
         #[cfg(not(target_arch = "wasm32"))]
         syncmark::tick(self);
+        // On native apps this final fallback observes missing text in tables, plugin panels
+        // and language pickers. Web eframe's earlier canvas fallback can draw UI-only misses.
+        // This observer queues work only; no network or file I/O runs in shaping.
+        ctx.add_glyph_rasterizer(egui::epaint::text::GlyphRasterizer::new("rustgis::missing-font", |request| {
+            for c in request.cluster.chars() {
+                rustgis_engine::render::fonts::note_missing_script(c);
+            }
+            None
+        }));
         self.ensure_script_font();
+        self.ensure_data_cjk_font(ctx);
+        self.ensure_other_script_fonts(ctx);
         // Fonts downloaded by the web app.
         let fonts: Vec<(String, Vec<u8>)> = match &self.services.font_inbox {
             Some(inbox) => std::mem::take(&mut *inbox.lock().unwrap_or_else(|e| e.into_inner())),
             None => Vec::new(),
         };
         for (url, bytes) in fonts {
-            use rustgis_engine::render::fonts::{CjkRegion, ScriptFont, script_font_url, valid_font};
-            let region = [CjkRegion::SimplifiedChinese, CjkRegion::TraditionalChinese, CjkRegion::Japanese, CjkRegion::Korean]
-                .map(ScriptFont::Cjk)
-                .into_iter()
-                .chain([ScriptFont::Arabic, ScriptFont::Bengali, ScriptFont::Lao])
-                .find(|r| script_font_url(*r) == Some(url.as_str()));
-            if bytes.is_empty() || !valid_font(&bytes, 0) {
+            use rustgis_engine::render::fonts::{ScriptFont, script_font_url};
+            let region = ScriptFont::ALL.into_iter().find(|r| script_font_url(*r) == Some(url.as_str()));
+            let Some(known) = region else { continue };
+            if !valid_script_download(&bytes, known) {
                 // A failed download: say so; picking the language again retries.
                 log::error!("{url}: no usable font downloaded");
                 // Name the language whose font failed (not the current one), in English: its own
                 // script has no font yet.
-                let language = i18n::Lang::all()
-                    .find(|l| region.is_some_and(|r| Self::script_region(l.script()) == Some(r)))
-                    .unwrap_or(self.chosen_lang());
-                let msg = i18n::fmt(
-                    "Couldn't download the font for {language}; pick the language again to retry.",
-                    &[("language", language.english())],
-                );
+                let chosen = self.chosen_lang();
+                let language = if Self::script_region(chosen.script()) == region {
+                    chosen
+                } else {
+                    i18n::Lang::all().find(|l| region.is_some_and(|r| Self::script_region(l.script()) == Some(r))).unwrap_or(chosen)
+                };
+                let for_data = self.fonts_for_data.contains(&known);
+                let msg = if for_data {
+                    i18n::fmt(
+                        "Couldn't download or validate the font for the {script} text, so those characters cannot be displayed or exported; pick a language in Settings › Language to retry.",
+                        &[("script", fallback_script_name(known))],
+                    )
+                } else {
+                    i18n::fmt(
+                        "Couldn't download or validate the font for {language}; pick the language again to retry.",
+                        &[("language", language.english())],
+                    )
+                };
                 self.session.notify(msg, true);
                 if let Some(r) = region {
                     let name = format!("script-{r:?}");
@@ -6079,12 +7342,9 @@ impl RustGisApp {
             // The renderer (exported images and PDFs, the layout view) has no installed CJK
             // font in the browser either: it draws CJK text with this face too. It keeps the
             // face for good, and the interface shares those bytes rather than a second copy.
-            let face = match region {
-                Some(ScriptFont::Cjk(r)) => match rustgis_engine::render::fonts::add_downloaded_cjk_font(r, bytes) {
-                    Ok(kept) => egui::FontData::from_static(kept),
-                    Err(bytes) => egui::FontData::from_owned(bytes),
-                },
-                _ => egui::FontData::from_owned(bytes),
+            let face = match rustgis_engine::render::fonts::add_downloaded_script_font(known, bytes) {
+                Ok(kept) => egui::FontData::from_static(kept),
+                Err(bytes) => egui::FontData::from_owned(bytes),
             };
             let name = format!("web-{}", url.rsplit('/').next().unwrap_or("font"));
             self.extra_fonts.retain(|(n, _, _)| *n != name);
@@ -6094,6 +7354,19 @@ impl RustGisApp {
         if self.fonts_dirty {
             self.fonts_dirty = false;
             self.installed_region = self.current_region();
+            // Ideographs in exports and the layout view take the interface's regional forms when
+            // its face was downloaded, though another region's was downloaded before; with another
+            // interface language, those of the region the map's ideographs were downloaded in
+            // (`han_region`), so a face downloaded for kana or Hangul doesn't take them over.
+            if self.services.fetch_font.is_some() {
+                let han = self.han_region();
+                rustgis_engine::render::fonts::prefer_downloaded_cjk(Some(han));
+                // The interface falls back to the extra faces in order: that region's first, so
+                // the ideographs it draws take the same forms, whichever face arrived first.
+                put_first(&mut self.extra_fonts, rustgis_engine::render::fonts::ScriptFont::Cjk(han));
+            }
+            self.language_coverage = None;
+            self.other_scripts_handled.clear();
             theme::install_fonts(ctx, &self.extra_fonts, self.installed_region);
             self.fonts_pending = true;
             self.map.invalidate();
@@ -6148,6 +7421,15 @@ impl RustGisApp {
         for (name, bytes) in arrived {
             let _ = self.open_picked(&name, &bytes);
         }
+        // A script file for the Script pane's Load…, opened with the context its undo needs; said,
+        // not dropped, if something in the inbox started a run meanwhile.
+        if let Some(script) = self.workflow.script_picked.take() {
+            if analysispane::script_running(self) {
+                self.session.notify(tl!("Wait for the run to finish").to_string(), true);
+            } else {
+                analysispane::open_script(self, ctx, script);
+            }
+        }
         // Files dropped on the desktop window arrive as paths. (The web shell reads browser drops
         // asynchronously and passes them through the inbox instead.)
         if !cfg!(target_arch = "wasm32") {
@@ -6192,13 +7474,15 @@ impl RustGisApp {
             self.add_cjk_fallback();
             self.add_symbol_fallback();
             self.installed_region = self.current_region();
+            self.language_coverage = None;
+            self.other_scripts_handled.clear();
             theme::install_fonts(ctx, &self.extra_fonts, self.installed_region);
             self.fonts_pending = true;
         }
         // Switch the drawn language once its font can draw it; until then keep the previous one.
         let chosen = self.chosen_lang();
         if self.shown_lang != chosen {
-            if self.can_draw(chosen) {
+            if self.can_draw(ctx, chosen) {
                 self.shown_lang = chosen;
                 self.map.invalidate();
             } else if self.fonts_pending {
@@ -6249,6 +7533,7 @@ impl RustGisApp {
         self.themes_revision
     }
 
+    /// Draws the current workspace and processes toolbar actions once the interface fonts are ready.
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let _diagnostics = self.session.diagnostics.enter();
         // See `logic`.
@@ -6268,12 +7553,13 @@ impl RustGisApp {
         fieldmenu::play(self, &ctx);
         chrome::shortcuts(self, &ctx);
         panes::follow_layer_filter(self);
-        // A Zarr summary, a trend, a workflow, an export or a read running on its thread lands
+        // A Zarr summary or point series, a trend, a workflow, an export or a read running on its thread lands
         // whatever is in view, the File menu's backstage too, so a project saved there holds it
         // (all are looked at: `|`, not `||`), and the frames go on while one runs so it's taken
         // when it ends.
         #[cfg(not(target_arch = "wasm32"))]
         if workspacepanes::land_summary(self)
+            | workspacepanes::land_series(self)
             | analysispane::land_trend(self)
             | analysispane::land_job(self)
             | exportjob::land(self)
@@ -6338,6 +7624,22 @@ impl RustGisApp {
             self.sent_title = title;
         }
         pluginstart::frame_drawn(self, &ctx);
+        // Cancel, save prompts and any project changes from UI controls take effect first.
+        chrome::advance_history_jump(self, &ctx);
+        // Capture and photo attachment land during UI handling. Submit a due checkpoint
+        // in the same frame, after those edits.
+        if self.autosave.phone {
+            autosave::tick(self, &ctx);
+        }
+        // Missing text first drawn this frame needs a next logic pass even without input.
+        // Handled requests wait for their result instead of keeping an idle window repainting.
+        if rustgis_engine::render::fonts::peek_missing_cjk().iter().any(|s| !self.cjk_scripts_handled.contains(s))
+            || rustgis_engine::render::fonts::peek_missing_text()
+                .iter()
+                .any(|(s, _)| !matches!(s, rustgis_engine::render::fonts::ScriptFont::Cjk(_)) && !self.other_scripts_handled.contains(s))
+        {
+            ctx.request_repaint();
+        }
         // egui times clicks by the frame they arrive in: at a slow frame rate the two clicks of a
         // double-click land too far apart for its default delay (#1321). It reads the delay when
         // the next frame begins, before that frame's `logic`, so it's set here, from this frame's
@@ -6365,6 +7667,626 @@ fn project_file_name(url: &str) -> Option<&str> {
 /// still read as two.
 fn double_click_delay(dt: f32) -> f64 {
     (0.3 + 2.0 * f64::from(dt)).clamp(0.5, 1.2)
+}
+
+/// Names a script without guessing a data string's language from the current UI preference.
+fn fallback_script_name(script: rustgis_engine::render::fonts::ScriptFont) -> &'static str {
+    use rustgis_engine::render::fonts::ScriptFont;
+    match script {
+        ScriptFont::Latin => tl!("Latin"),
+        ScriptFont::Arabic => tl!("Arabic script"),
+        ScriptFont::Bengali => tl!("Bengali"),
+        ScriptFont::Lao => tl!("Lao"),
+        ScriptFont::Cjk(region) => RustGisApp::cjk_language(region).english(),
+    }
+}
+
+/// Missing reports can be one frame old. Recheck the small bounded sample against the active
+/// UI and export stacks before downloading another face or announcing a terminal coverage gap.
+fn text_still_missing(ctx: &egui::Context, chars: &[char]) -> bool {
+    let ui_missing = ctx.fonts_mut(|fonts| {
+        [egui::FontFamily::Proportional, egui::FontFamily::Name("semibold".into()), egui::FontFamily::Monospace].into_iter().any(|family| {
+            // Before the first theme install a standalone host need not define semibold yet.
+            if !fonts.definitions().families.contains_key(&family) {
+                return false;
+            }
+            let font = egui::FontId::new(14.0, family);
+            chars.iter().any(|c| !fonts.has_glyph(&font, *c))
+        })
+    });
+    ui_missing || chars.iter().any(|c| !rustgis_engine::render::covers_quietly(&c.to_string(), false))
+}
+
+/// Validates the requested script against the shipped catalogs, not just one representative
+/// character. Latin letters belonging to the base UI face aren't required in script-only fonts.
+fn valid_script_download(bytes: &[u8], script: rustgis_engine::render::fonts::ScriptFont) -> bool {
+    use rustgis_engine::render::fonts::{self, ScriptFont};
+    if bytes.len() > fonts::MAX_FONT_BYTES || !fonts::draws_script(bytes, 0, script) {
+        return false;
+    }
+    let chars = i18n::Lang::all()
+        .filter(|lang| RustGisApp::script_region(lang.script()) == Some(script))
+        .flat_map(|lang| lang.letters().iter().copied())
+        .filter(|c| match script {
+            ScriptFont::Cjk(_) => fonts::CjkScript::of(*c).is_some(),
+            _ => ScriptFont::of(*c) == Some(script),
+        });
+    fonts::has_characters(bytes, 0, chars)
+}
+
+/// The CJK faces to download for the scripts the renderer had no face for: a Korean face for
+/// Hangul, a Japanese one for kana, `han`'s for ideographs. A region already downloaded, asked
+/// for or failed (`asked`) isn't asked for again, nor twice.
+fn cjk_downloads(
+    missing: &[rustgis_engine::render::fonts::CjkScript],
+    han: rustgis_engine::render::fonts::CjkRegion,
+    asked: impl Fn(rustgis_engine::render::fonts::CjkRegion) -> bool,
+) -> Vec<rustgis_engine::render::fonts::CjkRegion> {
+    use rustgis_engine::render::fonts::{CjkRegion, CjkScript};
+    let mut wanted = Vec::new();
+    for script in missing {
+        let region = match script {
+            CjkScript::Han => han,
+            CjkScript::Kana => CjkRegion::Japanese,
+            CjkScript::Hangul => CjkRegion::Korean,
+        };
+        if !asked(region) && !wanted.contains(&region) {
+            wanted.push(region);
+        }
+    }
+    wanted
+}
+
+/// Moves the extra face for `region` ahead of the others, the rest kept in order.
+fn put_first(
+    fonts: &mut Vec<(String, std::sync::Arc<egui::FontData>, Option<rustgis_engine::render::fonts::ScriptFont>)>,
+    region: rustgis_engine::render::fonts::ScriptFont,
+) {
+    if let Some(i) = fonts.iter().position(|(_, _, r)| *r == Some(region)) {
+        let face = fonts.remove(i);
+        fonts.insert(0, face);
+    }
+}
+
+/// [`RustGisApp::han_region`] for the interface's script face `current` and the system's preferred
+/// language `tags`.
+fn han_region_for(
+    current: Option<rustgis_engine::render::fonts::ScriptFont>,
+    tags: impl IntoIterator<Item = String>,
+) -> rustgis_engine::render::fonts::CjkRegion {
+    use rustgis_engine::render::fonts::{CjkRegion, ScriptFont};
+    let cjk = |s: Option<ScriptFont>| match s {
+        Some(ScriptFont::Cjk(r)) => Some(r),
+        _ => None,
+    };
+    cjk(current)
+        .or_else(|| tags.into_iter().find_map(|tag| cjk(i18n::lang_from_tag(&tag).and_then(|l| RustGisApp::script_region(l.script())))))
+        .unwrap_or(CjkRegion::SimplifiedChinese)
+}
+
+#[cfg(test)]
+mod language_coverage_tests {
+    use super::*;
+
+    /// Runs the app's real completion hook: only it can change `shown_lang`, and a second frame
+    /// exercises the steady state rather than only inspecting a helper's result.
+    fn frame(app: &mut RustGisApp, ctx: &egui::Context) {
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.logic(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    /// Even on a machine with fonts installed, emulate a missing or failed face deterministically:
+    /// the normal request cache prevents host discovery, and egui starts with its bundled fonts.
+    fn without_script_font(code: &str) -> (RustGisApp, egui::Context) {
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.language", json!({"code": code})).unwrap();
+        let region = RustGisApp::script_region(app.chosen_lang().script());
+        if let Some(region) = region {
+            let name = format!("script-{region:?}");
+            app.fonts_requested.push(name.clone());
+            app.fonts_failed.push(name);
+        }
+        app.installed_region = region;
+        app.fonts_frames = 1;
+        let ctx = egui::Context::default();
+        let mut defs = egui::FontDefinitions::default();
+        let regular = defs.families.get(&egui::FontFamily::Proportional).unwrap().clone();
+        defs.families.insert(egui::FontFamily::Name("semibold".into()), regular);
+        ctx.set_fonts(defs);
+        (app, ctx)
+    }
+
+    /// An embedding host may lay out its own text before the app installs its font families.
+    /// That install is deferred by egui, so startup must wait without a notice or cached failure.
+    #[test]
+    fn a_saved_alphabetic_language_waits_for_deferred_font_families() {
+        for defined_but_incomplete in [false, true] {
+            let mut app = RustGisApp::with_sample();
+            app.run("ui.language", json!({"code": "de"})).unwrap();
+            let ctx = egui::Context::default();
+            if defined_but_incomplete {
+                let mut fonts = egui::FontDefinitions::default();
+                fonts.font_data.insert(
+                    "partial".into(),
+                    std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../render/testdata/test-cff.otf"))),
+                );
+                fonts.families.insert(egui::FontFamily::Name("semibold".into()), vec!["partial".into()]);
+                ctx.set_fonts(fonts);
+            }
+            let mark = app.session.notice_mark();
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                ui.label("Host text before RustGIS");
+                app.logic(ui.ctx());
+            });
+            output.textures_delta.clear();
+            assert_eq!(app.lang(), i18n::Lang::EN, "wait until the new families become active");
+            assert!(app.language_coverage.is_none(), "deferred families are not a coverage failure");
+            assert!(!app.session.notices_since(mark).iter().any(|n| n.text.contains("can't display")));
+            frame(&mut app, &ctx);
+            assert_eq!(app.lang().code(), "de", "activate once the font families are defined");
+        }
+    }
+
+    #[test]
+    fn missing_fonts_keep_the_previous_language_and_say_why_once() {
+        for code in ["zh", "zh-tw", "ja", "ko", "fa", "bn", "lo", "vi", "az"] {
+            let (mut app, ctx) = without_script_font(code);
+            let mark = app.session.notice_mark();
+            frame(&mut app, &ctx);
+            frame(&mut app, &ctx);
+            assert_eq!(app.lang(), i18n::Lang::EN, "{code}: activated a language with missing glyphs");
+            assert_eq!(app.chosen_lang().code(), code, "preserve the requested preference for retry");
+            let notices = app.session.notices_since(mark);
+            assert_eq!(notices.iter().filter(|n| n.text.contains("The available fonts can't display")).count(), 1, "{code}: {notices:?}");
+            app.run("ui.language", json!({"code": "de"})).unwrap();
+            frame(&mut app, &ctx);
+            assert_eq!(app.lang().code(), "de", "a covered language still activates");
+        }
+    }
+
+    /// A real English UI widget, rather than a direct missing-font helper call, must ask for
+    /// both scripts. A child process pins the installed-font override without mutating global
+    /// environment state in the test process or depending on fonts installed on the CI host.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn missing_widget_glyphs_request_fonts_and_report_the_data_script() {
+        if std::env::var_os("RUSTGIS_WIDGET_FONT_TEST").is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "language_coverage_tests::missing_widget_glyphs_request_fonts_and_report_the_data_script", "--nocapture"])
+                .env("RUSTGIS_WIDGET_FONT_TEST", "1")
+                .env("RUSTGIS_BUILTIN_FONTS", "1")
+                .output()
+                .unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        // Exercise the real theme install under the child's built-in-font override.
+        let ctx = egui::Context::default();
+        theme::install_fonts(&ctx, &[], None);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.ctx().fonts_mut(|fonts| {
+                for family in [egui::FontFamily::Proportional, egui::FontFamily::Name("semibold".into()), egui::FontFamily::Monospace] {
+                    let font = egui::FontId::new(14.0, family);
+                    for lang in i18n::Lang::all().filter(|lang| matches!(lang.script(), i18n::Script::Alphabetic)) {
+                        for c in lang.letters() {
+                            assert!(fonts.has_glyph(&font, *c), "{} {:?}: missing U+{:04X}", lang.code(), font.family, u32::from(*c));
+                        }
+                    }
+                }
+            });
+        });
+        output.textures_delta.clear();
+        use rustgis_engine::render::fonts::{ScriptFont, script_font_url};
+        let (mut app, ctx) = without_script_font("en");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        app.services.fetch_font = Some(Box::new(move |url| sink.lock().unwrap().push(url.to_string())));
+        let inbox = Inbox::default();
+        app.services.font_inbox = Some(inbox.clone());
+        let mark = app.session.notice_mark();
+        for _ in 0..3 {
+            let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+                app.logic(ui.ctx());
+                ui.label("অệ");
+            });
+            output.textures_delta.clear();
+        }
+        let bengali = script_font_url(ScriptFont::Bengali).unwrap();
+        let latin = script_font_url(ScriptFont::Latin).unwrap();
+        let urls = asked.lock().unwrap().clone();
+        assert_eq!(urls.iter().filter(|url| *url == bengali).count(), 1, "Bengali widget did not ask once: {urls:?}");
+        assert_eq!(urls.iter().filter(|url| *url == latin).count(), 1, "Vietnamese widget did not ask once: {urls:?}");
+        assert_eq!(app.lang(), i18n::Lang::EN);
+        assert_eq!(app.session.notices_since(mark).iter().filter(|n| n.text.contains("Downloading a fallback font")).count(), 2);
+        let failure = app.session.notice_mark();
+        inbox.lock().unwrap().push((latin.into(), Vec::new()));
+        frame(&mut app, &ctx);
+        let notices = app.session.notices_since(failure);
+        assert!(notices.iter().any(|n| n.text.contains("Couldn't download or validate the font for the Latin text")), "{notices:?}");
+        assert!(!notices.iter().any(|n| n.text.contains("Azerbaijani")), "a data string is not an Azerbaijani UI request");
+        app.run("ui.language", json!({"code": "en"})).unwrap();
+        assert_eq!(asked.lock().unwrap().iter().filter(|url| *url == latin).count(), 2, "retry includes non-CJK data fonts");
+    }
+
+    #[test]
+    fn data_download_retry_is_not_blocked_by_a_partial_installed_face() {
+        use rustgis_engine::render::fonts::{ScriptFont, script_font_url};
+        let (mut app, ctx) = without_script_font("en");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        app.services.fetch_font = Some(Box::new(move |url| sink.lock().unwrap().push(url.to_string())));
+        app.extra_fonts.push((
+            "installed-latin".into(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../render/testdata/test-fallback.otf"))),
+            Some(ScriptFont::Latin),
+        ));
+        app.fonts_for_data.push(ScriptFont::Latin);
+        app.fonts_failed.push("script-Latin".into());
+        app.fonts_requested.push("download-Latin".into());
+        app.run("ui.language", json!({"code": "vi"})).unwrap();
+        assert_eq!(*asked.lock().unwrap(), vec![script_font_url(ScriptFont::Latin).unwrap().to_string()]);
+        assert!(app.fonts_failed.is_empty());
+        app.installed_region = Some(ScriptFont::Latin);
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!app.can_draw(ui.ctx(), app.chosen_lang()), "wait for the retried font");
+        });
+        output.textures_delta.clear();
+        assert_eq!(asked.lock().unwrap().len(), 1, "language activation must reuse the data retry");
+    }
+
+    /// Selecting a language while a data fallback is still in flight must reuse that request.
+    #[test]
+    fn choosing_a_language_keeps_a_partial_face_download_in_flight() {
+        use rustgis_engine::render::fonts::ScriptFont;
+        let (mut app, ctx) = without_script_font("en");
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        app.services.fetch_font = Some(Box::new(move |url| sink.lock().unwrap().push(url.to_string())));
+        app.extra_fonts.push((
+            "installed-latin".into(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../render/testdata/test-fallback.otf"))),
+            Some(ScriptFont::Latin),
+        ));
+        app.fonts_for_data.push(ScriptFont::Latin);
+        app.fonts_requested.push("download-Latin".into());
+        app.installed_region = Some(ScriptFont::Latin);
+        app.run("ui.language", json!({"code": "vi"})).unwrap();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| {
+            assert!(!app.can_draw(ui.ctx(), app.chosen_lang()));
+        });
+        output.textures_delta.clear();
+        assert!(asked.lock().unwrap().is_empty(), "the existing request must not start again");
+    }
+
+    /// Exercise the real end-of-UI wake after a widget first records non-CJK missing text.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn missing_script_text_wakes_the_next_frame_once() {
+        if crate::isolate_account_test("language_coverage_tests::missing_script_text_wakes_the_next_frame_once") {
+            return;
+        }
+        let (mut app, ctx) = without_script_font("en");
+        app.fonts_frames = 2;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(640.0, 480.0))),
+            ..Default::default()
+        };
+        let wakes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let sink = wakes.clone();
+        ctx.set_repaint_observer(move |request| {
+            if request.delay.is_zero() {
+                sink.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        app.label_fonts_indexed = true;
+        app.chrome = Some(|_, _| {});
+        app.services.fetch_font = Some(Box::new(|_| {}));
+        for _ in 0..8 {
+            let mut output = ctx.run_ui(input(), |ui| {
+                app.logic(ui.ctx());
+                app.ui(ui);
+            });
+            output.textures_delta.clear();
+        }
+        let mut output = ctx.run_ui(input(), |ui| {
+            app.logic(ui.ctx());
+            wakes.store(0, std::sync::atomic::Ordering::SeqCst);
+            app.ui(ui);
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0, "the UI must add no immediate wake before the missing text");
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(input(), |ui| {
+            app.logic(ui.ctx());
+            ui.label("অ");
+            wakes.store(0, std::sync::atomic::Ordering::SeqCst);
+            app.ui(ui);
+            assert!(wakes.load(std::sync::atomic::Ordering::SeqCst) > 0, "the new missing script must wake font loading");
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(input(), |ui| {
+            app.logic(ui.ctx());
+            ui.label("অ");
+            app.ui(ui);
+        });
+        output.textures_delta.clear();
+        let mut output = ctx.run_ui(input(), |ui| {
+            app.logic(ui.ctx());
+            ui.label("অ");
+            // A download notice has its own toast animation, independent of font scheduling.
+            app.map.notices_seen = app.session.notice_mark();
+            app.map.toasts.clear();
+            wakes.store(0, std::sync::atomic::Ordering::SeqCst);
+            app.ui(ui);
+            assert_eq!(wakes.load(std::sync::atomic::Ordering::SeqCst), 0, "a handled request must not keep the interface busy");
+        });
+        output.textures_delta.clear();
+    }
+
+    /// Reports survive a queued native-face install; readable text needs no redundant download.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn queued_fonts_preserve_reports_until_their_installation() {
+        if crate::isolate_account_test("language_coverage_tests::queued_fonts_preserve_reports_until_their_installation") {
+            return;
+        }
+        use rustgis_engine::render::fonts::{self, CjkRegion, CjkScript, ScriptFont};
+        let (mut app, ctx) = without_script_font("en");
+        app.fonts_frames = 2;
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = asked.clone();
+        app.services.fetch_font = Some(Box::new(move |url| sink.lock().unwrap().push(url.to_string())));
+        let bytes = include_bytes!("../../render/testdata/test-fallback.otf");
+        let face = std::sync::Arc::new(egui::FontData::from_static(bytes));
+        for script in [ScriptFont::Bengali, ScriptFont::Cjk(CjkRegion::Japanese)] {
+            app.extra_fonts.push((format!("native-{script:?}"), face.clone(), Some(script)));
+        }
+        app.fonts_dirty = true;
+        // Reports from a preceding widget frame, before these native faces became active.
+        fonts::note_missing_script('অ');
+        fonts::note_missing_script('あ');
+        frame(&mut app, &ctx);
+        assert!(asked.lock().unwrap().is_empty(), "queued native faces must be tried before downloading");
+        assert!(fonts::peek_missing_text().iter().any(|(script, chars)| *script == ScriptFont::Bengali && chars.contains(&'অ')));
+        assert!(fonts::peek_missing_cjk().contains(&CjkScript::Kana));
+        // The renderer uses the same original face bytes, as it does with an installed font.
+        for script in [ScriptFont::Bengali, ScriptFont::Cjk(CjkRegion::Japanese)] {
+            fonts::add_downloaded_script_font(script, bytes.to_vec()).unwrap();
+        }
+        frame(&mut app, &ctx);
+        assert!(asked.lock().unwrap().is_empty(), "the active native faces cover the reported characters");
+        assert!(fonts::peek_missing_text().is_empty());
+        assert!(fonts::peek_missing_cjk().is_empty());
+    }
+
+    /// Missing data in the same script must not block a catalog the active fonts already cover.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn data_downloads_do_not_block_a_covered_interface_in_the_same_script() {
+        if crate::isolate_account_test("language_coverage_tests::data_downloads_do_not_block_a_covered_interface_in_the_same_script") {
+            return;
+        }
+        use rustgis_engine::render::fonts::{ScriptFont, script_font_url};
+        let (mut app, ctx) = without_script_font("az");
+        app.fonts_frames = 2;
+        app.fonts_failed.clear();
+        app.extra_fonts.push((
+            "script-Latin".into(),
+            std::sync::Arc::new(egui::FontData::from_static(include_bytes!("../../render/testdata/test-latin-catalog.otf"))),
+            Some(ScriptFont::Latin),
+        ));
+        theme::install_fonts(&ctx, &app.extra_fonts, Some(ScriptFont::Latin));
+        app.fonts_for_data.push(ScriptFont::Latin);
+        app.fonts_requested.push("download-Latin".into());
+        app.services.fetch_font = Some(Box::new(|_| {}));
+        let inbox = Inbox::default();
+        app.services.font_inbox = Some(inbox.clone());
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang().code(), "az", "data-only downloads must not delay a readable interface");
+        let mark = app.session.notice_mark();
+        inbox.lock().unwrap().push((script_font_url(ScriptFont::Latin).unwrap().into(), Vec::new()));
+        frame(&mut app, &ctx);
+        let notices = app.session.notices_since(mark);
+        assert!(notices.iter().any(|n| n.error && n.text.contains(fallback_script_name(ScriptFont::Latin))), "{notices:?}");
+        assert!(!notices.iter().any(|n| n.text.contains("Azerbaijani")), "{notices:?}");
+        assert_eq!(app.lang().code(), "az");
+    }
+
+    /// A complete font delivered through the real inbox must release the activation guard.
+    /// The isolated process keeps its permanent downloaded-font slot out of other tests.
+    #[test]
+    fn a_complete_download_activates_the_requested_language() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("language_coverage_tests::a_complete_download_activates_the_requested_language") {
+            return;
+        }
+        let (mut app, ctx) = without_script_font("vi");
+        let inbox = Inbox::default();
+        app.services.font_inbox = Some(inbox.clone());
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang(), i18n::Lang::EN, "missing letters must keep the readable language");
+        let bytes = include_bytes!("../../render/testdata/test-latin-catalog.otf");
+        let url = rustgis_engine::render::fonts::script_font_url(rustgis_engine::render::fonts::ScriptFont::Latin).unwrap();
+        inbox.lock().unwrap().push((url.into(), bytes.to_vec()));
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_eq!(app.lang().code(), "vi", "the admitted font must activate Vietnamese");
+        app.run("ui.language", json!({"code": "az"})).unwrap();
+        for _ in 0..3 {
+            frame(&mut app, &ctx);
+        }
+        assert_eq!(app.lang().code(), "az", "the same complete fallback supports Azerbaijani");
+    }
+
+    #[test]
+    fn a_download_must_cover_its_catalog_not_just_the_probe_character() {
+        let bytes = include_bytes!("../../render/testdata/test-fallback.otf");
+        for script in rustgis_engine::render::fonts::ScriptFont::ALL {
+            assert!(rustgis_engine::render::fonts::draws_script(bytes, 0, script), "fixture should draw the probe for {script:?}");
+            assert!(!super::valid_script_download(bytes, script), "{script:?}: a partial font must not fill the permanent slot/cache");
+        }
+    }
+
+    #[test]
+    fn wrong_script_downloads_are_rejected_and_the_language_can_be_retried() {
+        let (mut app, ctx) = without_script_font("bn");
+        let inbox = Inbox::default();
+        app.services.font_inbox = Some(inbox.clone());
+        let url = rustgis_engine::render::fonts::script_font_url(rustgis_engine::render::fonts::ScriptFont::Bengali).unwrap();
+        let face = egui::FontDefinitions::default().font_data.get("Ubuntu-Light").unwrap().font.as_ref().as_ref().to_vec();
+        inbox.lock().unwrap().push((url.into(), face));
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang(), i18n::Lang::EN);
+        assert!(!app.extra_fonts.iter().any(|(name, _, _)| name.starts_with("web-")), "never install a wrong-script font");
+        assert!(app.fonts_failed.contains(&"script-Bengali".to_string()));
+        app.run("ui.language", json!({"code": "bn"})).unwrap();
+        assert!(app.fonts_failed.is_empty(), "explicit retry clears the failure");
+        assert!(!app.fonts_requested.contains(&"script-Bengali".to_string()), "failed request must not suppress the retry");
+    }
+
+    #[test]
+    fn a_region_tag_is_not_proof_that_its_font_draws_the_catalog() {
+        let (mut app, ctx) = without_script_font("fa");
+        app.extra_fonts.push((
+            "wrong-face".into(),
+            egui::FontDefinitions::default().font_data.get("Ubuntu-Light").unwrap().clone(),
+            Some(rustgis_engine::render::fonts::ScriptFont::Arabic),
+        ));
+        // Preserve the deterministic bundled stack rather than the host's system UI font.
+        app.fonts_dirty = false;
+        frame(&mut app, &ctx);
+        frame(&mut app, &ctx);
+        assert_eq!(app.lang(), i18n::Lang::EN, "a valid font with no Persian must not activate Persian");
+    }
+}
+
+#[cfg(test)]
+mod cjk_download_tests {
+    /// Initializes the font stack before a poll can recheck actual missing characters.
+    fn poll_cjk(app: &mut super::RustGisApp) {
+        let ctx = egui::Context::default();
+        let mut output = ctx.run_ui(egui::RawInput::default(), |ui| app.ensure_data_cjk_font(ui.ctx()));
+        output.textures_delta.clear();
+    }
+
+    use rustgis_engine::render::fonts::{CjkRegion, CjkScript};
+
+    /// The map's ideographs take the interface's CJK region, else that of the first CJK language
+    /// the browser prefers (a Taiwanese browser under an English interface gets Traditional
+    /// Chinese, whatever other faces kana or Hangul bring), else Simplified Chinese.
+    #[test]
+    fn ideographs_follow_the_interface_then_the_browser() {
+        use CjkRegion::{Japanese as Jp, SimplifiedChinese as Sc, TraditionalChinese as Tc};
+        use rustgis_engine::render::fonts::ScriptFont;
+        let tags = |t: &[&str]| t.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+        assert_eq!(super::han_region_for(None, tags(&["en-US", "zh-TW", "ja-JP"])), Tc);
+        assert_eq!(super::han_region_for(None, tags(&["en-US", "ja-JP", "zh-TW"])), Jp);
+        assert_eq!(super::han_region_for(None, tags(&["en-US", "de"])), Sc);
+        assert_eq!(super::han_region_for(Some(ScriptFont::Cjk(Jp)), tags(&["zh-TW"])), Jp);
+        assert_eq!(super::han_region_for(Some(ScriptFont::Arabic), tags(&["zh-TW"])), Tc);
+    }
+
+    /// Each script missing asks for its region's face once; ideographs for the region given, and
+    /// nothing for a region already downloaded, asked for or failed.
+    #[test]
+    fn missing_scripts_ask_for_their_regions_once() {
+        use CjkRegion::{Japanese as Jp, Korean as Kr, SimplifiedChinese as Sc, TraditionalChinese as Tc};
+        let none = |_| false;
+        assert_eq!(super::cjk_downloads(&[], Tc, none), vec![]);
+        assert_eq!(super::cjk_downloads(&[CjkScript::Han], Tc, none), vec![Tc]);
+        assert_eq!(super::cjk_downloads(&[CjkScript::Han], Sc, none), vec![Sc]);
+        assert_eq!(super::cjk_downloads(&[CjkScript::Han, CjkScript::Kana, CjkScript::Hangul], Tc, none), vec![Tc, Jp, Kr]);
+        // Japanese ideographs and kana need one face.
+        assert_eq!(super::cjk_downloads(&[CjkScript::Han, CjkScript::Kana], Jp, none), vec![Jp]);
+        assert_eq!(super::cjk_downloads(&[CjkScript::Han, CjkScript::Hangul], Tc, |r| r == Tc), vec![Kr]);
+    }
+
+    /// Never silent: CJK text the renderer had no face for is said once a script where nothing can
+    /// be downloaded, and in the browser once its face is asked for; with nothing missing, nothing
+    /// is said. In a process of its own, as the noted scripts are process-wide.
+    #[test]
+    fn missing_cjk_text_is_said_once_a_script() {
+        #[cfg(not(target_arch = "wasm32"))]
+        if crate::isolate_account_test("cjk_download_tests::missing_cjk_text_is_said_once_a_script") {
+            return;
+        }
+        use rustgis_engine::render::fonts::{cjk_font_url, note_missing_cjk, take_missing_cjk};
+        let mut app = crate::RustGisApp::with_sample();
+        let _ = take_missing_cjk();
+        let said = |app: &crate::RustGisApp, mark| app.session.notices_since(mark).len();
+        let mark = app.session.notice_mark();
+        poll_cjk(&mut app);
+        assert_eq!(said(&app, mark), 0, "nothing missing, nothing said");
+        note_missing_cjk('臺');
+        note_missing_cjk('北');
+        poll_cjk(&mut app);
+        assert_eq!(said(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        assert!(app.session.notices_since(mark)[0].text.contains("Chinese (Simplified) text"));
+        note_missing_cjk('市');
+        poll_cjk(&mut app);
+        assert_eq!(said(&app, mark), 1, "once a script");
+        note_missing_cjk('한');
+        poll_cjk(&mut app);
+        assert_eq!(said(&app, mark), 2);
+
+        // In the browser the face is asked for, once, and that is said.
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let sink = std::sync::Arc::clone(&asked);
+        app.services.fetch_font = Some(Box::new(move |url: &str| sink.lock().unwrap().push(url.to_string())));
+        let mark = app.session.notice_mark();
+        for _ in 0..2 {
+            note_missing_cjk('か');
+            poll_cjk(&mut app);
+        }
+        assert_eq!(*asked.lock().unwrap(), vec![cjk_font_url(CjkRegion::Japanese).to_string()]);
+        assert_eq!(said(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+
+        // Its face loaded, characters it still lacks are said once, and the face isn't asked for
+        // again.
+        let face = std::sync::Arc::new(egui::FontData::from_static(&[]));
+        app.extra_fonts.push(("web-test".into(), face, Some(rustgis_engine::render::fonts::ScriptFont::Cjk(CjkRegion::Japanese))));
+        let mark = app.session.notice_mark();
+        for _ in 0..2 {
+            note_missing_cjk('か');
+            poll_cjk(&mut app);
+        }
+        assert_eq!(said(&app, mark), 1, "{:?}", app.session.notices_since(mark));
+        assert_eq!(asked.lock().unwrap().len(), 1);
+
+        // A face the map's text asked for that failed is asked for again when a language is
+        // picked, the retry its failure notice offers, though nothing notes it again.
+        note_missing_cjk('한');
+        poll_cjk(&mut app);
+        let korean = cjk_font_url(CjkRegion::Korean).to_string();
+        assert_eq!(asked.lock().unwrap().last(), Some(&korean));
+        let name = format!("script-{:?}", rustgis_engine::render::fonts::ScriptFont::Cjk(CjkRegion::Korean));
+        app.fonts_requested.retain(|n| *n != name);
+        app.fonts_failed.push(name);
+        let mark = app.session.notice_mark();
+        app.run("ui.language", serde_json::json!({"code": "en"})).unwrap();
+        let urls = asked.lock().unwrap().clone();
+        assert_eq!(urls.iter().filter(|u| **u == korean).count(), 2, "{urls:?}");
+        let retrying = app.session.notices_since(mark).iter().filter(|n| n.text.contains("Downloading the font for the Korean")).count();
+        assert_eq!(retrying, 1, "the retry is said: {:?}", app.session.notices_since(mark));
+    }
+
+    /// The interface falls back to the face of the map's ideographs first, whichever face
+    /// arrived first, the other faces kept in order.
+    #[test]
+    fn the_ideographs_face_falls_back_first_whichever_arrived_first() {
+        use CjkRegion::{Japanese as Jp, TraditionalChinese as Tc};
+        use rustgis_engine::render::fonts::ScriptFont;
+        let face =
+            |name: &str, region: Option<ScriptFont>| (name.to_string(), std::sync::Arc::new(egui::FontData::from_static(&[])), region);
+        for (first, second) in [(Jp, Tc), (Tc, Jp)] {
+            let mut fonts = vec![face("symbols", None), face("a", Some(ScriptFont::Cjk(first))), face("b", Some(ScriptFont::Cjk(second)))];
+            super::put_first(&mut fonts, ScriptFont::Cjk(Tc));
+            let order: Vec<_> = fonts.iter().map(|(_, _, r)| *r).collect();
+            let other = if first == Tc { second } else { first };
+            assert_eq!(order, vec![Some(ScriptFont::Cjk(Tc)), None, Some(ScriptFont::Cjk(other))]);
+        }
+    }
 }
 
 /// A test's click whose press and release arrive in one frame, as they do inside a slow one, `gap`
@@ -6408,6 +8330,7 @@ pub(crate) fn isolate_account_test(name: &str) -> bool {
 /// and a test that replaces it (`set_fetcher`) would answer another's downloads. So do tests that
 /// log in to a connection, as a login replaced or ended empties the cache (`cache::clear`), and
 /// tests that wait for what it reads (tiles, an archive's header), which that would drop.
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 pub(crate) mod fetching {
     use std::io::{Read, Write};
@@ -6579,6 +8502,7 @@ const MAX_STEP_BYTES: usize = 4 << 20;
 /// an optional `layer` that defaults to the active layer goes here, so a recorded step names it;
 /// `record_tests::every_optional_layer_is_classified` fails until it is placed here or there.
 const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
+    "edit.addPoint",
     "select.byAttributes",
     "stac.search",
     "select.rows",
@@ -6603,6 +8527,7 @@ const DEFAULTS_TO_ACTIVE_LAYER: &[&str] = &[
     "cube.reduce",
 ];
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod record_tests {
     use super::{DEFAULTS_TO_ACTIVE_LAYER, RustGisApp};
@@ -6854,6 +8779,22 @@ mod record_tests {
         }
     }
 
+    /// A WCS coverage's download keeps the system it was asked for in (`coverageCrs`, from
+    /// `service.coverage`), for `layer.addDownload` to read an answer that doesn't say its own in
+    /// it (#2032); a value that isn't text isn't passed on.
+    #[test]
+    fn a_coverage_download_keeps_the_system_it_was_asked_in() {
+        let _turn = crate::fetching::turn();
+        rustgis_engine::render::rustgis_tiles::cache::set_fetcher(|_, _| {});
+        let mut app = RustGisApp::with_sample();
+        let url = "https://wcs.invalid/wcs?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage&COVERAGEID=dem";
+        app.run("ui.addUrl", json!({"url": url, "name": "Terrain", "coverage": true, "coverageCrs": "EPSG:2056"})).unwrap();
+        app.run("ui.addUrl", json!({"url": url, "name": "Other", "coverage": true, "coverageCrs": 2056})).unwrap();
+        let kept: Vec<serde_json::Value> = app.ui.downloads.iter().map(|d| d.params["coverageCrs"].clone()).collect();
+        assert_eq!(kept, [json!("EPSG:2056"), serde_json::Value::Null]);
+        assert!(app.ui.downloads.iter().all(|d| d.params["coverage"] == true));
+    }
+
     /// A window read off the frame is a step all the same: the command that reads it, with its box,
     /// not the download that can't be added again (#1330).
     #[test]
@@ -7034,6 +8975,103 @@ mod record_tests {
         held.lock().unwrap().pop().unwrap()(Ok(br#"{"type":"Point","coordinates":[1,2]}"#.to_vec()));
         app.poll_data_downloads();
         assert!(app.session.map().layer_by_name("Cancelled download").is_none());
+    }
+
+    /// A GRIB download's read looks at its Cancel as it goes: once cancelled, it stops and says so
+    /// rather than reading on to its end with the turn held.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_cancelled_grib_read_stops() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        // A GRIB2 message whose length runs past these bytes: read through, it is cut short.
+        let mut bytes = b"GRIB\0\0\0\x02".to_vec();
+        bytes.extend(1000u64.to_be_bytes());
+        bytes.resize(64, 0);
+        let bytes = std::sync::Arc::new(bytes);
+        let left = std::sync::Arc::new(AtomicBool::new(false));
+        let read = crate::read_download("t.grb", &bytes, None, true, &left).unwrap_err();
+        assert!(!read.contains("cancel"), "{read}");
+        left.store(true, Ordering::Relaxed);
+        let cancelled = crate::read_download("t.grb", &bytes, None, true, &left).unwrap_err();
+        assert!(cancelled.to_lowercase().contains("cancel"), "{cancelled}");
+    }
+
+    /// A PDF download's page waiting for its turn to be drawn is cancelled like a download: taken
+    /// off the list at once, said cancelled, and not added when its turn comes (#2336).
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn a_cancelled_pdf_page_isnt_added_when_its_turn_comes() {
+        use rustgis_engine::render::rustgis_tiles::cache;
+        use std::sync::{Arc, Mutex};
+        let _turn = crate::fetching::turn();
+        struct Fetcher;
+        impl Drop for Fetcher {
+            fn drop(&mut self) {
+                cache::clear_fetcher();
+            }
+        }
+        let held = Arc::new(Mutex::new(Vec::<cache::Done>::new()));
+        let callbacks = held.clone();
+        cache::set_fetcher(move |_, done| callbacks.lock().unwrap().push(done));
+        let _fetcher = Fetcher;
+        // A one-page PDF of a 72 × 36 point page, with its cross-reference table.
+        let objects = [
+            "<< /Type /Catalog /Pages 2 0 R >>",
+            "<< /Type /Pages /Kids [3 0 R] /Count 1 >>",
+            "<< /Type /Page /Parent 2 0 R /MediaBox [0 0 72 36] >>",
+        ];
+        let mut pdf = String::from("%PDF-1.7\n");
+        let mut at = Vec::new();
+        for (i, o) in objects.iter().enumerate() {
+            at.push(pdf.len());
+            pdf.push_str(&format!("{} 0 obj\n{o}\nendobj\n", i + 1));
+        }
+        let xref = pdf.len();
+        pdf.push_str("xref\n0 4\n0000000000 65535 f \n");
+        for a in at {
+            pdf.push_str(&format!("{a:010} 00000 n \n"));
+        }
+        pdf.push_str(&format!("trailer\n<< /Size 4 /Root 1 0 R >>\nstartxref\n{xref}\n%%EOF\n"));
+        let late = pdf.clone().into_bytes();
+        let mut app = RustGisApp::with_sample();
+        app.run("ui.addUrl", json!({"url": "https://cancel.invalid/sheet.pdf", "name": "Cancelled sheet"})).unwrap();
+        // The page waits for its turn while this test holds it.
+        let reading = crate::WINDOW_TURN.lock().unwrap_or_else(|e| e.into_inner());
+        held.lock().unwrap().pop().unwrap()(Ok(pdf.into_bytes()));
+        app.poll_data_downloads();
+        assert_eq!(app.ui.page_reads.len(), 1, "drawn off the frame");
+        let under_way = app.downloads_under_way();
+        assert!(under_way.len() == 1 && under_way[0].shown.contains("sheet.pdf"), "{under_way:?}");
+        app.cancel_download(under_way[0].id);
+        assert!(app.ui.page_reads.is_empty() && app.downloads_under_way().is_empty());
+        let said = |n: &rustgis_engine::Notice| n.text.contains("sheet.pdf") && n.text.contains("cancelled");
+        assert!(app.session.notices.iter().any(said), "{:?}", app.session.notices);
+        drop(reading);
+        for _ in 0..10 {
+            app.poll_data_downloads();
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: the given-up draw's thread lands into a slot no list holds
+        }
+        assert!(app.session.map().layer_by_name("Cancelled sheet").is_none());
+        // A page drawn already when Cancel comes isn't added either.
+        app.run("ui.addUrl", json!({"url": "https://cancel.invalid/late.pdf", "name": "Late sheet"})).unwrap();
+        held.lock().unwrap().pop().unwrap()(Ok(late));
+        app.poll_data_downloads();
+        assert_eq!(app.ui.page_reads.len(), 1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while app.ui.page_reads.first().is_some_and(|(_, slot, _)| slot.lock().unwrap().is_none()) {
+            assert!(std::time::Instant::now() < deadline, "the page wasn't drawn");
+            std::thread::sleep(std::time::Duration::from_millis(20)); // test-wait: the drawing thread's result, which has no signal of its own
+        }
+        app.cancel_download(app.downloads_under_way()[0].id);
+        app.poll_data_downloads();
+        assert!(app.session.map().layer_by_name("Late sheet").is_none() && app.ui.page_reads.is_empty());
+        // A page asked for by number reaches the download as it was asked.
+        app.run("ui.addUrl", json!({"url": "https://cancel.invalid/paged.pdf", "layer": 2})).unwrap();
+        let asked = app.ui.downloads.last().map(|d| d.params.clone()).unwrap();
+        assert_eq!(asked["layer"], json!(2), "{asked}");
+        app.run("ui.addUrl", json!({"url": "https://cancel.invalid/odd.pdf", "layer": 2.5})).unwrap();
+        let asked = app.ui.downloads.last().map(|d| d.params.clone()).unwrap();
+        assert_eq!(asked["layer"], json!(2.5), "passed on, to be refused: {asked}");
     }
 
     /// The next window is read only once the frame has taken the last: a frame that stalls holds
@@ -7429,7 +9467,7 @@ mod download_service_tests {
                 withheld_addresses: 0,
                 vector: false,
                 fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
-                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((body, super::Reach::Local))))),
             };
             app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: true, origin: None, opened: app.session.opened });
             app.poll_service_steps();
@@ -7451,6 +9489,8 @@ mod download_service_tests {
         for (query, count) in [("collections=roads", 0), ("token=RGSYNTH_ui_refused&collections=roads", 1)] {
             let mut app = RustGisApp::new(rustgis_engine::Session::new(rustgis_engine::Project::default()));
             let list = format!("https://h.invalid/svc/tiles?{query}");
+            // The list was read from the internet, as its fetch observed it; its record may since
+            // have been cleared (a direct add of the same address), which changes nothing.
             let body = json!({"tilesets":[{"tileMatrixSetId":"WebMercatorQuad",
                 "links":[{"rel":"self", "href":"http://127.0.0.1/tiles"}]}]})
             .to_string()
@@ -7464,7 +9504,7 @@ mod download_service_tests {
                 withheld_addresses: 0,
                 vector: false,
                 fallback: "https://h.invalid/svc/tiles/{z}/{y}/{x}".into(),
-                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(body)))),
+                slot: std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((body, super::Reach::Public))))),
             };
             app.ui.service_steps.push(super::ServiceStep::Tiles { resolve, dialog: false, origin: None, opened: app.session.opened });
             app.poll_service_steps();
@@ -7675,7 +9715,14 @@ mod download_service_tests {
             let params = json!({"url":"https://h.invalid/wcs", "name":"Heights"});
             let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Err("the server is down".to_string()))));
             let opened = app.session.opened;
-            app.ui.service_steps.push(super::ServiceStep::Coverage { params, slot, dialog: true, origin: None, opened });
+            app.ui.service_steps.push(super::ServiceStep::Coverage {
+                params,
+                describe: String::new(),
+                slot,
+                dialog: true,
+                origin: None,
+                opened,
+            });
             app.dialogs.info = Some(if newer { "Reading the tileset of Roads" } else { "Describing Heights" }.into());
             app.dialogs.open = open.then_some("addService");
             app.poll_service_steps();
@@ -7702,9 +9749,16 @@ mod download_service_tests {
                 let opened = app.session.opened;
                 let params = json!({"url":"https://retired.invalid/service", "name":"Old read"});
                 let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let step = |opened, slot: std::sync::Arc<std::sync::Mutex<Option<Result<Vec<u8>, String>>>>| {
+                let step = |opened, slot: std::sync::Arc<std::sync::Mutex<Option<Result<(Vec<u8>, super::Reach), String>>>>| {
                     if coverage {
-                        super::ServiceStep::Coverage { params: params.clone(), slot, dialog: true, origin: None, opened }
+                        super::ServiceStep::Coverage {
+                            params: params.clone(),
+                            describe: String::new(),
+                            slot,
+                            dialog: true,
+                            origin: None,
+                            opened,
+                        }
                     } else {
                         super::ServiceStep::Tiles {
                             resolve: super::TilesResolve {
@@ -7731,7 +9785,7 @@ mod download_service_tests {
                     app.ui.service_steps.push(step(app.session.opened, Default::default()));
                 }
                 app.dialogs.info = Some(if newer == 1 { "New operation" } else { pending }.into());
-                *slot.lock().unwrap() = Some(Ok(b"late completion".to_vec()));
+                *slot.lock().unwrap() = Some(Ok((b"late completion".to_vec(), super::Reach::Local)));
                 app.poll_service_steps();
                 assert_eq!(app.ui.service_steps.len(), usize::from(newer == 2));
                 assert!(app.session.map().tiles.is_empty() && app.session.map().layers.is_empty());
@@ -7760,7 +9814,91 @@ mod download_service_tests {
         assert!(!app.session.notices.iter().any(|n| n.text.contains("Download offered")));
         assert!(!app.download("archive.pmtiles", vec![1, 2, 3]));
         assert!(app.session.notices.iter().any(|n| n.error && n.text.contains("browser rejected download")));
-        assert!(!app.session.notices.iter().any(|n| n.text.contains("Downloaded")));
+        assert!(!app.session.notices.iter().any(|n| n.text.contains("Download offered")));
+    }
+
+    /// The browser's Save Layout File downloads what `layout.save` writes, its header included, so
+    /// an older RustGIS refuses what the layout uses that it can't keep (#2277).
+    #[test]
+    fn layout_download_is_the_saved_layout_file() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        app.run("layout.new", json!({"page": "a4", "template": "map"})).unwrap();
+        app.run("layout.addElement", json!({"kind": "text", "text": "A", "background": {}})).unwrap();
+        app.run("ui.saveLayout", serde_json::Value::Null).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("saved.rgislayout");
+        app.run("layout.save", json!({"path": path.display().to_string()})).unwrap();
+        let downloaded = file.lock().unwrap().clone();
+        assert_eq!(downloaded, std::fs::read(&path).unwrap());
+        let header: serde_json::Value = serde_json::from_slice(&downloaded).unwrap();
+        assert_eq!(header["format"], json!(rustgis_engine::project::FORMAT));
+        assert_eq!(header["requires"], json!(["layout-element-background"]));
+    }
+
+    /// The web download encodes the filtered rows and reports the count once the bytes are accepted.
+    #[test]
+    fn feature_download_respects_the_definition_query() {
+        let file = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let downloaded = file.clone();
+        let mut app = RustGisApp::with_sample().with_services(Services {
+            download: Some(Box::new(move |_, bytes| {
+                *downloaded.lock().unwrap() = bytes;
+                Ok(())
+            })),
+            ..Default::default()
+        });
+        let layer = app.session.map().layer_by_name("Cities").unwrap();
+        let (id, total) = (layer.id, layer.dataset.features.len());
+        for (query, count) in [("@row_number = 1", 1), ("", total)] {
+            app.run("layer.definitionQuery", json!({"layer": id, "where": query})).unwrap();
+            let mark = app.session.notice_mark();
+            app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"})).unwrap();
+            let data: serde_json::Value = serde_json::from_slice(&file.lock().unwrap()).unwrap();
+            assert_eq!(data["features"].as_array().unwrap().len(), count);
+            let notes: Vec<_> = app.session.notices_since(mark).iter().filter(|n| n.text.contains("definition query")).collect();
+            assert_eq!(notes.len(), usize::from(!query.is_empty()));
+            if let Some(note) = notes.first() {
+                assert_eq!(
+                    note.text,
+                    format!("Cities.geojson: the definition query on Cities left out {} of the source features", total - 1)
+                );
+            }
+        }
+    }
+
+    /// The web download says the numbers GeoJSON can't hold, written as null, with their code, once
+    /// the browser takes the file; a refused download says nothing of them.
+    #[test]
+    fn feature_download_says_numbers_written_as_null() {
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value};
+        use rustgis_engine::geom::Coord;
+        // A NaN accepted, a NaN refused, and finite numbers only (nothing to say).
+        for (accept, first) in [(true, f64::NAN), (false, f64::NAN), (true, 2.5)] {
+            let download: Box<dyn Fn(&str, Vec<u8>) -> Result<(), String>> =
+                if accept { Box::new(|_, _| Ok(())) } else { Box::new(|_, _| Err("browser rejected download".into())) };
+            let mut app = RustGisApp::with_sample().with_services(Services { download: Some(download), ..Default::default() });
+            let mut ds = Dataset::new("Gauges", GeometryType::Point, vec![Field::new("level", FieldType::Double)]);
+            ds.push(Some(Geometry::Point(Coord::new(1.0, 2.0))), vec![Value::Float(first)]);
+            ds.push(Some(Geometry::Point(Coord::new(3.0, 4.0))), vec![Value::Float(1.5)]);
+            let id = app.session.map_mut().add_dataset(ds);
+            let mark = app.session.notice_mark();
+            let run = app.run("ui.exportLayer", json!({"layer": id, "format": "geojson"}));
+            if accept {
+                run.unwrap();
+            }
+            let said: Vec<_> =
+                app.session.notices_since(mark).iter().filter(|n| n.text.contains("written as null")).map(|n| n.loss()).collect();
+            let expected = if accept && first.is_nan() { vec![Some(rustgis_engine::data::loss::LossCode::DroppedValue)] } else { vec![] };
+            assert_eq!(said, expected, "accepted: {accept}, first: {first}");
+        }
     }
 
     /// The web app's Shapefile download says which field names it changed, once the browser takes
@@ -7942,6 +10080,26 @@ mod download_service_tests {
 #[cfg(test)]
 mod peer_output_tests {
     use super::*;
+
+    /// Completed rankings belong to the replaced project, through User and peer entry points.
+    #[test]
+    fn project_replacement_clears_similar_output() {
+        for peer in [false, true] {
+            let mut app = RustGisApp::new(Session::new(Project::default()));
+            app.workflow.section = "similar";
+            app.workflow.result = Some(json!({"similar":[{"row":1,"distance":0.5}]}));
+            app.workflow.error = Some("old project error".into());
+            assert!(app.open_peer_text("invalid project").is_err());
+            assert!(app.workflow.result.is_some() && app.workflow.error.is_some(), "a refused replacement keeps current output");
+            if peer {
+                let (text, _) = Project::default().saved_text(None).unwrap();
+                app.open_peer_text(&text).unwrap();
+            } else {
+                app.run("project.new", json!({})).unwrap();
+            }
+            assert!(app.workflow.result.is_none() && app.workflow.error.is_none(), "a replacement cannot show old row indices");
+        }
+    }
 
     /// Drives the actual receiving wrapper, including the UI state a direct Session call misses.
     #[test]
@@ -8548,5 +10706,86 @@ mod look_tests {
         app.open_picked("picked.rgis", text.as_bytes()).expect("a picked peer project opens via open_peer_text");
         assert_eq!(app.session.project.name, "PickedFromEmbedder");
         assert_eq!(app.ui.web_file, None, "a picked project also goes through open_peer_text");
+    }
+}
+
+#[cfg(test)]
+mod touch_tests {
+    use super::RustGisApp;
+    use serde_json::Value;
+
+    /// A stand-in for a phone's touch interface.
+    fn touch(_: &mut RustGisApp, _: &mut egui::Ui) {}
+
+    /// After Use the Desktop Interface (the chrome cleared), `ui.touchInterface` brings back the
+    /// one the shell kept; a computer, which has none, is told so.
+    #[test]
+    fn the_desktop_interface_goes_back_to_the_touch_one() {
+        let mut app = RustGisApp::with_sample();
+        // A computer has no touch interface to go back to.
+        assert!(app.run("ui.touchInterface", Value::Null).is_err());
+        assert!(app.chrome.is_none());
+        // A phone: its shell sets both, and the More sheet's row clears the chrome.
+        app.touch = Some(touch);
+        app.chrome = app.touch;
+        app.chrome = None;
+        app.run("ui.touchInterface", Value::Null).unwrap();
+        assert!(app.chrome.is_some_and(|c| std::ptr::fn_addr_eq(c, touch as super::Chrome)));
+        // Already on it: nothing changes.
+        app.run("ui.touchInterface", Value::Null).unwrap();
+        assert!(app.chrome.is_some());
+    }
+}
+
+#[cfg(test)]
+mod datum_grid_setting_tests {
+    use super::RustGisApp;
+    use rustgis_engine::{Project, Session};
+    use serde_json::json;
+
+    /// Sharp tiles on HiDPI displays (#2390) are on by default, kept as a choice, read at start
+    /// and turned off by it; a value that isn't true or false is refused.
+    #[test]
+    fn sharp_tiles_are_a_kept_choice_on_by_default() {
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = saved.clone();
+        let services = crate::Services {
+            load_pref: Some(Box::new(|k| (k == "sharp_tiles").then(|| "off".to_string()))),
+            save_pref: Some(Box::new(move |k, v| log.lock().unwrap().push((k.to_string(), v.to_string())))),
+            ..crate::Services::default()
+        };
+        let mut app = RustGisApp::new(Session::new(Project::default())).with_services(services);
+        // The setting itself is shared by the tests running beside this one: only the choice is
+        // looked at, and it is left on.
+        assert!(!app.ui.sharp_tiles, "read at start");
+        assert_eq!(app.run("ui.sharpTiles", json!({"on": true})).unwrap(), json!({"on": true}));
+        assert_eq!(saved.lock().unwrap().last().cloned(), Some(("sharp_tiles".to_string(), "on".to_string())));
+        for junk in [json!({"on": "false"}), json!({"on": 0})] {
+            assert!(app.run("ui.sharpTiles", junk).is_err());
+            assert!(app.ui.sharp_tiles);
+        }
+        // Without a choice kept: on.
+        assert!(RustGisApp::new(Session::new(Project::default())).ui.sharp_tiles);
+    }
+
+    /// Downloading datum grids is off unless turned on (it reaches a server), and the choice is
+    /// kept as a preference. Turned on only by `rustgis-engine`'s own test, which reaches no
+    /// network: here, where other tests run beside it, it stays off.
+    #[test]
+    fn downloading_datum_grids_is_a_kept_choice_off_by_default() {
+        let mut app = RustGisApp::new(Session::new(Project::default()));
+        let saved = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = saved.clone();
+        app.services.save_pref = Some(Box::new(move |k, v| log.lock().unwrap().push((k.to_string(), v.to_string()))));
+        assert!(!app.ui.download_grids);
+        assert!(!rustgis_engine::grids::enabled());
+        assert_eq!(app.run("ui.datumGrids", json!({"on": false})).unwrap(), json!({"on": false}));
+        assert_eq!(saved.lock().unwrap().last().cloned(), Some(("download_datum_grids".to_string(), "off".to_string())));
+        // A value that isn't true or false is refused and changes nothing.
+        for junk in [json!({"on": "true"}), json!({"on": 1}), json!({"on": [true]})] {
+            assert!(app.run("ui.datumGrids", junk).is_err());
+            assert!(!app.ui.download_grids && !rustgis_engine::grids::enabled());
+        }
+        assert_eq!(saved.lock().unwrap().len(), 1);
     }
 }

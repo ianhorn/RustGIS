@@ -25,6 +25,7 @@
 
 #[cfg(not(target_arch = "wasm32"))]
 pub mod install;
+pub mod langpack;
 #[cfg(not(target_arch = "wasm32"))]
 mod native;
 #[cfg(not(target_arch = "wasm32"))]
@@ -134,6 +135,28 @@ struct Meta {
     schema: &'static [ParamSpec],
     category: String,
     params: Vec<MetaParam>,
+    /// The form has the [`OUTPUT`] field naming the layers the outputs come back as.
+    names_outputs: bool,
+}
+
+/// The parameter that names a tool's new layers, under the key the built-in tools use (#2224).
+pub const OUTPUT: &str = "output";
+/// The [`OUTPUT`] field's label, as on the built-in tools.
+const OUTPUT_LABEL: &str = "Output Name";
+/// The [`OUTPUT`] field's help: the same text on every tool, so it can be translated.
+const OUTPUT_HELP: &str = "Name of the new layer. Empty: the tool's name. With several outputs, each adds its own name to it. A name already in use gets a number.";
+/// The longest layer name [`OUTPUT`] keeps (the engine's longest name).
+const MAX_OUTPUT_NAME: usize = 200;
+
+/// The Raster Calculator's tool id: its inputs are bound to the names its expression quotes
+/// ([`calculator_order`]).
+const CALCULATOR: &str = "raster_calculator";
+/// How the Raster Calculator's inputs meet its expression, added to the `inputs` field's help.
+const CALCULATOR_INPUTS_HELP: &str = "Each name quoted in the expression is the name of one of these layers (or a file's path, file name or name without extension), and is read from that input whatever the order here. With only files listed and no quoted name matching any of them, the k-th quoted name is the k-th file.";
+
+/// `p` is the [`OUTPUT`] field RustGIS adds, not one of the manifest's parameters.
+pub fn is_output_name(p: &ParamSpec) -> bool {
+    p.name == OUTPUT && p.label == OUTPUT_LABEL && p.kind == ParamKind::Text
 }
 
 static META: Mutex<Option<HashMap<String, Meta>>> = Mutex::new(None);
@@ -240,6 +263,8 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
             && p.get("io_role").is_none()
             && p.get("data_kind").and_then(Value::as_str) == Some("string")
             && schema.and_then(|s| s.get("kind")).and_then(Value::as_str) == Some("string");
+        // Raster Calculator takes several rasters, though GeoLibre 1.8.1 calls the input single.
+        let calculator_inputs = id == CALCULATOR && pname == "inputs";
         let data = if composite_inputs { Data::Raster } else { Data::of(p.get("data_kind").and_then(Value::as_str).unwrap_or("")) };
         let role = match p.get("io_role").and_then(Value::as_str) {
             None if composite_inputs => Role::Input,
@@ -247,11 +272,14 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
             Some("output") => Role::Output,
             _ => Role::Option,
         };
-        let many = composite_inputs || schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
+        let many = composite_inputs
+            || (calculator_inputs && role == Role::Input && data == Data::Raster)
+            || schema.and_then(|s| s.get("cardinality")).and_then(Value::as_str).is_some_and(|c| c != "single");
         let optional = !p.get("required").and_then(Value::as_bool).unwrap_or(false);
         let default = defaults.and_then(|d| d.get(pname)).filter(|v| optional && !v.is_null()).cloned();
         meta.push(MetaParam { name: pname.to_string(), role, data, default });
-        // Outputs are written to a scratch folder and come back as layers: no form field.
+        // Outputs are written to a scratch folder and come back as layers: no field of their own
+        // (the one [`OUTPUT`] field below names the layers).
         if role == Role::Output {
             continue;
         }
@@ -296,6 +324,10 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
         if many {
             help.push_str(" (layer names or file paths, separated by ;)");
         }
+        if calculator_inputs && many {
+            help.push(' ');
+            help.push_str(CALCULATOR_INPUTS_HELP);
+        }
         params.push(ParamSpec {
             name: leak(pname),
             label: leak(label_of(pname)),
@@ -303,6 +335,19 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
             required: p.get("required").and_then(Value::as_bool).unwrap_or(false),
             default: leak(default),
             help: leak(help),
+        });
+    }
+    // One optional field names the new layers. A tool with an option or input of its own called
+    // `output` keeps it, and its outputs keep the tool's name.
+    let names_outputs = meta.iter().any(|p| p.role == Role::Output) && !params.iter().any(|p| p.name == OUTPUT);
+    if names_outputs {
+        params.push(ParamSpec {
+            name: OUTPUT,
+            label: OUTPUT_LABEL,
+            kind: ParamKind::Text,
+            required: false,
+            default: "",
+            help: OUTPUT_HELP,
         });
     }
     let spec = ToolSpec {
@@ -314,7 +359,7 @@ fn spec_of(m: &Value) -> Option<(ToolSpec, Meta)> {
         run: rustgis_analysis::external_placeholder,
     };
     let schema = spec.params;
-    Some((spec, Meta { schema, category, params: meta }))
+    Some((spec, Meta { schema, category, params: meta, names_outputs }))
 }
 
 /// `g` with every point converted by `f`, or `None` when a point can't be (rather than
@@ -500,6 +545,94 @@ fn stage(inputs: &dyn Inputs, value: &str, data: Data, tf: &Transformer, job: &m
     Err(format!("there is no layer or file named '{value}'"))
 }
 
+/// The names a Raster Calculator expression quotes, each once, in the order they first appear,
+/// read as the runner reads them: between `"` when the expression has one, else between `'`.
+fn quoted_names(expression: &str) -> Vec<&str> {
+    let delimiter = if expression.contains('"') { '"' } else { '\'' };
+    let mut names: Vec<&str> = Vec::new();
+    for name in expression.split(delimiter).skip(1).step_by(2).map(str::trim) {
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    names
+}
+
+/// The Raster Calculator's `list` of inputs in the order its `expression` first quotes them,
+/// and a notice when they keep their order instead. The runner binds the k-th quoted name to the
+/// k-th input whatever that input is called, and RustGIS stages a layer under a file name of its
+/// own, so without this a layer's name in the expression reads another layer's cells, silently.
+/// A quoted name matches an input by layer name, or, for a file, by its path, file name or name
+/// without extension; ASCII case aside, as layers are found by name, with an exact match first.
+/// A name that matches none, or an input the expression doesn't use, is refused, unless only
+/// files are listed and no name matches any: the runner's own contract (the k-th quoted name is
+/// the k-th file) then holds as before, and the notice says which name reads which file.
+fn calculator_order<'a>(expression: &str, list: Vec<&'a str>, inputs: &dyn Inputs) -> Result<(Vec<&'a str>, Option<String>), String> {
+    let quoted = quoted_names(expression);
+    if quoted.is_empty() {
+        // The runner says an expression needs a quoted name.
+        return Ok((list, None));
+    }
+    let layer: Vec<bool> = list.iter().map(|n| inputs.raster(n).is_some() || inputs.dataset(n).is_some()).collect();
+    let file_parts = |n: &'a str| {
+        let p = Path::new(n);
+        [p.file_name(), p.file_stem()].into_iter().flatten().filter_map(|part| part.to_str())
+    };
+    // `whole`: the input's whole name (a layer's, or a file's path); else a file's name or stem.
+    let matches = |q: &str, i: usize, same: fn(&str, &str) -> bool, whole: bool| {
+        if whole { same(q, list[i]) } else { !layer[i] && file_parts(list[i]).any(|part| same(q, part)) }
+    };
+    let exact: fn(&str, &str) -> bool = |a, b| a == b;
+    let any_case: fn(&str, &str) -> bool = |a, b| a.eq_ignore_ascii_case(b);
+    // Exact before any case, and a whole name before a file's name, each pass over every name
+    // before the next: a layer `A` isn't taken by `/x/A.tif` listed before it, nor `nir.tif` by
+    // `'NIR'` before `'nir'` matches it exactly.
+    let passes = [(exact, true), (exact, false), (any_case, true), (any_case, false)];
+    // Each quoted name takes the first input it matches that no other name took, so one layer
+    // listed twice can be quoted under two names (a path and a file name, say).
+    let mut taken = vec![false; list.len()];
+    let mut bound: Vec<Option<usize>> = vec![None; quoted.len()];
+    for (same, whole) in passes {
+        for (k, q) in quoted.iter().enumerate() {
+            if bound[k].is_none()
+                && let Some(i) = (0..list.len()).find(|&i| !taken[i] && matches(q, i, same, whole))
+            {
+                taken[i] = true;
+                bound[k] = Some(i);
+            }
+        }
+    }
+    let order: Vec<&'a str> = bound.iter().flatten().map(|&i| list[i]).collect();
+    let missing: Vec<String> = quoted.iter().zip(&bound).filter(|(_, b)| b.is_none()).map(|(q, _)| format!("\"{q}\"")).collect();
+    if order.is_empty() && !layer.contains(&true) {
+        // By position, one file per name: a file left over, or a name without a file, is refused
+        // here, so the notice below names every pair.
+        if quoted.len() != list.len() {
+            return Err(format!(
+                "the expression quotes {} name(s) but {} file(s) are listed: list one file per quoted name, in the order they first appear",
+                quoted.len(),
+                list.len()
+            ));
+        }
+        let pairs: Vec<String> = quoted.iter().zip(&list).map(|(q, n)| format!("\"{q}\" from {n}")).collect();
+        let note =
+            format!("no quoted name matches an input file's path or name, so they are read in the order listed: {}", pairs.join(", "));
+        return Ok((list, Some(note)));
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "the expression quotes {} but the inputs are {}: quote each input layer's name, or a file's path or name, as it is listed",
+            missing.join(", "),
+            list.join("; ")
+        ));
+    }
+    let unused: Vec<&str> = list.iter().zip(&taken).filter(|(_, t)| !**t).map(|(n, _)| *n).collect();
+    if !unused.is_empty() {
+        return Err(format!("the expression doesn't quote the input(s) {}: list only the layers it uses", unused.join("; ")));
+    }
+    Ok((order, None))
+}
+
 /// Whether `p` names something on disk (never in the browser, which has no file system).
 fn on_disk(p: &str) -> bool {
     !cfg!(target_arch = "wasm32") && Path::new(p).exists()
@@ -608,7 +741,7 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
             if let Some(r) = inputs.raster(n) {
                 raster_crs.push(r.raster.crs);
             } else if let Some(ds) = inputs.dataset(n) {
-                vector_extents.push(ds.extent());
+                vector_extents.push(ds.lonlat_extent());
             }
         }
     }
@@ -625,11 +758,23 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
     };
 
     let n_outputs = meta.params.iter().filter(|p| p.role == Role::Output).count();
+    let given = if meta.names_outputs { output_name(spec, params, &mut job.notes)? } else { None };
+    let base = given.as_deref().unwrap_or(spec.name);
+    let (mut renamed, mut shortened) = (Vec::new(), false);
     for p in &meta.params {
         match p.role {
             Role::Input => {
                 let Some(v) = value_of(&p.name) else { continue };
-                let files = names(v)?.into_iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
+                let mut list = names(v)?;
+                if id == CALCULATOR
+                    && p.name == "inputs"
+                    && let Some(expression) = params.get("expression").and_then(Value::as_str)
+                {
+                    let (order, note) = calculator_order(expression, list, inputs).map_err(|e| format!("{}: {e}", spec.name))?;
+                    list = order;
+                    job.notes.extend(note.map(|n| format!("{}: {n}", spec.name)));
+                }
+                let files = list.into_iter().map(|n| stage(inputs, n, p.data, &tf, &mut job)).collect::<Result<Vec<_>, _>>()?;
                 if !files.is_empty() {
                     job.args.push((p.name.clone(), Arg::Files(files)));
                 }
@@ -637,9 +782,21 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
             Role::Output => {
                 let file = format!("{}.{}", safe(&p.name), output_ext(p, meta));
                 job.args.push((p.name.clone(), Arg::Files(vec![FileRef::Work(file.clone())])));
-                let name =
-                    if n_outputs > 1 { format!("{} {}", spec.name, label_of(&p.name).to_lowercase()) } else { spec.name.to_string() };
-                job.outputs.push((file, name));
+                // Each output's own name after the one given, kept whole within the limit.
+                let suffix = if n_outputs > 1 { format!(" {}", label_of(&p.name).to_lowercase()) } else { String::new() };
+                let room = MAX_OUTPUT_NAME.saturating_sub(suffix.chars().count());
+                shortened |= given.is_some() && base.chars().count() > room;
+                let name: String = base.chars().take(room).chain(suffix.chars()).collect();
+                // A name a layer, a table or an earlier output of this run has gets a number, so two
+                // runs don't give two layers of one name. Said when it was the name given.
+                let taken = |n: &str| {
+                    inputs.dataset(n).is_some() || inputs.raster(n).is_some() || job.outputs.iter().any(|(_, o)| o.eq_ignore_ascii_case(n))
+                };
+                let free = numbered(base, &suffix, taken);
+                if given.is_some() && free != name {
+                    renamed.push(format!("'{name}' is now '{free}'"));
+                }
+                job.outputs.push((file, free));
             }
             Role::Option => {
                 let Some(v) = value_of(&p.name).map(|v| option_value(v, p.data)) else { continue };
@@ -654,22 +811,233 @@ fn prepare_with(spec: &ToolSpec, meta: &Meta, inputs: &dyn Inputs, params: &Valu
             }
         }
     }
+    // One notice per kind, with a count.
+    if !renamed.is_empty() {
+        job.notes.push(format!("{}: {} output name(s) in use already, so numbered: {}", spec.name, renamed.len(), renamed.join(", ")));
+    }
+    if shortened {
+        job.notes.push(format!("{}: the output name is cut to fit each output's own name within {MAX_OUTPUT_NAME} characters", spec.name));
+    }
     Ok(job)
+}
+
+/// The layer name given in [`OUTPUT`], trimmed, or `None` for the tool's own name. Cut to
+/// [`MAX_OUTPUT_NAME`] characters, which is said.
+fn output_name(spec: &ToolSpec, params: &Value, notes: &mut Vec<String>) -> Result<Option<String>, String> {
+    let name = match params.get(OUTPUT) {
+        None | Some(Value::Null) => return Ok(None),
+        Some(Value::String(s)) => s.trim(),
+        Some(_) => return Err(format!("{}: '{OUTPUT}' is the new layer's name and must be text", spec.name)),
+    };
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let n = name.chars().count();
+    if n > MAX_OUTPUT_NAME {
+        notes.push(format!("{}: the output name is cut from {n} to {MAX_OUTPUT_NAME} characters", spec.name));
+    }
+    Ok(Some(name.chars().take(MAX_OUTPUT_NAME).collect()))
+}
+
+/// `base` with `suffix` (one output's own name) after it, or, while `taken` claims that, the
+/// first with ` 2`, ` 3`… after the suffix that it doesn't. Each fits [`MAX_OUTPUT_NAME`]
+/// characters by cutting `base`, never the suffix or the number.
+fn numbered(base: &str, suffix: &str, taken: impl Fn(&str) -> bool) -> String {
+    let fit = |tail: &str| -> String {
+        let room = MAX_OUTPUT_NAME.saturating_sub(tail.chars().count());
+        base.chars().take(room).chain(tail.chars()).collect()
+    };
+    let mut name = fit(suffix);
+    let mut k = 1u64;
+    while taken(&name) {
+        k += 1;
+        name = fit(&format!("{suffix} {k}"));
+    }
+    name
 }
 
 /// Coordinates that can't be longitude/latitude (a tool kept the working coordinate system).
 fn looks_projected(ds: &Dataset) -> bool {
-    let e = ds.extent();
-    !e.is_empty() && (e.min_x < -180.5 || e.max_x > 180.5 || e.min_y < -90.5 || e.max_y > 90.5)
+    ds.extent().beyond_lonlat()
+}
+
+/// `bytes` without a byte-order mark, when they start as a JSON object (after white space) rather
+/// than with a TIFF's signature (which never starts with `{`).
+fn json_not_tiff(bytes: &[u8]) -> Option<&[u8]> {
+    let json = bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes);
+    (json.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{')).then_some(json)
+}
+
+/// A JSON object (after white space; [`json_not_tiff`] has left out a byte-order mark) whose own
+/// `type` ([`own_type`]) is one of GeoJSON's (a feature collection, a feature or a geometry),
+/// TopoJSON's or CityJSON's, which RustGIS reads as layers. Whether the document parses doesn't
+/// matter: GeoJSON cut short while it was written is read, so the reader's error is shown rather
+/// than its text. Anything else is a report: a list, plain text, or an object with no `type`, with
+/// a `type` that isn't text, or with another one.
+fn is_geojson(json: &[u8]) -> bool {
+    const TYPES: [&str; 11] = [
+        "FeatureCollection",
+        "Topology",
+        "CityJSON",
+        "Feature",
+        "Point",
+        "MultiPoint",
+        "LineString",
+        "MultiLineString",
+        "Polygon",
+        "MultiPolygon",
+        "GeometryCollection",
+    ];
+    json.iter().find(|b| !b.is_ascii_whitespace()) == Some(&b'{') && own_type(json).is_some_and(|t| TYPES.contains(&t.as_str()))
+}
+
+/// The `type` member of the JSON object `json` starts with, when its value is a string: among the
+/// object's own members, wherever it comes (after a `crs`, after the features), not one nested in
+/// them; names and values with their escapes decoded (`"\u0074ype"` is `"type"`). The first `type`
+/// counts, should there be two. One pass, stopping at the `type` or at the object's end, and the
+/// same whether the document is whole or cut short.
+fn own_type(json: &[u8]) -> Option<String> {
+    /// What the last of the object's own tokens was, as far as finding `"type": "…"` goes.
+    #[derive(PartialEq)]
+    enum Last {
+        Other,
+        TypeName,
+        TypeColon,
+    }
+    let (mut depth, mut i, mut last) = (0usize, 0usize, Last::Other);
+    while let Some(&b) = json.get(i) {
+        match b {
+            b'"' => {
+                let (text, next) = json_string(json, i + 1, depth == 1);
+                i = next;
+                if depth == 1 {
+                    if last == Last::TypeColon {
+                        return text;
+                    }
+                    last = if text.as_deref() == Some("type") { Last::TypeName } else { Last::Other };
+                }
+                continue;
+            }
+            b'{' | b'[' => {
+                depth += 1;
+                if depth == 2 {
+                    last = Last::Other;
+                }
+            }
+            b'}' | b']' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return None;
+                }
+            }
+            b':' if depth == 1 => last = if last == Last::TypeName { Last::TypeColon } else { Last::Other },
+            _ if b.is_ascii_whitespace() => {}
+            _ if depth == 1 => last = Last::Other,
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// The JSON string whose text starts at `json[start]` (after its opening quote), its escapes
+/// decoded when `decode` (else `None`, only skipped), and where after its closing quote the
+/// document goes on (its end, when it is cut short inside the string).
+fn json_string(json: &[u8], start: usize, decode: bool) -> (Option<String>, usize) {
+    let mut out = Vec::new();
+    let mut i = start;
+    while let Some(&b) = json.get(i) {
+        match b {
+            b'"' => return (decode.then(|| String::from_utf8_lossy(&out).into_owned()), i + 1),
+            b'\\' => {
+                let Some(&e) = json.get(i + 1) else { break };
+                i += 2;
+                if !decode {
+                    continue;
+                }
+                match e {
+                    b'u' => {
+                        let hex = |at: usize| {
+                            json.get(at..at + 4)
+                                .filter(|h| h.iter().all(u8::is_ascii_hexdigit))
+                                .and_then(|h| std::str::from_utf8(h).ok())
+                                .and_then(|h| u32::from_str_radix(h, 16).ok())
+                        };
+                        let Some(mut code) = hex(i) else { continue };
+                        i += 4;
+                        // A pair of surrogates is one character.
+                        if (0xD800..0xDC00).contains(&code)
+                            && json.get(i..i + 2) == Some(b"\\u".as_slice())
+                            && let Some(low) = hex(i + 2).filter(|l| (0xDC00..0xE000).contains(l))
+                        {
+                            code = 0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00);
+                            i += 6;
+                        }
+                        let c = char::from_u32(code).unwrap_or(char::REPLACEMENT_CHARACTER);
+                        out.extend_from_slice(c.encode_utf8(&mut [0; 4]).as_bytes());
+                    }
+                    b'n' => out.push(b'\n'),
+                    b't' => out.push(b'\t'),
+                    b'r' => out.push(b'\r'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    other => out.push(other),
+                }
+                continue;
+            }
+            _ => {
+                if decode {
+                    out.push(b);
+                }
+            }
+        }
+        i += 1;
+    }
+    (decode.then(|| String::from_utf8_lossy(&out).into_owned()), json.len())
 }
 
 /// Reads one output file back as a layer, table or message. `dir` is the native working folder,
 /// for formats read with their sidecar files (shapefiles).
-fn load(file_name: &str, bytes: &[u8], layer_name: &str, job: &Job, dir: Option<&Path>, messages: &mut Vec<String>) -> Option<OutputLayer> {
-    let ext = Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+fn load(
+    file_name: &str,
+    bytes: &[u8],
+    layer_name: &str,
+    job: &Job,
+    dir: Option<&Path>,
+    messages: &mut Vec<String>,
+    losses: &mut Vec<rustgis_data::loss::LossMessage>,
+) -> Option<OutputLayer> {
+    let mut ext = Path::new(file_name).extension().and_then(|e| e.to_str()).unwrap_or("").to_ascii_lowercase();
+    // A tool whose manifest calls its vector output a raster writes GeoJSON into the `.tif` it is
+    // given (Longest Flowpath, #2762): read by what it holds, GeoJSON as `.json` and another JSON
+    // document (a report) as text. A JSON object is taken without its byte-order mark, which the
+    // JSON reader refuses; whether it is a layer ([`is_geojson`]) is worked out once, in a pass
+    // over its members up to its `type`, and only where it decides something (not for a `.geojson`).
+    let object = if matches!(ext.as_str(), "tif" | "tiff" | "json" | "geojson") { json_not_tiff(bytes) } else { None };
+    let layer = matches!(ext.as_str(), "tif" | "tiff" | "json") && object.is_some_and(is_geojson);
+    let renamed;
+    let (file_name, bytes) = match object {
+        Some(json) if matches!(ext.as_str(), "tif" | "tiff") => {
+            ext = if layer { "json" } else { "txt" }.into();
+            renamed = Path::new(file_name).with_extension(&ext).display().to_string();
+            (renamed.as_str(), json)
+        }
+        // A `.json` object that isn't GeoJSON (the reader would take it for a feature without a
+        // geometry) is shown as a report, as it is from a `.tif`.
+        Some(json) if ext == "json" && !layer => {
+            ext = "txt".into();
+            (file_name, json)
+        }
+        Some(json) => (file_name, json),
+        None if matches!(ext.as_str(), "json" | "geojson") => (file_name, bytes.strip_prefix("\u{feff}".as_bytes()).unwrap_or(bytes)),
+        None => (file_name, bytes),
+    };
     match ext.as_str() {
         "tif" | "tiff" | "asc" => match rustgis_data::raster::read_bytes(file_name, bytes) {
-            Ok(_) => Some(OutputLayer::Raster { name: layer_name.to_string(), file_name: file_name.to_string(), bytes: bytes.to_vec() }),
+            Ok(grey) => {
+                let bytes = if ext == "asc" { bytes.to_vec() } else { colours_split(&grey, bytes, layer_name, messages) };
+                Some(OutputLayer::Raster { name: layer_name.to_string(), file_name: file_name.to_string(), bytes })
+            }
             Err(e) => {
                 messages.push(format!("{layer_name}: {e}"));
                 None
@@ -681,24 +1049,62 @@ fn load(file_name: &str, bytes: &[u8], layer_name: &str, job: &Job, dir: Option<
                 _ => rustgis_data::io::read_bytes(file_name, bytes),
             };
             match read {
-                Ok((mut ds, _)) => {
+                Ok((mut ds, report)) => {
                     ds.name = layer_name.to_string();
-                    if job.crs != Crs::LonLat
-                        && looks_projected(&ds)
-                        && let Ok(tf) = job.crs.transformer()
-                    {
-                        let lost = convert_features(&mut ds, |c| tf.to_lonlat(c));
-                        if lost > 0 {
-                            messages.push(format!(
-                                "{layer_name}: {lost} features couldn't be converted to longitude/latitude and have no geometry"
-                            ));
+                    // What the reader left out or assumed (features without a geometry it reads, Z
+                    // values, a `crs` it doesn't know) is said, as when the file is added.
+                    for note in report.messages {
+                        let note = note.prefixed(layer_name);
+                        match note.loss {
+                            Some(code) => losses.push(rustgis_data::loss::LossMessage { code, text: note.text }),
+                            None => messages.push(note.text),
+                        }
+                    }
+                    // An output that says its system (a .prj, a GeoJSON `crs`) is held in it as
+                    // read; one in the working system that doesn't is relabelled to it.
+                    if job.crs != Crs::LonLat && ds.coord_crs() == Crs::LonLat && looks_projected(&ds) {
+                        match job.crs.to(Crs::LonLat) {
+                            Ok(to) => {
+                                ds.held_in = job.crs;
+                                ds.crs = Some(job.crs);
+                                // A feature with a place that can't be given in longitude/latitude
+                                // is kept as read, and counted: it doesn't draw (#2032 C2f-4b). Each
+                                // place is converted to be checked; the layer keeps its own.
+                                let (mut lost, mut beyond) = (0usize, 0usize);
+                                for g in ds.features.rows().filter_map(|r| r.geometry()) {
+                                    match Dataset::converted_to_lonlat(&to, g) {
+                                        Some(l) => beyond += usize::from(l.extent().beyond_lonlat()),
+                                        None => lost += 1,
+                                    }
+                                }
+                                if beyond > 0 {
+                                    let have = if beyond == 1 { "feature has" } else { "features have" };
+                                    messages.push(format!(
+                                        "{layer_name}: {beyond} {have} coordinates that come out beyond longitude/latitude once converted from {}: it may not be their coordinate system, and they may draw out of place",
+                                        job.crs.label()
+                                    ));
+                                }
+                                if lost > 0 {
+                                    let have = if lost == 1 { "feature has" } else { "features have" };
+                                    messages.push(format!(
+                                        "{layer_name}: {lost} {have} a place in {} that can't be given in longitude/latitude: kept as read, but not drawn",
+                                        job.crs.label()
+                                    ));
+                                }
+                            }
+                            // Not held in a system it can't be converted from: kept as read, and said.
+                            Err(e) => messages.push(format!(
+                                "{layer_name}: its {} features are in {}, which can't be converted to longitude/latitude ({e}); they are kept as read and draw off the map",
+                                ds.features.len(),
+                                job.crs.label()
+                            )),
                         }
                     }
                     Some(if ds.features.iter().all(|f| f.geometry.is_none()) { OutputLayer::Table(ds) } else { OutputLayer::Vector(ds) })
                 }
-                // A JSON report rather than GeoJSON: show it.
-                Err(_) if ext == "json" => {
-                    text_message(bytes, layer_name, messages);
+                // A JSON report rather than GeoJSON: show it. GeoJSON that can't be read says why.
+                Err(_) if ext == "json" && !layer => {
+                    text_message(bytes, layer_name, false, messages);
                     None
                 }
                 Err(e) => {
@@ -708,7 +1114,7 @@ fn load(file_name: &str, bytes: &[u8], layer_name: &str, job: &Job, dir: Option<
             }
         }
         "txt" | "html" | "htm" => {
-            text_message(bytes, layer_name, messages);
+            text_message(bytes, layer_name, ext != "txt", messages);
             None
         }
         _ => {
@@ -718,12 +1124,36 @@ fn load(file_name: &str, bytes: &[u8], layer_name: &str, job: &Job, dir: Option<
     }
 }
 
-/// The start of a text or HTML report as a message.
-fn text_message(bytes: &[u8], layer_name: &str, messages: &mut Vec<String>) {
-    let text = String::from_utf8_lossy(bytes);
+/// A GeoTIFF output's bytes for its layer: one of packed colour (a single `UInt32` band of
+/// `0xAABBGGRR`, as Panchromatic Sharpening writes by default) rewritten as red, green, blue and
+/// alpha byte bands before anything holds it as `f32`, which drops the red byte (#2594), and said;
+/// any other as the tool wrote it. `grey` is the file as read.
+fn colours_split(grey: &rustgis_data::raster::Raster, bytes: &[u8], layer_name: &str, messages: &mut Vec<String>) -> Vec<u8> {
+    use rustgis_data::raster::geotiff;
+    match geotiff::unpack_rgba(grey, bytes).and_then(|r| r.map(|r| geotiff::write_all(&r)).transpose()) {
+        Ok(Some(rgba)) => {
+            messages.push(format!(
+                "{layer_name}: its one band of packed colours (alpha, blue, green and red bytes) was split into red, green and blue bands, see-through where alpha is 0 or the pixel is no-data"
+            ));
+            // What reading the tool's file left out, which the rewritten file no longer shows.
+            messages.extend(grey.lost.texts().map(|l| format!("{layer_name}: {l}")));
+            rgba
+        }
+        Ok(None) => bytes.to_vec(),
+        Err(e) => {
+            messages.push(format!(
+                "{layer_name}: its one band of packed colours couldn't be split into red, green and blue bands ({e}): it is kept as one band of 32-bit floats, which lose the red byte"
+            ));
+            bytes.to_vec()
+        }
+    }
+}
+
+/// `html` without its tags.
+fn strip_tags(html: &str) -> String {
     let mut plain = String::new();
     let mut in_tag = false;
-    for c in text.chars() {
+    for c in html.chars() {
         match c {
             '<' => in_tag = true,
             '>' => in_tag = false,
@@ -731,9 +1161,43 @@ fn text_message(bytes: &[u8], layer_name: &str, messages: &mut Vec<String>) {
             _ => {}
         }
     }
-    let lines: Vec<&str> = plain.lines().map(str::trim).filter(|l| !l.is_empty()).take(30).collect();
+    plain
+}
+
+/// The most lines of a report shown.
+const REPORT_LINES: usize = 30;
+/// The most characters of a report's line shown (a JSON report may be one long line).
+const REPORT_LINE_CHARS: usize = 500;
+
+/// The start of a text, JSON or (`html`) HTML report as a message, its tags left out, saying how many
+/// more lines it has.
+fn text_message(bytes: &[u8], layer_name: &str, html: bool, messages: &mut Vec<String>) {
+    let text = String::from_utf8_lossy(bytes);
+    let text = text.trim_start_matches('\u{feff}');
+    let plain: std::borrow::Cow<str> = if html { strip_tags(text).into() } else { text.into() };
+    // The first lines kept, the rest only counted, so a large report costs no more than its text.
+    let mut rest = plain.lines().map(str::trim).filter(|l| !l.is_empty());
+    let shown: Vec<&str> = rest.by_ref().take(REPORT_LINES).collect();
+    let more = rest.count();
+    let mut cut = 0;
+    let lines: Vec<String> = shown
+        .iter()
+        .map(|l| match l.char_indices().nth(REPORT_LINE_CHARS) {
+            Some((at, _)) => {
+                cut += 1;
+                format!("{}…", l.get(..at).unwrap_or(l))
+            }
+            None => l.to_string(),
+        })
+        .collect();
     if !lines.is_empty() {
         messages.push(format!("{layer_name}:\n{}", lines.join("\n")));
+    }
+    if more > 0 {
+        messages.push(format!("{layer_name}: the report's other {more} non-empty lines aren't shown"));
+    }
+    if cut > 0 {
+        messages.push(format!("{layer_name}: lines of the report cut at {REPORT_LINE_CHARS} characters: {cut}"));
     }
 }
 
@@ -753,6 +1217,7 @@ pub fn finish(job: &Job, files: &[(String, Vec<u8>)], lines: &[String], dir: Opt
     messages.extend(lines.into_iter().take(40).map(str::to_string));
 
     let mut layers = Vec::new();
+    let mut losses = Vec::new();
     for (file, name) in &job.outputs {
         // A tool may pick its own extension (a shapefile for a vector output).
         let stem = Path::new(file).file_stem();
@@ -763,7 +1228,7 @@ pub fn finish(job: &Job, files: &[(String, Vec<u8>)], lines: &[String], dir: Opt
             })
         });
         if let Some((f, bytes)) = found
-            && let Some(l) = load(f, bytes, name, job, dir, &mut messages)
+            && let Some(l) = load(f, bytes, name, job, dir, &mut messages, &mut losses)
         {
             layers.push(l);
         }
@@ -786,7 +1251,7 @@ pub fn finish(job: &Job, files: &[(String, Vec<u8>)], lines: &[String], dir: Opt
     if layers.is_empty() && messages.is_empty() {
         messages.push(format!("{} finished without output", job.name));
     }
-    ToolResult { output: Output::Layers(layers), messages }
+    ToolResult { losses, output: Output::Layers(layers), messages }
 }
 
 /// Runs a tool to completion: natively through the `geolibre` program; in the browser the

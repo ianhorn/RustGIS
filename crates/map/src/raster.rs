@@ -26,6 +26,11 @@ pub struct RasterLayer {
     /// in view as it draws (see [`set_in_place_reader`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub in_place: bool,
+    /// `path` is a file on this computer read in place this session, as a web address's is: a
+    /// tiled GeoTIFF too large to hold whole (#2761), found so each time it is read (see
+    /// [`set_tiled_probe`]). Never saved: a project keeps it as the file it is.
+    #[serde(skip)]
+    pub tiled: bool,
     /// The file's own name (for its format) when it is embedded.
     #[serde(default)]
     pub file_name: Option<String>,
@@ -105,6 +110,11 @@ pub struct RasterLayer {
     /// [`RasterLayer::dropped_unsaid`]).
     #[serde(skip)]
     dropped: Vec<&'static str>,
+    /// The pixels and the file that `embedded` was written from them as, while both are still the
+    /// layer's (see [`RasterLayer::written_file`]): held weakly, so a change to either, which takes
+    /// a new allocation, breaks the pairing.
+    #[serde(skip)]
+    written: Option<(Weak<Raster>, Weak<Vec<u8>>)>,
 }
 
 /// Called once with a cloud-optimised GeoTIFF's overview, or why it couldn't be read.
@@ -117,7 +127,7 @@ pub type InPlaceRead = Box<dyn FnOnce(Result<Raster, String>) + Send>;
 /// place in `layers`: without waiting, the reads that couldn't start.
 pub fn read_together(layers: &mut [&mut RasterLayer], wait: bool) -> Vec<(usize, String)> {
     let mut failed = Vec::new();
-    let unread = |l: &RasterLayer| l.in_place && l.data.is_none() && l.opening.is_none() && l.time_zarr.is_none();
+    let unread = |l: &RasterLayer| l.reads_in_place() && l.data.is_none() && l.opening.is_none() && l.time_zarr.is_none();
     for (i, l) in layers.iter_mut().enumerate() {
         // Started without waiting: waited for below, together.
         if unread(l)
@@ -146,7 +156,7 @@ pub fn wait_for_reads(layers: &mut [&mut RasterLayer]) -> Vec<(usize, String)> {
         let deadline = Instant::now() + rustgis_data::raster::IN_PLACE_WAIT;
         let mut failed = Vec::new();
         for (i, l) in layers.iter_mut().enumerate() {
-            if l.in_place
+            if l.reads_in_place()
                 && l.opening.is_some()
                 && let Err(e) = l.wait_for_read(deadline)
             {
@@ -167,6 +177,55 @@ fn in_place_reader() -> &'static Mutex<Option<InPlaceReader>> {
 /// which checks addresses and signs requests; this crate does no networking).
 pub fn set_in_place_reader(f: impl Fn(&str, InPlaceRead) + Send + Sync + 'static) {
     *in_place_reader().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+}
+
+type TiledProbe = Arc<dyn Fn(&str) -> bool + Send + Sync>;
+
+fn tiled_probe() -> &'static Mutex<Option<TiledProbe>> {
+    static P: std::sync::OnceLock<Mutex<Option<TiledProbe>>> = std::sync::OnceLock::new();
+    P.get_or_init(Mutex::default)
+}
+
+/// Sets how a raster file on this computer is found to be read in place rather than held whole
+/// ([`RasterLayer::tiled`]): the app's test, which reads the file's header. Without one, every
+/// file is read whole.
+pub fn set_tiled_probe(f: impl Fn(&str) -> bool + Send + Sync + 'static) {
+    *tiled_probe().lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(f));
+}
+
+/// Whether the file at `path` is read in place, by the installed probe.
+fn probed_tiled(path: &str) -> bool {
+    let probe = tiled_probe().lock().unwrap_or_else(|e| e.into_inner()).clone();
+    probe.is_some_and(|p| p(path))
+}
+
+/// The overview of the file at `path` read in place by the installed reader, waited for
+/// (natively; at most two minutes); `None` when it can't be read so, or in the browser.
+fn read_in_place_now(path: &str) -> Option<Raster> {
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = path;
+        None
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        use rustgis_data::source::remote;
+        let reader = in_place_reader().lock().unwrap_or_else(|e| e.into_inner()).clone()?;
+        let still = remote::current_still();
+        let (tx, rx) = std::sync::mpsc::channel();
+        reader(path, Box::new(move |r| tx.send(r).unwrap_or_default()));
+        // Waited for as `wait_for_read` waits: given up as soon as the read is asked to stop (a
+        // Cancel, a project replaced).
+        let deadline = Instant::now() + rustgis_data::raster::IN_PLACE_WAIT;
+        loop {
+            remote::check_still(&still).ok()?;
+            match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+                Ok(r) => return r.ok(),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if Instant::now() < deadline => {}
+                Err(_) => return None,
+            }
+        }
+    }
 }
 
 /// The renderer bands' statistics without the masked pixels, and what they were worked out for:
@@ -190,6 +249,13 @@ impl RasterLayer {
     /// Whether a captured opening still owns the live source and any deferred address look.
     pub fn same_opening(&self, other: &Self) -> bool {
         self.read_generation == other.read_generation && self.restyle == other.restyle && self.look == other.look
+    }
+
+    /// Whether the map reads the part in view as it draws, holding only an overview: a web
+    /// address's cloud-optimised GeoTIFF ([`RasterLayer::in_place`]), or a large tiled GeoTIFF on
+    /// this computer ([`RasterLayer::tiled`]).
+    pub fn reads_in_place(&self) -> bool {
+        self.in_place || self.tiled
     }
 
     /// Detaches a fully read replacement from the prior opening's pending reads and notices.
@@ -222,17 +288,37 @@ impl RasterLayer {
             return Err("give a raster file or Zarr store on this computer: web addresses aren't repaired here".into());
         }
         let sub = subdataset.or(self.subdataset.as_deref());
-        let r = self.read_placed(path, sub, false).map_err(|e| format!("{path}: {e}"))?;
+        // A large tiled GeoTIFF is read in place, as when it was added (#2761): its overview,
+        // waited for (a repair or reload reads ahead of the window, natively); read whole when
+        // that can't be read after all.
+        let in_place = if sub.is_none() && self.crs.is_none() && self.placement.is_none() && probed_tiled(path) {
+            read_in_place_now(path)
+        } else {
+            None
+        };
+        let tiled = in_place.is_some();
+        let r = match in_place {
+            Some(r) => r,
+            None => {
+                // Not read whole for a read asked to stop (a Cancel, a project replaced).
+                rustgis_data::source::remote::check_still(&rustgis_data::source::remote::current_still())?;
+                self.read_placed(path, sub, false).map_err(|e| format!("{path}: {e}"))?
+            }
+        };
         self.validate_replacement(&r, path)?;
         let mut style = self.style.clone();
         style.repair(&r);
+        // An SRTM tile or DTED file takes no subdataset or coordinate system: the ones the layer
+        // had were said to be ignored as it was read, and aren't kept.
+        let elevation = rustgis_data::raster::is_elevation_name(path);
         Ok(RasterLayer {
             path: Some(path.into()),
             in_place: false,
+            tiled,
             file_name: None,
             embedded: None,
-            subdataset: sub.map(String::from),
-            crs: self.crs.clone(),
+            subdataset: sub.filter(|_| !elevation).map(String::from),
+            crs: self.crs.clone().filter(|_| !elevation),
             time_zarr: None,
             placement: self.placement,
             style,
@@ -252,6 +338,7 @@ impl RasterLayer {
             lost_said: false,
             look_lost: None,
             dropped: Vec::new(),
+            written: None,
         })
     }
 
@@ -278,6 +365,7 @@ impl RasterLayer {
         RasterLayer {
             path: Some(path.into()),
             in_place: false,
+            tiled: false,
             file_name: None,
             embedded: None,
             subdataset: None,
@@ -301,17 +389,42 @@ impl RasterLayer {
             lost_said: false,
             look_lost: None,
             dropped: Vec::new(),
+            written: None,
         }
     }
 
     /// A raster from a file's bytes, kept in the project.
     pub fn from_bytes(raster: Raster, file_name: impl Into<String>, bytes: Vec<u8>) -> RasterLayer {
+        Self::from_shared(raster, file_name, Arc::new(bytes))
+    }
+
+    /// A raster with the file [`rustgis_data::raster::geotiff::write_all`] wrote of it (or
+    /// [`rustgis_data::raster::geotiff::write`] of its first band, the same file when that writes every
+    /// band), kept in the project: [`RasterLayer::written_file`] gives that file back while neither
+    /// changes.
+    pub fn from_written(raster: Raster, file_name: impl Into<String>, bytes: Vec<u8>) -> RasterLayer {
+        let mut layer = Self::from_bytes(raster, file_name, bytes);
+        layer.written = layer.data.as_ref().map(Arc::downgrade).zip(layer.embedded.as_ref().map(Arc::downgrade));
+        layer
+    }
+
+    /// The embedded file, when it is the one [`RasterLayer::from_written`] was given for the
+    /// pixels the layer holds now: an export that writes every band writes those same bytes.
+    pub fn written_file(&self) -> Option<&Arc<Vec<u8>>> {
+        let (pixels, file) = self.written.as_ref()?;
+        let (data, embedded) = (self.data.as_ref()?, self.embedded.as_ref()?);
+        (Weak::as_ptr(pixels) == Arc::as_ptr(data) && Weak::as_ptr(file) == Arc::as_ptr(embedded)).then_some(embedded)
+    }
+
+    /// Keeps the original shared allocation used to decode an uploaded raster.
+    pub fn from_shared(raster: Raster, file_name: impl Into<String>, bytes: Arc<Vec<u8>>) -> RasterLayer {
         let style = RasterStyle::default_for(&raster);
         RasterLayer {
             path: None,
             in_place: false,
+            tiled: false,
             file_name: Some(file_name.into()),
-            embedded: Some(Arc::new(bytes)),
+            embedded: Some(bytes),
             subdataset: None,
             crs: None,
             time_zarr: None,
@@ -333,6 +446,7 @@ impl RasterLayer {
             lost_said: false,
             look_lost: None,
             dropped: Vec::new(),
+            written: None,
         }
     }
 
@@ -341,12 +455,19 @@ impl RasterLayer {
         RasterLayer { in_place: true, ..RasterLayer::from_path(raster, address) }
     }
 
+    /// A large tiled GeoTIFF on this computer read in place ([`RasterLayer::tiled`]), its overview
+    /// `raster` read.
+    pub fn tiled_file(raster: Raster, path: impl Into<String>) -> RasterLayer {
+        RasterLayer { tiled: true, ..RasterLayer::from_path(raster, path) }
+    }
+
     /// A cloud-optimised GeoTIFF read in place by its address, its overview not read yet: drawn,
     /// in its own look, once [`RasterLayer::reload`] (or [`read_together`]) has read it.
     pub fn unread_in_place(address: impl Into<String>) -> RasterLayer {
         RasterLayer {
             path: Some(address.into()),
             in_place: true,
+            tiled: false,
             file_name: None,
             embedded: None,
             subdataset: None,
@@ -370,6 +491,7 @@ impl RasterLayer {
             lost_said: false,
             look_lost: None,
             dropped: Vec::new(),
+            written: None,
         }
     }
 
@@ -415,8 +537,11 @@ impl RasterLayer {
         remote::check_still(&still)?;
         let Some(address) = self.path.clone() else { return Err("the raster has no source".to_string()) };
         // Checked as a tile layer's address is (http(s) or s3, a host, no control characters): a
-        // project edited by hand asks for nothing else.
-        crate::tiles::check_url(&address)?;
+        // project edited by hand asks for nothing else. A local file read in place was found so
+        // by the probe, and the reader checks its path again.
+        if !self.tiled {
+            crate::tiles::check_url(&address)?;
+        }
         let Some(reader) = in_place_reader().lock().unwrap_or_else(|e| e.into_inner()).clone() else {
             return Err(format!("{address}: can't be read in place here"));
         };
@@ -441,6 +566,8 @@ impl RasterLayer {
     /// one being read, and one that waits for something other than time (its bucket's connection:
     /// see [`RasterLayer::fail`]).
     pub fn read_failure(&self) -> Option<(&str, Instant, u32)> {
+        // A web address's read is made again; a local file's read in place that failed is the
+        // file's, which Reload Data reads again, deciding afresh how.
         if !self.in_place || self.data.is_some() || self.opening.is_some() {
             return None;
         }
@@ -495,21 +622,48 @@ impl RasterLayer {
         self.error = None;
         self.failed_at = None;
         self.failures = 0;
+        // A large tiled GeoTIFF on this computer is read in place, as a web address's is (#2761):
+        // asked each time it is read where the read is waited for (the probe reads the file's
+        // header), as the file may have been written again since; a read that isn't waited for
+        // keeps what was found. A scan laid by hand, a page, or a coordinate system given is read
+        // whole, as those apply to it.
+        if wait {
+            self.tiled = !self.in_place
+                && self.embedded.is_none()
+                && self.subdataset.is_none()
+                && self.crs.is_none()
+                && self.placement.is_none()
+                && self.path.as_deref().is_some_and(probed_tiled);
+        }
         // Read in place: its overview, by the reader the app installed; waited for natively when
-        // asked to (as a file is read), else landing later, as always in the browser.
-        if self.in_place {
-            if let Err(e) = self.begin_in_place_read() {
-                self.error = Some(e.clone());
-                self.error_said = false;
-                return Err(e);
-            }
+        // asked to (as a file is read), else landing later, as always in the browser. A local
+        // file whose overview can't be read so after all is read whole, as it was added.
+        if self.reads_in_place() {
+            let read = self.begin_in_place_read();
             #[cfg(not(target_arch = "wasm32"))]
-            if wait {
-                return self.wait_for_read(Instant::now() + rustgis_data::raster::IN_PLACE_WAIT);
-            }
+            let read = match read {
+                Ok(()) if wait => self.wait_for_read(Instant::now() + rustgis_data::raster::IN_PLACE_WAIT),
+                other => other,
+            };
             #[cfg(target_arch = "wasm32")]
             let _ = wait;
-            return Ok(());
+            match read {
+                // The in-place reader failing on its own, not a read asked to stop (a Cancel, a
+                // project replaced), which the whole read below wouldn't stop for.
+                Err(_) if self.tiled && rustgis_data::source::remote::check_still(&self.read_still).is_ok() => {
+                    self.tiled = false;
+                    self.opening = None;
+                    self.error = None;
+                    self.failed_at = None;
+                    self.failures = 0;
+                }
+                Err(e) => {
+                    self.error = Some(e.clone());
+                    self.error_said = false;
+                    return Err(e);
+                }
+                Ok(()) => return Ok(()),
+            }
         }
         if self.embedded.is_none()
             && let Some(path) = self.path.as_deref().filter(|p| {
@@ -524,6 +678,8 @@ impl RasterLayer {
                 .unwrap_or("raster.tif")
                 .to_string();
             let placement = self.placement;
+            // A PDF's page, read again from the download.
+            let page = self.subdataset.clone();
             let slot = Arc::new(Mutex::new(None));
             let land = slot.clone();
             let still = self.read_still.clone();
@@ -538,7 +694,7 @@ impl RasterLayer {
                             _ => "The raster could not be downloaded.".to_string(),
                         }))
                         .and_then(|bytes| {
-                            rustgis_data::raster::read_bytes(&name, &bytes)
+                            rustgis_data::raster::read_shared_page(&name, Arc::new(bytes), page.as_deref(), placement.is_none())
                                 .and_then(|r| placed(r, placement))
                                 .map(Arc::new)
                                 .map_err(|e| e.to_string())
@@ -551,8 +707,13 @@ impl RasterLayer {
         }
         // A scan goes back where it was laid (a GeoTIFF opened `as` a scan is one again).
         let r = if let Some(bytes) = &self.embedded {
-            rustgis_data::raster::read_bytes(self.file_name.as_deref().unwrap_or("raster.tif"), bytes)
-                .and_then(|r| placed(r, self.placement))
+            rustgis_data::raster::read_shared_page(
+                self.file_name.as_deref().unwrap_or("raster.tif"),
+                bytes.clone(),
+                self.subdataset.as_deref(),
+                self.placement.is_none(),
+            )
+            .and_then(|r| placed(r, self.placement))
         } else if let Some(p) = &self.path {
             self.read_placed(p, self.subdataset.as_deref(), true)
         } else {
@@ -560,6 +721,7 @@ impl RasterLayer {
         };
         match r {
             Ok(r) => {
+                self.forget_ignored_options();
                 self.style.repair(&r);
                 self.data = Some(Arc::new(r));
                 self.pixels_said = false;
@@ -630,7 +792,7 @@ impl RasterLayer {
     /// What reading its pixels left out (`Raster::lost`), the first time it is asked for after
     /// they landed, so it is said once: as the layer is added, as its project opens, or when they
     /// land later (the browser).
-    pub fn lost_unsaid(&mut self) -> Vec<String> {
+    pub fn lost_unsaid(&mut self) -> rustgis_data::loss::Notes {
         if self.lost_said {
             // A look applied after the pixels' losses were said: what it asked for that the file
             // hasn't, on its own, not the pixels' losses again.
@@ -645,7 +807,7 @@ impl RasterLayer {
     /// Why a layer read in place couldn't be read, the first time it is asked for after the read
     /// failed, so it is said once (a project, an import or the browser read it after adding it).
     pub fn error_unsaid(&mut self) -> Option<String> {
-        if !self.in_place || self.error_said {
+        if !self.reads_in_place() || self.error_said {
             return None;
         }
         let e = self.error.clone()?;
@@ -725,6 +887,60 @@ impl RasterLayer {
         Some(stats)
     }
 
+    /// What a frame draws it from ([`crate::look`]): its settings and its pixels' allocation, which
+    /// doesn't keep them. `None` when drawing reads more than it holds: read in place (the part in
+    /// view is read as the map draws), still being read, or lit by cast shadows or sky worked out
+    /// in the background.
+    pub fn look(&self) -> Option<RasterLook> {
+        let RasterLayer {
+            path,
+            in_place,
+            // Read in place too.
+            tiled,
+            // Read into `data`, compared itself.
+            file_name: _,
+            embedded: _,
+            subdataset,
+            crs,
+            time_zarr,
+            placement,
+            style,
+            data,
+            // What it says, not what it draws.
+            error: _,
+            // Worked out from the pixels and the style.
+            masked: _,
+            cast: _,
+            opening,
+            read_still,
+            read_generation: _,
+            restyle,
+            look,
+            pixels_said: _,
+            error_said: _,
+            failed_at: _,
+            failures: _,
+            lost_said: _,
+            look_lost: _,
+            dropped: _,
+            written: _,
+        } = self;
+        if *in_place || *tiled || opening.is_some() || read_still.is_some() || self.casts_shadows() {
+            return None;
+        }
+        Some(RasterLook {
+            path: path.clone(),
+            subdataset: subdataset.clone(),
+            crs: crs.clone(),
+            time_zarr: time_zarr.clone(),
+            placement: *placement,
+            style: style.clone(),
+            restyle: *restyle,
+            look: look.clone(),
+            data: Arc::downgrade(data.as_ref()?),
+        })
+    }
+
     /// Whether it is drawn with cast shadows or sky visibility (Shaded Relief with a shadow or a
     /// sky above 0): its frames are drawn again as they land (see [`RasterLayer::cast_shadows`]).
     pub fn casts_shadows(&self) -> bool {
@@ -737,6 +953,13 @@ impl RasterLayer {
     pub fn cast_shadow_waiters(&self) -> usize {
         let Ok(jobs) = self.cast.0.lock() else { return 0 };
         jobs.iter().map(|j| j.work.waiting.load(std::sync::atomic::Ordering::SeqCst)).sum()
+    }
+
+    /// How many light jobs it and its copies keep, including finished ones: for tests of whether
+    /// drawing started work, without starting any work through the inspection itself.
+    #[doc(hidden)]
+    pub fn cast_shadow_jobs(&self) -> usize {
+        self.cast.0.lock().unwrap_or_else(|e| e.into_inner()).len()
     }
 
     /// The light its cast shadows leave on each cell (see [`crate::shadow::light`]), when it is
@@ -776,7 +999,7 @@ impl RasterLayer {
         let Some(r) = self.data.as_ref().filter(|_| on && z_factor.is_finite()) else { return CastShadows::None };
         let not_drawn = grid.not_drawn();
         // Read in place, the layer holds an overview; the part in view is read as the map draws.
-        if self.in_place && r.overview.is_some_and(|(w, _)| w > r.width) {
+        if self.reads_in_place() && r.overview.is_some_and(|(w, _)| w > r.width) {
             return CastShadows::Unavailable(format!("{not_drawn}: it is read in place, and only its overview is held"));
         }
         let cells = r.width as usize * r.height as usize;
@@ -1103,9 +1326,20 @@ impl RasterLayer {
         }
         let mut r = read_path_with(p, subdataset, crs)?;
         if reopening && !r.georeferenced {
-            r.lost.push("it has no coordinates now, though it had them when added: it is drawn at a stand-in place".into());
+            r.lost.push("it has no coordinates now, though it had them when added: it is drawn at a stand-in place");
         }
         Ok(r)
+    }
+
+    /// Drops the subdataset and coordinate system of an SRTM tile or DTED file read from its path
+    /// (a project saved when these files went through GDAL kept them): reading it said they are
+    /// ignored, once, and the project saved again leaves them out, so the next open doesn't say it
+    /// again.
+    fn forget_ignored_options(&mut self) {
+        if self.embedded.is_none() && self.path.as_deref().is_some_and(rustgis_data::raster::is_elevation_name) {
+            self.subdataset = None;
+            self.crs = None;
+        }
     }
 }
 
@@ -1144,6 +1378,11 @@ pub struct ZarrTime {
     /// The coordinate system given for a store that doesn't say.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub crs: Option<String>,
+    /// The window of the map's cells each step reads, `[x0, y0, x1, y1]` as `layer.addZarr`'s
+    /// `cells` (the ends not included); `None` for the whole map. A project with one requires
+    /// `zarr-window`: an older reader would read the whole map at each step.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window: Option<[u64; 4]>,
     /// The step whose slice the layer holds (an index into `dates`); `None` when none is.
     #[serde(skip)]
     pub shown: Option<usize>,
@@ -1168,6 +1407,7 @@ impl Default for ZarrTime {
             offset: 0,
             dates: Vec::new(),
             crs: None,
+            window: None,
             shown: None,
             read_generation: next_read_generation(),
         }
@@ -1200,6 +1440,16 @@ impl Rock {
     }
 }
 
+/// The share of the colour a Shaded Relief slope turned fully from the sun keeps: its `ambient`
+/// when set, or else 0.25 (the light of old), and 0.5 with the `balanced` light, which keeps about
+/// the old light's contrast (#1977).
+pub fn relief_ambient(ambient: Option<f64>, balanced: bool) -> f64 {
+    ambient.unwrap_or(if balanced { 0.5 } else { 0.25 }).clamp(0.0, 1.0)
+}
+
+/// The most a balanced Shaded Relief light multiplies a colour by, on slopes facing the sun.
+const BALANCED_MAX: f64 = 1.3;
+
 fn is_no_light(v: &f64) -> bool {
     *v == 0.0
 }
@@ -1218,10 +1468,12 @@ impl ZarrTime {
         }
     }
 
-    /// The selection of step `i` as `zarr::Selection::parse` reads it: `t2m[time=12,level=3]`.
+    /// The selection of step `i` as `zarr::Selection::parse` reads it: `t2m[time=12,level=3]`,
+    /// with `cells=x0:y0:x1:y1` after them for a window.
     pub fn selection(&self, i: usize) -> String {
         let mut parts = vec![format!("{}={}", self.dim, self.offset.saturating_add(i as u64))];
         parts.extend(self.index.iter().filter(|(d, _)| *d != self.dim).map(|(d, v)| format!("{d}={v}")));
+        parts.extend(self.window.map(|[x0, y0, x1, y1]| format!("cells={x0}:{y0}:{x1}:{y1}")));
         format!("{}[{}]", self.variable, parts.join(","))
     }
 
@@ -1235,6 +1487,8 @@ impl ZarrTime {
             self.dates.clear();
         }
         self.index.truncate(32);
+        // A window is kept as it is: one a read can't take (a project edited by hand) is refused
+        // at each step, never widened to the whole map.
         for t in [&mut self.store, &mut self.variable, &mut self.dim] {
             *t = t.chars().take(4096).collect();
         }
@@ -1409,7 +1663,11 @@ pub enum RasterRenderer {
     /// ([`crate::shadow::sky`]); 0, the default, leaves it whole. `fill` (0 to 1) is a fill light
     /// from the side opposite the sun, 55° up, that lightens only the slopes turned toward it; 0,
     /// the default, has none. `rock` tints steep slopes toward a rock colour before the lights
-    /// shade them (see [`Rock`]); none, the default, keeps the ramp.
+    /// shade them (see [`Rock`]); none, the default, keeps the ramp. `ambient` (0 to 1) is the
+    /// share of the colour a slope turned fully from the sun keeps; none, the default, is
+    /// [`relief_ambient`]'s. `balanced` divides the sun's light by its value on flat ground, so flat
+    /// ground keeps the ramp's colour and slopes facing the sun brighten (#1977); off, the default,
+    /// lights as before.
     ShadedRelief {
         band: usize,
         ramp: Option<Ramp>,
@@ -1424,6 +1682,10 @@ pub enum RasterRenderer {
         fill: f64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         rock: Option<Rock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        ambient: Option<f64>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        balanced: bool,
     },
 }
 
@@ -1643,6 +1905,37 @@ impl RasterMask {
 
 fn one() -> f64 {
     1.0
+}
+
+/// What a frame draws a raster layer from ([`RasterLayer::look`]).
+#[derive(Clone, Debug)]
+pub struct RasterLook {
+    path: Option<String>,
+    subdataset: Option<String>,
+    crs: Option<String>,
+    time_zarr: Option<ZarrTime>,
+    placement: Option<[f64; 4]>,
+    style: RasterStyle,
+    restyle: bool,
+    look: Option<AddressLook>,
+    /// The pixels, by allocation.
+    data: Weak<Raster>,
+}
+
+impl RasterLook {
+    /// Whether `other` draws as this did.
+    pub fn same(&self, other: &RasterLook) -> bool {
+        let RasterLook { path, subdataset, crs, time_zarr, placement, style, restyle, look, data } = self;
+        *path == other.path
+            && *subdataset == other.subdataset
+            && *crs == other.crs
+            && *time_zarr == other.time_zarr
+            && placement.map(|p| p.map(f64::to_bits)) == other.placement.map(|p| p.map(f64::to_bits))
+            && *style == other.style
+            && *restyle == other.restyle
+            && *look == other.look
+            && Weak::ptr_eq(data, &other.data)
+    }
 }
 
 /// The look an address gives a GeoTIFF read in place (`…/scene.tif#bands=5,3,2&range=0,3000`, as
@@ -1980,22 +2273,15 @@ impl<'a> Colorizer<'a> {
         self.color_lit(vals, hillshade, None, None, None)
     }
 
-    /// [`Colorizer::color`], with Shaded Relief's ambient light scaled by `ambient` (0–255, the
+    /// [`Colorizer::color`], with Shaded Relief's ambient light scaled by `sky` (0–255, the
     /// share of it the sky a cell sees leaves, see [`RasterRenderer::ShadedRelief`]'s `sky`),
     /// `fill` (0–255, a share of the colour) added for its fill light (its `fill`), and its colour
     /// moved `rock` (0–255) of the way to its rock colour (its `rock`, see [`Rock::share`]).
-    pub fn color_lit(
-        &self,
-        vals: &[f32],
-        hillshade: Option<u8>,
-        ambient: Option<u8>,
-        fill: Option<u8>,
-        rock: Option<u8>,
-    ) -> Option<[u8; 4]> {
+    pub fn color_lit(&self, vals: &[f32], hillshade: Option<u8>, sky: Option<u8>, fill: Option<u8>, rock: Option<u8>) -> Option<[u8; 4]> {
         // The renderer masks values as it samples them (they arrive as NaN); this is for other callers.
         let mask = &self.style.mask;
         if mask.is_empty() || !vals.iter().any(|v| mask.hides(*v)) {
-            return self.paint(vals, hillshade, ambient, fill, rock);
+            return self.paint(vals, hillshade, sky, fill, rock);
         }
         // Masked values are no data. The renderer bands are at most three.
         let mut kept = [f32::NAN; 3];
@@ -2004,10 +2290,10 @@ impl<'a> Colorizer<'a> {
                 *k = *v;
             }
         }
-        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, ambient, fill, rock)
+        self.paint(kept.get(..vals.len().min(3)).unwrap_or(&kept), hillshade, sky, fill, rock)
     }
 
-    fn paint(&self, vals: &[f32], hillshade: Option<u8>, ambient: Option<u8>, fill: Option<u8>, rock: Option<u8>) -> Option<[u8; 4]> {
+    fn paint(&self, vals: &[f32], hillshade: Option<u8>, sky: Option<u8>, fill: Option<u8>, rock: Option<u8>) -> Option<[u8; 4]> {
         let v0 = *vals.first()?;
         let c = match &self.style.renderer {
             RasterRenderer::Rgb { .. } => {
@@ -2034,7 +2320,7 @@ impl<'a> Colorizer<'a> {
                 }
                 *self.palette.get(i as usize)?
             }
-            RasterRenderer::ShadedRelief { ramp, rock: steep, .. } => {
+            RasterRenderer::ShadedRelief { ramp, rock: steep, altitude, ambient: setting, balanced, .. } => {
                 let h = hillshade.unwrap_or(180) as f64 / 255.0;
                 let base = if ramp.is_some() { *self.ramp_lut.get(self.byte(0, v0) as usize)? } else { [255, 255, 255, 255] };
                 // Steep ground first takes on the rock colour; the light then shades either.
@@ -2044,9 +2330,20 @@ impl<'a> Colorizer<'a> {
                 };
                 // Multiply the tint by the hillshade, keeping some ambient light (less of it where
                 // the terrain hides part of the sky), and adding the fill light on its own.
-                let a = 0.25 * ambient.map_or(1.0, |a| f64::from(a) / 255.0);
+                let share = relief_ambient(*setting, *balanced);
+                let a = share * sky.map_or(1.0, |s| f64::from(s) / 255.0);
                 let f = fill.map_or(0.0, |f| f64::from(f) / 255.0);
-                let m = |c: u8| (c as f64 * (a + 0.75 * h + f)).round().clamp(0.0, 255.0) as u8;
+                // Flat ground's hillshade, rounded as the hillshade is: 0 for a sun on the horizon,
+                // which lights no flat ground to balance against, so that is lit as unbalanced.
+                let flat = (255.0 * altitude.clamp(0.0, 90.0).to_radians().sin()).round();
+                let lit = if *balanced && flat > 0.0 {
+                    // The sun's light over its value on flat ground: flat ground keeps the ramp's
+                    // colour, slopes facing the sun brighten.
+                    (a + (1.0 - share) * h * 255.0 / flat).min(BALANCED_MAX)
+                } else {
+                    a + (1.0 - share) * h
+                };
+                let m = |c: u8| (c as f64 * (lit + f)).round().clamp(0.0, 255.0) as u8;
                 [m(base[0]), m(base[1]), m(base[2]), 255]
             }
         };
@@ -2218,7 +2515,7 @@ impl RasterLayer {
         let Some(r) = &self.data else { return false };
         let every = self.lists_every_class(all_classes);
         self.style.renderer.draws_classes()
-            && (self.in_place || r.overview.is_some())
+            && (self.reads_in_place() || r.overview.is_some())
             && !every
             && !self.classes_unknown()
             && !self.mask_hides_all()
@@ -2323,6 +2620,7 @@ impl RasterLayer {
             read_still: _,
             read_generation: _,
             in_place: _,
+            tiled: _,
             restyle: _,
             look: _,
             pixels_said: _,
@@ -2332,13 +2630,24 @@ impl RasterLayer {
             lost_said: _,
             look_lost: _,
             dropped: _,
+            written: _,
         } = self;
         let mut out = Vec::new();
         if let Some(p) = path {
             out.push((crate::LayerRole::Raster, p.as_str(), true, embedded.is_none() && crate::paths::is_local(p)));
         }
-        if let Some(ZarrTime { store, variable: _, index: _, dim: _, offset: _, dates: _, crs: _, shown: _, read_generation: _ }) =
-            time_zarr
+        if let Some(ZarrTime {
+            store,
+            variable: _,
+            index: _,
+            dim: _,
+            offset: _,
+            dates: _,
+            crs: _,
+            window: _,
+            shown: _,
+            read_generation: _,
+        }) = time_zarr
         {
             out.push((crate::LayerRole::ZarrStore, store.as_str(), true, crate::paths::is_local(store)));
         }
@@ -2396,7 +2705,19 @@ mod tests {
 
     /// A Shaded Relief without a ramp or rock, lit from `azimuth` and `altitude`.
     fn grey_relief(azimuth: f64, altitude: f64, z_factor: f64, shadow: f64, sky: f64) -> RasterRenderer {
-        RasterRenderer::ShadedRelief { band: 0, ramp: None, azimuth, altitude, z_factor, shadow, sky, fill: 0.0, rock: None }
+        RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth,
+            altitude,
+            z_factor,
+            shadow,
+            sky,
+            fill: 0.0,
+            rock: None,
+            ambient: None,
+            balanced: false,
+        }
     }
 
     /// The legend names a class as the file does (#889), and gives the value of one it doesn't.
@@ -2639,6 +2960,7 @@ mod tests {
                 offset: 3,
                 dates,
                 crs: None,
+                window: None,
                 shown: Some(1),
                 read_generation: 0,
             };
@@ -2652,6 +2974,27 @@ mod tests {
         }
     }
 
+    /// A following layer's window is part of each step's selection, as `zarr::Selection::parse`
+    /// reads it; repair keeps one a read refuses (a project edited by hand), never dropping it to
+    /// the whole map.
+    #[test]
+    fn a_zarr_window_is_in_each_steps_selection() {
+        let mut z = ZarrTime {
+            variable: "t".into(),
+            index: vec![("level".into(), 2)],
+            dim: "time".into(),
+            offset: 3,
+            dates: vec![1.0, 2.0],
+            window: Some([4, 1, 9, 3]),
+            ..Default::default()
+        };
+        z.repair();
+        assert_eq!(z.selection(1), "t[time=4,level=2,cells=4:1:9:3]");
+        z.window = Some([4, 1, 5, 3]);
+        z.repair();
+        assert_eq!((z.window, z.selection(0)), (Some([4, 1, 5, 3]), "t[time=3,level=2,cells=4:1:5:3]".to_string()));
+    }
+
     fn dem() -> Raster {
         let gt = GeoTransform { origin_x: 0.0, origin_y: 4.0, pixel_width: 1.0, pixel_height: -1.0 };
         let data: Vec<f32> = (0..16).map(|i| (i % 4 + i / 4) as f32).collect();
@@ -2663,7 +3006,7 @@ mod tests {
     #[test]
     fn a_look_applied_after_the_losses_were_said_says_its_own_alone() {
         let mut r = dem();
-        r.lost.push("its colour table is left out".into());
+        r.lost.push("its colour table is left out");
         let mut rl = RasterLayer::in_place(r, "test://look-later.tif");
         assert_eq!(rl.lost_unsaid(), vec!["its colour table is left out".to_string()]);
         assert!(rl.lost_unsaid().is_empty());
@@ -2674,7 +3017,7 @@ mod tests {
         assert!(rl.lost_unsaid().is_empty());
         // A look applied before they are said is said with them, once.
         let mut r = dem();
-        r.lost.push("its colour table is left out".into());
+        r.lost.push("its colour table is left out");
         let mut rl = RasterLayer::in_place(r, "test://look-first.tif").with_look(AddressLook { bands: vec![9], range: None });
         assert_eq!(rl.lost_unsaid().len(), 2);
         assert!(rl.lost_unsaid().is_empty());
@@ -2903,6 +3246,25 @@ mod tests {
         assert!(missing.data.is_none());
     }
 
+    #[test]
+    fn a_written_file_is_given_back_only_while_its_pixels_and_bytes_are_the_layers() {
+        let r = dem();
+        let bytes = rustgis_data::raster::geotiff::write_all(&r).unwrap();
+        assert!(RasterLayer::from_bytes(r.clone(), "dem.tif", bytes.clone()).written_file().is_none());
+        let written = RasterLayer::from_written(r, "dem.tif", bytes.clone());
+        assert_eq!(written.written_file().map(|b| b.as_slice()), Some(bytes.as_slice()));
+        // A copy shares both, so it gives the file too.
+        assert!(written.clone().written_file().is_some());
+        let mut edited = written.clone();
+        if let Some(band) = edited.data.as_mut().and_then(|d| Arc::make_mut(d).bands.first_mut()) {
+            band.data[0] += 1.0;
+        }
+        assert!(edited.written_file().is_none());
+        let mut replaced = written.clone();
+        replaced.embedded = Some(Arc::new(bytes));
+        assert!(replaced.written_file().is_none());
+    }
+
     /// A plain web address is read as it was before logins: never downloaded whole on reload.
     #[test]
     fn reload_downloads_only_s3_and_login_wrapped_addresses() {
@@ -2943,6 +3305,8 @@ mod tests {
             sky: 0.0,
             fill: 0.0,
             rock,
+            ambient: None,
+            balanced: false,
         };
         let (mut rocky, mut plain) = (RasterStyle::default_for(&r), RasterStyle::default_for(&r));
         (rocky.renderer, plain.renderer) = (relief(Some(rock)), relief(None));
@@ -2975,6 +3339,80 @@ mod tests {
         assert!(!saved.contains("rock"), "{saved}");
         let saved = serde_json::to_string(&relief(Some(rock))).unwrap();
         assert_eq!(serde_json::from_str::<RasterRenderer>(&saved).unwrap(), relief(Some(rock)));
+    }
+
+    /// Ambient and the balanced light (#1977): unset, the relief is lit as before; `ambient` is the
+    /// share a slope turned from the sun keeps; balanced, flat ground keeps the ramp's colour,
+    /// slopes facing the sun brighten up to 1.3, and every other light still shades it. Each is
+    /// saved only when set.
+    #[test]
+    fn balanced_light_keeps_flat_ground_at_the_ramps_colour() {
+        assert_eq!((relief_ambient(None, false), relief_ambient(None, true), relief_ambient(Some(2.0), true)), (0.25, 0.5, 1.0));
+        let gt = GeoTransform { origin_x: 0.0, origin_y: 10.0, pixel_width: 1.0, pixel_height: -1.0 };
+        let r = Raster::new("dem", 10, 10, vec![vec![5.0; 100]], gt, Crs::WebMercator, None, ColorHint::Gray, "Float32").unwrap();
+        let tinted_relief = |ramp, altitude, ambient, balanced| RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp,
+            azimuth: 315.0,
+            altitude,
+            z_factor: 1.0,
+            shadow: 0.0,
+            sky: 0.0,
+            fill: 0.0,
+            rock: None,
+            ambient,
+            balanced,
+        };
+        let relief = |altitude, ambient, balanced| tinted_relief(None, altitude, ambient, balanced);
+        // Grey relief: white shaded, so a channel is 255 times the light.
+        let paint = |renderer: RasterRenderer, h: u8, sky: Option<u8>, fill: Option<u8>| {
+            let mut style = RasterStyle::default_for(&r);
+            style.renderer = renderer;
+            Colorizer::new(&style, &r, None).color_lit(&[5.0], Some(h), sky, fill, None).map(|c| c[0])
+        };
+        let grey = |f: f64| Some((255.0 * f).round().clamp(0.0, 255.0) as u8);
+        for h in [0u8, 90, 180, 255] {
+            let hf = f64::from(h) / 255.0;
+            assert_eq!(paint(relief(45.0, None, false), h, None, None), grey(0.25 + 0.75 * hf), "unset: as before");
+            assert_eq!(paint(relief(45.0, Some(0.4), false), h, None, None), grey(0.4 + 0.6 * hf));
+        }
+        for altitude in [20.0, 45.0, 70.0] {
+            // Flat ground's hillshade, as `hillshade` rounds it: the ramp's own colour.
+            let flat = hillshade(&[0.0; 9], 1.0, 1.0, 315.0, altitude, 1.0);
+            for ambient in [None, Some(0.2), Some(0.8)] {
+                assert_eq!(paint(relief(altitude, ambient, true), flat, None, None), Some(255), "{altitude}° {ambient:?}");
+            }
+            // Turned away, the ambient share; facing the sun, brighter, up to 1.3 times.
+            assert_eq!(paint(relief(altitude, None, true), 0, None, None), grey(0.5));
+            let lit = (0.5 + 0.5 * 255.0 / f64::from(flat)).min(1.3);
+            assert!(lit > 1.0);
+            assert_eq!(paint(relief(altitude, None, true), 255, None, None), Some(255), "white: clamped");
+            // On a ramp's colour, flat ground is that colour, and a slope facing the sun it times 1.3 at most.
+            let mut style = RasterStyle::default_for(&r);
+            style.renderer = tinted_relief(Some(Ramp::Terrain), altitude, None, true);
+            let tinted = Colorizer::new(&style, &r, None);
+            let ramp = tinted.color_lit(&[5.0], Some(flat), None, None, None).unwrap();
+            let bright = |c: u8| (f64::from(c) * lit).round().min(255.0) as u8;
+            let lit_ramp = tinted.color_lit(&[5.0], Some(255), None, None, None).unwrap();
+            assert_eq!(lit_ramp, [bright(ramp[0]), bright(ramp[1]), bright(ramp[2]), 255]);
+            assert!(lit_ramp.iter().zip(ramp).take(3).any(|(l, c)| *l > c), "brighter than the ramp: {lit_ramp:?} {ramp:?}");
+            // The sky dims the ambient share, the fill light adds to it, as before.
+            let sky_fill = 0.5 * 128.0 / 255.0 + 0.5 * f64::from(flat / 2) / f64::from(flat) + 30.0 / 255.0;
+            assert_eq!(paint(relief(altitude, None, true), flat / 2, Some(128), Some(30)), grey(sky_fill));
+        }
+
+        // A sun on the horizon lights no flat ground (its hillshade rounds to 0): balanced is
+        // lit as unbalanced, with its own ambient.
+        for h in [0u8, 40, 120] {
+            assert_eq!(paint(relief(0.0, None, true), h, None, None), paint(relief(0.0, Some(0.5), false), h, None, None));
+        }
+
+        // Saved only when set, and read back as it was.
+        let saved = serde_json::to_string(&relief(45.0, None, false)).unwrap();
+        assert!(!saved.contains("ambient") && !saved.contains("balanced"), "{saved}");
+        let set = relief(45.0, Some(0.35), true);
+        let saved = serde_json::to_string(&set).unwrap();
+        assert_eq!(serde_json::from_str::<RasterRenderer>(&saved).unwrap(), set);
     }
 
     /// A tower lit from the east, drawn as Shaded Relief with `shadow`.

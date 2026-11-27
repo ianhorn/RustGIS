@@ -1,12 +1,14 @@
 //! Every command, grouped by ribbon tab.
 
 pub mod arcgis;
+pub(crate) mod block_model;
 pub mod catalogs;
 pub mod clipboard;
 pub mod connections;
 pub mod copernicus;
 pub mod cube;
 pub mod cube_catalog;
+pub mod cube_mask;
 pub mod deeplearning;
 pub mod design;
 pub mod diagram;
@@ -18,6 +20,7 @@ pub mod embeddings;
 pub mod exports;
 pub mod extensions;
 pub mod field;
+pub(crate) mod field_changes;
 pub mod geocode;
 pub mod geolibre;
 pub mod gp;
@@ -26,6 +29,8 @@ pub mod graphics;
 pub mod group;
 pub mod history;
 pub mod imagery;
+#[cfg(not(target_arch = "wasm32"))]
+pub(crate) mod in_blocks;
 pub mod items;
 pub mod labels;
 pub mod layer;
@@ -52,6 +57,7 @@ pub mod service;
 pub mod service_added;
 pub mod share;
 pub mod sharing;
+mod similar;
 pub mod sources;
 pub mod sql;
 pub mod stac;
@@ -64,7 +70,7 @@ pub mod tiles;
 pub mod time;
 pub mod view;
 pub mod webdata;
-pub(crate) mod whole;
+pub mod whole;
 pub mod workflows;
 pub mod workspace;
 pub mod zarr;
@@ -192,6 +198,24 @@ pub(crate) fn saved_target(layer: &str, table: &str) -> String {
     if layer == table { layer.to_string() } else { format!("{layer}: {table}") }
 }
 
+/// An opaque colour under `k`: absent `None`, null `Some(None)`, `"#RRGGBB"` `Some(Some(colour))`;
+/// anything else, a translucent `#RRGGBBAA` included, refused. Six hex digits exactly: `from_hex`
+/// alone would take a sign in a pair ("#+F0000").
+pub(crate) fn opaque_color(p: &Value, k: &str) -> Result<Option<Option<rustgis_map::Rgba>>, String> {
+    match p.get(k) {
+        None => Ok(None),
+        Some(Value::Null) => Ok(Some(None)),
+        Some(Value::String(c)) => c
+            .trim()
+            .strip_prefix('#')
+            .filter(|h| h.len() == 6 && h.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(rustgis_map::Rgba::from_hex)
+            .map(|rgba| Some(Some(rgba)))
+            .ok_or_else(|| format!("{k} must be \"#RRGGBB\" (opaque), not '{c}'")),
+        Some(_) => Err(format!("{k} must be \"#RRGGBB\" or null")),
+    }
+}
+
 pub(crate) fn ps<'a>(p: &'a Value, k: &str) -> Option<&'a str> {
     p.get(k).and_then(Value::as_str)
 }
@@ -204,6 +228,35 @@ pub(crate) fn f(p: &Value, k: &str) -> Option<f64> {
 /// numbers as floats).
 pub(crate) fn uint(p: &Value, k: &str) -> Option<u64> {
     f(p, k).filter(|x| *x >= 0.0 && x.fract() == 0.0 && *x <= u64::MAX as f64).map(|x| x as u64)
+}
+
+/// Moves item `from` of `items` to `p`'s `to` (0: first; past the end: last) for `map.move` and
+/// `layout.move`, and gives where it went. A move to where the item is changes nothing and leaves
+/// no undo step.
+pub(crate) fn move_item<T>(s: &mut Session, items: impl Fn(&mut Session) -> &mut Vec<T>, from: usize, p: &Value) -> Result<usize, String> {
+    let to = uint(p, "to").ok_or("to is required (an index)")?;
+    let v = items(s);
+    if from >= v.len() {
+        return Err("no such item".into());
+    }
+    let to = usize::try_from(to).unwrap_or(usize::MAX).min(v.len() - 1);
+    if to == from {
+        s.request_only = true;
+    } else {
+        let item = v.remove(from);
+        v.insert(to, item);
+    }
+    Ok(to)
+}
+
+/// Where the item at `at` is after [`move_item`] took the one at `from` to `to`.
+pub(crate) fn after_move(at: usize, from: usize, to: usize) -> usize {
+    match at {
+        a if a == from => to,
+        a if from < a && a <= to => a - 1,
+        a if to <= a && a < from => a + 1,
+        a => a,
+    }
 }
 
 /// The longest name a map or a layout keeps.
@@ -253,15 +306,45 @@ pub(crate) fn numbered_saying(
     (name, cut)
 }
 
-/// A copy's name: the one `given` (trimmed), else `<original> copy` with the original cut so
-/// " copy" fits; then [`numbered`] by `taken`.
-pub(crate) fn copy_name(given: Option<&str>, original: &str, taken: impl Fn(&str) -> bool) -> String {
+/// A copy's name: the one `given` (trimmed; the caller refuses one past [`MAX_NAME`]), else
+/// `<original> copy` with the original cut so " copy" fits; then [`numbered`] by `taken`. With the
+/// notice to give when that cut part of the name ([`name_cut`]); `command` is the command's title.
+pub(crate) fn copy_name(command: &str, given: Option<&str>, original: &str, taken: impl Fn(&str) -> bool) -> (String, Option<String>) {
     const COPY: &str = " copy";
-    let base = match given.map(str::trim).filter(|n| !n.is_empty()) {
-        Some(n) => n.to_string(),
-        None => original.chars().take(MAX_NAME - COPY.len()).chain(COPY.chars()).collect(),
+    let (base, whole, whose) = match given.map(str::trim).filter(|n| !n.is_empty()) {
+        Some(n) => (n.to_string(), n.to_string(), "the name given"),
+        None => {
+            (original.chars().take(MAX_NAME - COPY.len()).chain(COPY.chars()).collect(), format!("{original}{COPY}"), "the copy's name")
+        }
     };
-    numbered(&base, taken)
+    let name = numbered(&base, taken);
+    let cut = name_cut(command, whose, &whole, &name);
+    (name, cut)
+}
+
+/// The notice to give when `name`, the name a command kept, doesn't keep all of `given`, the name
+/// it was making (#2639): cut to a limit, or cut to fit what follows it (" copy", " 2"), as
+/// [`numbered`] and [`copy_name`] do. `command` is the command's title, such as "Duplicate Map",
+/// and `whose` says where the name came from ("the name given", "the copy's name"). None when the
+/// whole of `given` is kept.
+pub(crate) fn name_cut(command: &str, whose: &str, given: &str, name: &str) -> Option<String> {
+    let kept = given.chars().zip(name.chars()).take_while(|(a, b)| a == b).count();
+    if kept >= given.chars().count() {
+        return None;
+    }
+    let after: String = name.chars().skip(kept).collect();
+    Some(if after.is_empty() {
+        format!("{command}: {whose} is cut to {kept} characters")
+    } else {
+        format!("{command}: {whose} is cut to {kept} characters to fit \"{after}\"")
+    })
+}
+
+/// Gives the [`name_cut`] notice, if any.
+pub(crate) fn say_name_cut(s: &mut Session, command: &str, whose: &str, given: &str, name: &str) {
+    if let Some(cut) = name_cut(command, whose, given, name) {
+        s.notify(cut, false);
+    }
 }
 
 /// The most unread true/false parameters one command names in its notice.

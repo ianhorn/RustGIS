@@ -29,9 +29,9 @@ enum Rows {
 pub(crate) struct Unread {
     layer: String,
     rows: usize,
-    dates: Option<String>,
-    rounded: Option<String>,
-    messages: Vec<String>,
+    dates: Option<rustgis_data::loss::Note>,
+    rounded: Option<rustgis_data::loss::Note>,
+    messages: rustgis_data::loss::Notes,
 }
 
 impl Whole {
@@ -56,10 +56,11 @@ impl Whole {
         Whole { name: l.name.clone(), rows }
     }
 
-    /// Every feature, with the fields the layer lists (so a field's index in the layer is its
-    /// index here), and the rows of its source that couldn't be read. A source read a chunk at a
-    /// time looks at Cancel between chunks; one read at once (a GeoJSON file, a database table)
-    /// is a single step that doesn't, as for Load All Features.
+    /// Every feature in the system the layer holds its coordinates in ([`Dataset::coord_crs`]: its
+    /// work tests places there, none of them converted), with the fields the layer lists (so a
+    /// field's index in the layer is its index here), and the rows of its source that couldn't be
+    /// read. A source read a chunk at a time looks at Cancel between chunks; one read at once (a
+    /// GeoJSON file, a database table) is a single step that doesn't, as for Load All Features.
     pub(crate) fn read(self) -> Result<(Dataset, Unread), String> {
         let Whole { name, rows } = self;
         let (ds, unread) = match rows {
@@ -80,24 +81,23 @@ impl Unread {
     /// date-times rounded to the microsecond (nothing when there were none).
     pub(crate) fn say(&self, s: &mut Session) {
         if self.rows > 0 {
-            s.warn(unread_notice(&self.layer, self.rows));
+            s.say(unread_note(&self.layer, self.rows));
         }
-        if let Some(dates) = &self.dates {
-            s.notify(format!("{}: {dates}", self.layer), false);
-        }
-        if let Some(rounded) = &self.rounded {
-            s.notify(format!("{}: {rounded}", self.layer), false);
+        for note in [&self.dates, &self.rounded].into_iter().flatten() {
+            s.say(note.clone().prefixed(&self.layer));
         }
         for message in &self.messages {
-            s.notify(message.clone(), false);
+            s.say(message.clone());
         }
     }
 
     /// What [`Unread::say`] says, as lines: for a tool's messages.
-    pub(crate) fn lines(&self) -> Vec<String> {
-        let rows = (self.rows > 0).then(|| unread_notice(&self.layer, self.rows));
-        let dates = [&self.dates, &self.rounded].into_iter().flatten().map(|n| format!("{}: {n}", self.layer));
-        rows.into_iter().chain(dates).chain(self.messages.iter().cloned()).collect()
+    pub(crate) fn lines(&self) -> rustgis_data::loss::Notes {
+        let rows = (self.rows > 0).then(|| unread_note(&self.layer, self.rows));
+        let dates = [&self.dates, &self.rounded].into_iter().flatten().map(|n| n.clone().prefixed(&self.layer));
+        let mut lines: rustgis_data::loss::Notes = rows.into_iter().chain(dates).collect();
+        lines.extend(self.messages.iter().cloned());
+        lines
     }
 
     /// `error`, with the rows left out when there were any: they may be why it failed.
@@ -163,8 +163,14 @@ pub(crate) fn load_into(l: &mut Layer) -> Result<Unread, String> {
     Ok(Unread::of(name, unread))
 }
 
-/// The notice for `unread` rows of `layer`'s source that couldn't be read.
-pub(crate) fn unread_notice(layer: &str, unread: usize) -> String {
+/// The notice, with its code, that `unread` rows of `layer`'s source couldn't be read and are left
+/// out. [`unread_notice`] gives the same text for an error that names it.
+pub fn unread_note(layer: &str, unread: usize) -> rustgis_data::loss::Note {
+    rustgis_data::loss::Note::loss(rustgis_data::loss::LossCode::DroppedFeature, unread_notice(layer, unread))
+}
+
+/// The text of [`unread_note`].
+pub fn unread_notice(layer: &str, unread: usize) -> String {
     match unread {
         1 => format!("{layer}: 1 row couldn't be read and was left out"),
         n => format!("{layer}: {n} rows couldn't be read and were left out"),
@@ -233,13 +239,13 @@ mod tests {
             "sites".into(),
             Unreadable {
                 dates: Some("1 value isn't a date and was read as empty, in 'day'".into()),
-                messages: vec!["source: conversion left out 2 source features".into()],
+                messages: ["source: conversion left out 2 source features"].into_iter().collect(),
                 ..Default::default()
             },
         );
         let mut session = Session::new(crate::Project::new("notices"));
         unread.say(&mut session);
-        assert_eq!(session.notices.iter().map(|n| &n.text).collect::<Vec<_>>(), unread.lines().iter().collect::<Vec<_>>());
+        assert_eq!(session.notices.iter().map(|n| n.text.as_str()).collect::<Vec<_>>(), unread.lines().texts().collect::<Vec<_>>());
         assert_eq!(session.notices.len(), 2);
         assert_eq!(unread.lines().iter().filter(|n| n.contains("conversion left out 2")).count(), 1);
         assert!(Unread::of("clean".into(), Unreadable::default()).lines().is_empty());

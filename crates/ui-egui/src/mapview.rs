@@ -15,6 +15,7 @@ use rustgis_engine::map::layout::TextAlign;
 use rustgis_engine::map::projection::Flat;
 use rustgis_engine::map::{Camera, Globe, Projection};
 use rustgis_engine::render::rustgis_tiles::Unfinished;
+use rustgis_engine::render::rustgis_tiles::{address::Reach, cache};
 use rustgis_engine::render::{PlacedLabel, Rendered, View};
 use serde_json::{Value, json};
 
@@ -106,18 +107,35 @@ pub struct Ask {
     /// The other layers waiting for the same capabilities: fetched and read once for all.
     also: Vec<String>,
     capabilities: bool,
-    /// The GetFeatureInfo request asked (none for capabilities): its answer format tells what to
-    /// ask next after the service's error.
+    /// The GetFeatureInfo request asked, whose answer format tells what to ask next after the
+    /// service's error; or the capabilities asked for, which only layers of that service take.
     request: Option<String>,
-    slot: crate::Slot<Result<Vec<u8>, String>>,
+    /// The answer, with the reach it was read at.
+    slot: crate::Slot<Result<(Vec<u8>, Reach), String>>,
+}
+
+/// Asks for a request identify listed, within the layer's reach (`"public"`: a document read from
+/// the internet listed the layer, or its capabilities were read from there).
+fn ask_within(a: &Value, url: &str) -> crate::Slot<Result<(Vec<u8>, Reach), String>> {
+    let ceiling = if a["public"] == true { Reach::Public } else { Reach::Local };
+    crate::fetch_within(url, rustgis_engine::data::ogc::MAX_INFO_BYTES, None, ceiling)
 }
 
 impl Popup {
     /// A popup for what identify found at `at`, asking the WMS layers it lists.
     pub fn new(info: Value, at: Coord, map: usize, opened: u64) -> Popup {
         let mut asks: Vec<Ask> = Vec::new();
-        // The capabilities each fetch is for: layers of one service share it.
+        // The capabilities each fetch is for: layers of one service share it, asked within the
+        // narrowest reach of those layers (any listed by a document read from the internet holds
+        // the fetch there).
         let mut fetched: Vec<(String, usize)> = Vec::new();
+        let held: std::collections::HashSet<&str> = info["featureInfo"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|a| a["public"] == true)
+            .filter_map(|a| a["capabilities"].as_str())
+            .collect();
         for a in info["featureInfo"].as_array().into_iter().flatten() {
             let Some(layer) = a["tileLayer"].as_str().map(str::to_string) else { continue };
             let (url, capabilities) = match (a["url"].as_str(), a["capabilities"].as_str()) {
@@ -134,8 +152,8 @@ impl Popup {
             if capabilities {
                 fetched.push((url.to_string(), asks.len()));
             }
-            let slot = crate::fetch_into_limited(url, rustgis_engine::data::ogc::MAX_INFO_BYTES);
-            let request = (!capabilities).then(|| url.to_string());
+            let slot = if capabilities && held.contains(url) { ask_within(&json!({"public": true}), url) } else { ask_within(a, url) };
+            let request = Some(url.to_string());
             asks.push(Ask { layer, also: Vec::new(), capabilities, request, slot });
         }
         Popup { info, at, index: 0, map, opened, asks, since: web_time::Instant::now() }
@@ -186,7 +204,8 @@ fn with_answers(map: &rustgis_engine::map::Map, info: &Value, found: Vec<Value>)
     // identify.featureInfo tells its answer to the first of them, drawn or not).
     let drawn = |name: &str| map.tiles.iter().position(|t| t.name == name && t.draws());
     all.retain(|v| v["tileLayer"].as_str().is_none_or(|name| drawn(name).is_some()));
-    let stack = map.stack();
+    // As identify ranks them: the drawing order, a higher depth priority on top (#2488).
+    let stack = map.draw_order();
     // A tile layer's feature by its layer's name (two of one name drawn take the higher one's
     // place, as their answers are told apart by name too), a map layer's (or raster's pixel) by
     // its id; anything else after them all.
@@ -294,6 +313,16 @@ pub struct MapView {
     pub vertex_drag: Option<crate::vertexedit::VertexDrag>,
     /// Non-owning source identity for the held vertex gesture; never persisted with the project.
     pub(crate) vertex_drag_owner: Option<crate::vertexedit::DragOwner>,
+    /// The selected features Edit Vertices last said it can't give handles to (their place can't
+    /// be given in longitude/latitude), by map index, live layer ([`rustgis_engine::map::Layer::instance_id`])
+    /// and row, so it says so once per selection.
+    pub(crate) vertex_unplaced_said: Vec<(usize, u64, usize)>,
+    /// Whether there were more than those, the notice saying "at least" so many.
+    pub(crate) vertex_unplaced_more: bool,
+    /// How many of each layer's selected rows that scan went through, by live layer.
+    pub(crate) vertex_unplaced_visited: Vec<(u64, usize)>,
+    /// What those features were last looked for under, so they aren't looked for each frame.
+    pub(crate) vertex_unplaced_seen: Option<u64>,
     /// Session-only opt-in for coincident polygon moves; never saved with a project or preference.
     pub move_shared_vertices: bool,
     /// A sketch vertex clicked on an edge follows that edge from the previous vertex (Trace);
@@ -339,8 +368,9 @@ pub struct MapView {
     pictures: crate::popupmedia::Pictures,
     /// The tile layers' credits, from the last render.
     attribution: Vec<String>,
-    /// Tile layer errors, and why layers were drawn without their cast shadows (in the map or
-    /// the Layout view), already reported.
+    /// Tile layer errors (by kind, see [`say_tile_error`]), why layers were drawn without their
+    /// cast shadows (in the map or the Layout view), and what frames approximated, already
+    /// reported.
     pub(crate) tile_errors: std::collections::HashSet<String>,
     /// When the map last rendered (seconds).
     last_render: f64,
@@ -430,6 +460,10 @@ impl Default for MapView {
             vertex_owner: None,
             vertex_drag: None,
             vertex_drag_owner: None,
+            vertex_unplaced_said: Vec::new(),
+            vertex_unplaced_more: false,
+            vertex_unplaced_visited: Vec::new(),
+            vertex_unplaced_seen: None,
             move_shared_vertices: false,
             trace_edges: false,
             sketch_full_said: false,
@@ -441,7 +475,7 @@ impl Default for MapView {
             kept_lonlat: None,
             menu_lonlat: None,
             menu_text: None,
-            coord_format: crate::CoordReadout::Decimal,
+            coord_format: crate::CoordReadout::default(),
             render_ms: 0,
             notices_seen: 0,
             toasts: Vec::new(),
@@ -503,6 +537,10 @@ impl MapView {
             self.split_gpu = None;
             self.live_rev = None;
             self.gpu_turn_declined = None;
+            self.vertex_unplaced_said.clear();
+            self.vertex_unplaced_more = false;
+            self.vertex_unplaced_visited.clear();
+            self.vertex_unplaced_seen = None;
             self.labels.clear();
             self.label_lonlat.clear();
             self.label_map.clear();
@@ -511,7 +549,11 @@ impl MapView {
             self.attribution.clear();
             self.tile_errors.clear();
             self.drape = Default::default();
+            // With their relays: what the old project's frames approximated on workers isn't the
+            // new one's.
             self.tilt_drape = Default::default();
+            self.tilt_settle.relay = Default::default();
+            self.motion_frame.relay = Default::default();
             self.filling = false;
         }
         self.project = Some(opened);
@@ -558,6 +600,34 @@ impl MapView {
         let live = self.frame_times.back().is_some_and(|t| *t > now - 0.5);
         live.then(|| self.frame_times.iter().filter(|t| **t > now - 1.0).count())
     }
+    /// Drops what the map keeps only to draw sooner, for a system short of memory: the moving
+    /// globe's and tilted map's drapes, and what [`MapView::drop_gpu`] does.
+    pub(crate) fn release_memory(&mut self) {
+        self.drape.clear();
+        self.tilt_drape.clear();
+        self.drop_gpu();
+        // A frame drawn mid-motion, finished or stopped, would put back the drawing copies of
+        // its map when taken: it is let go untaken.
+        let relay = self.motion_frame.relay.clone();
+        self.motion_frame = Default::default();
+        self.motion_frame.relay = relay;
+        self.motion_dropped = false;
+    }
+
+    /// Drops the GPU renderer's scenes, textures and buffers (the renderer itself too): a frame
+    /// drawn on the GPU after this makes them again.
+    pub(crate) fn drop_gpu(&mut self) {
+        self.gpu_renderer = None;
+        self.gpu_frame = None;
+        // (No live GPU scene is left to keep the tile key for.)
+        self.live_rev = None;
+        self.split_gpu = None;
+        for target in [&self.gpu_target, &self.gpu_target_split] {
+            *target.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+        self.invalidate();
+    }
+
     /// Forces a re-render on the next frame; also drops the GPU frame (the backend toggle
     /// relies on it).
     pub fn invalidate(&mut self) {
@@ -575,6 +645,11 @@ impl MapView {
     /// The camera the last full render was drawn with (diagnostics and tests).
     pub fn full_frame_camera(&self) -> Camera {
         self.tex_camera
+    }
+
+    /// The camera the GPU scene on screen is drawn for now (diagnostics and tests).
+    pub fn scene_camera(&self) -> Option<Camera> {
+        self.gpu_frame.as_ref().map(|f| f.camera())
     }
 
     /// Whether the map shown is a GPU scene that moves with the camera (vector meshes and raster
@@ -623,6 +698,12 @@ impl MapView {
         if self.drag.is_some_and(|(_, kind)| matches!(kind, DragKind::Label { .. })) {
             self.drag = None;
         }
+    }
+
+    /// Adds a point to the unfinished sketch.
+    #[cfg(test)]
+    pub(crate) fn add_sketch_point_for_tests(&mut self, point: Coord) {
+        self.sketch.push(point);
     }
 
     #[cfg(test)]
@@ -752,15 +833,7 @@ pub(crate) fn leave_gpu_if_out_of_memory(app: &mut RustGisApp) {
         return;
     }
     app.map.gpu_enabled = false;
-    app.map.gpu_renderer = None;
-    app.map.gpu_frame = None;
-    // (No live GPU scene is left to keep the tile key for.)
-    app.map.live_rev = None;
-    app.map.split_gpu = None;
-    for target in [&app.map.gpu_target, &app.map.gpu_target_split] {
-        *target.lock().unwrap_or_else(|e| e.into_inner()) = None;
-    }
-    app.map.invalidate();
+    app.map.drop_gpu();
     app.session.notify(
         tl!(
             "The graphics card ran out of memory, so the map is now drawn without it (CPU), which is slower. Click CPU in the status bar to try the graphics card again, with a smaller window or fewer layers."
@@ -779,8 +852,12 @@ pub fn show(app: &mut RustGisApp, ui: &mut Ui) {
     app.map.follow_project(app.session.opened);
     let t = Tokens::get(ui.ctx());
     crate::modelbuilder::follow_view(app);
-    view_tabs(app, ui, &t);
+    // A shell with its own interface (the touch interface) switches views itself.
+    if app.chrome.is_none() {
+        view_tabs(app, ui, &t);
+    }
     crate::vertexedit::cancel_stale_drag(app);
+    crate::vertexedit::say_unplaced(app);
     if app.mb.shown() {
         crate::modelbuilder::show(app, ui);
         return;
@@ -973,7 +1050,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // pictures drawn on the CPU (tiles, rasters…). Vector scenes re-project in the vertex
     // shader; image scenes shift and scale as cached pictures while navigating.
     // A decline holds at its revision and zoom level (what it shows depends on both).
-    let rev = (app.session.revision, (cam.res.max(1e-9).log2().round()) as i32);
+    let rev = declined_at(app.session.revision, &cam);
     let turned_view = View { width: w, height: h, pixels_per_point: ppp as f64, camera: cam, sky: true };
     let gpu_ok = app.map.gpu_enabled
         && app.map.render_state.is_some()
@@ -1120,7 +1197,22 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         // A frame the worker couldn't draw (it panicked, or the system refused its thread) is
         // drawn on the UI thread, as before: a refused thread costs smoothness, not the frame.
         && !app.map.tilt_settle.failed(key);
-    let settling = (tilted || globe_view || tiled_flat || flat_settle) && !moving && app.ws.playing.is_none() && !hold;
+    // A turned or tilted map on the GPU re-projects its scene as the camera moves, but only so far
+    // (`SceneBuffers::fits`): turned or tilted half a degree, zoomed by 0.7 or 1.4 or panned a quarter
+    // of the view, it needs a scene of its own. Made on the UI thread, each one stopped the window
+    // for as long as tessellating every layer took, again and again through a turn, a tilt or a
+    // quick zoom. So, like a flat map's frames (#1750), it is made off the UI thread, while it
+    // moves and once it rests, and the scene on screen follows the camera meanwhile (ground it
+    // left out shows the map's background until the new one lands). The browser has one thread.
+    let turned_off = cfg!(not(target_arch = "wasm32"))
+        && !app.map.inline_frames
+        && gpu_ok
+        && !globe_view
+        && (cam.bearing != 0.0 || cam.pitch != 0.0)
+        && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.follows(&cam))
+        && app.map.key.is_some_and(|k| k.rev == key.rev && k.size == key.size && k.sources == key.sources && (k.cam != key.cam || k.draft))
+        && !app.map.tilt_settle.failed(key);
+    let settling = (tilted || globe_view || tiled_flat || flat_settle || turned_off) && !moving && app.ws.playing.is_none() && !hold;
     let mut tilt_draped = tilt_draped;
     // A frame finishing during a new gesture is obsolete. Drain it now so it neither holds
     // the worker slot nor keeps screenshot/idle waiters waiting for a frame we will not show;
@@ -1176,6 +1268,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
                 match r {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
+                        // A turned or tilted view the GPU declined stays on the CPU, as when it is
+                        // drawn here, until the map or its data change.
+                        if !globe_view && (done.view.camera.bearing != 0.0 || done.view.camera.pitch != 0.0) && gpu_ok {
+                            app.map.gpu_turn_declined = Some(declined_at(k.rev, &done.view.camera));
+                        }
                         app.map.gpu_frame = None;
                         show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, globe_view);
                         // Over terrain the settled frame's mesh is finer than the drape's
@@ -1207,9 +1304,18 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let upload = gpu_upload(app, gpu_ok);
             app.map.tilt_settle.start_prepared(ui.ctx(), key, app.session.map().clone(), view, backend, upload);
             // A worker the system refused wakes no frame: the next draws it here.
-            if flat_settle && app.map.tilt_settle.failed(key) {
+            if (flat_settle || turned_off) && app.map.tilt_settle.failed(key) {
                 ui.ctx().request_repaint();
             }
+        }
+        // A turned or tilted scene follows a camera that jumped (a zoom box, a bookmark) while
+        // the worker makes the scene for it, as it does while the map moves.
+        if turned_off
+            && app.map.key != Some(key)
+            && let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state)
+            && gf.camera() != cam
+        {
+            gf.set_camera(&rs.queue, &cam);
         }
         let shown = (app.map.texture.is_some() || app.map.gpu_frame.is_some())
             && app.map.key.is_some_and(|k| same_view(Key { draft: false, ..k }, key));
@@ -1223,7 +1329,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             } else if app.map.preview_attempt != Some(key)
                 && !reprojects
                 // The last frame, shifted, stands in while the worker draws; if it couldn't, a preview.
-                && !(flat_settle && app.map.tilt_settle.busy())
+                && !((flat_settle || turned_off) && app.map.tilt_settle.busy())
                 && !(keep_frame && app.map.tilt_settle.busy())
             {
                 // A kept frame waits for the exact one; if that couldn't be drawn, a preview.
@@ -1258,7 +1364,10 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // as it lands, while the map still moves: the camera has moved on since, so it is shifted and
     // scaled like the frame it replaces. Once the map rests or changes it is stopped and dropped:
     // the exact frame follows.
-    if flat_settle && interacting && !app.map.motion_dropped {
+    // A worker's frame that came back on the CPU because the GPU declined its turned or tilted
+    // view: the frame shown now is that one, and the next decides again whether to try the GPU.
+    let mut declined_now = false;
+    if (flat_settle || turned_off) && interacting && !app.map.motion_dropped {
         if let Some((k, done)) = app.map.motion_frame.take() {
             app.session.map_mut().adopt_caches(&done.map);
             if k.rev == key.rev
@@ -1271,6 +1380,11 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 app.map.motion_cost = full_cost(done.ms as f64, &done.view, (w, h), ppp);
                 match r {
                     rustgis_engine::render::RenderOutput::Cpu(r) => {
+                        if gpu_ok && (done.view.camera.bearing != 0.0 || done.view.camera.pitch != 0.0) {
+                            app.map.gpu_turn_declined = Some(declined_at(k.rev, &done.view.camera));
+                            declined_now = true;
+                            ui.ctx().request_repaint();
+                        }
                         app.map.gpu_frame = None;
                         show_frame(app, ui.ctx(), r, &done.view, (w, h), k, time, false);
                     }
@@ -1392,14 +1506,13 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let mut motion_off = false;
     if stale
         && !fast_engaged
-        && flat_settle
+        && ((flat_settle && !turning) || turned_off)
         && interacting
-        && !turning
         && !hold
         && !app.map.motion_dropped
         && (motion.is_some() || gpu_vector)
         // The scene on screen follows the camera while its successor is drawn.
-        && (!gpu_vector || (cam_only && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.fits(&cam))))
+        && (!gpu_vector || (cam_only && app.map.gpu_frame.as_ref().is_some_and(|f| !f.has_images && f.follows(&cam))))
     {
         let job = Key { draft: motion.is_some(), ..key };
         if !app.map.motion_frame.busy() {
@@ -1419,6 +1532,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     if stale
         && !fast_engaged
         && !motion_off
+        && !declined_now
         && !settling
         && !hold
         && !draped
@@ -1538,6 +1652,19 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     // vector-only scenes re-project in their shaders. Both draw inside egui's wgpu pass. The GPU
     // backend only serves flat maps, so the globe's drape never meets it.
     // Not under the tilted map's drape: a flat GPU frame from before the tilt would cover it.
+    // A scene that re-projects is drawn for the view's camera. One that followed a camera jump
+    // (a zoom box, a bookmark) while the worker made the scene for it stayed at that camera when
+    // the view came back to the one it was made for before that scene landed: then nothing above
+    // is out of date, and nothing else moves it back.
+    if app.map.key == Some(key)
+        && !tilt_draped
+        && let (Some(gf), Some(rs)) = (&app.map.gpu_frame, &app.map.render_state)
+        && !gf.has_images
+        && gf.follows(&cam)
+        && gf.camera() != cam
+    {
+        gf.set_camera(&rs.queue, &cam);
+    }
     if let (Some(gf), Some(gr)) = (app.map.gpu_frame.as_ref().filter(|_| !tilt_draped), &app.map.gpu_renderer) {
         // A scene with pictures (or drawn for another size, a pane being dragged) is shown as a
         // picture of itself, shifted and scaled until it is drawn again.
@@ -1548,9 +1675,7 @@ fn main_view(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         let (live_frame, live_pending) = match gf.live_frame(if picture { app.map.tex_camera } else { cam }) {
             Some((mut f, pending, declined)) => {
                 for error in f.tile_errors.drain(..) {
-                    if app.map.tile_errors.insert(error.clone()) {
-                        app.session.notify(error, true);
-                    }
+                    say_tile_error(&mut app.map.tile_errors, &mut app.session, error);
                 }
                 // A layer no longer drawn live (its style turned out to draw more than raster
                 // tiles): the map is drawn again, as tiles arriving would draw it.
@@ -1683,7 +1808,13 @@ fn casts_shadows(m: &rustgis_engine::map::Map) -> bool {
 /// Whether the map has raster layers read in place: the part in view arrives a tile at a time,
 /// through the tile cache, and the map is drawn again as it does.
 fn reads_in_place(m: &rustgis_engine::map::Map) -> bool {
-    m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.in_place))
+    m.layers.iter().any(|l| l.raster.as_ref().is_some_and(|r| r.reads_in_place()))
+}
+
+/// What a turned or tilted view the GPU declined is held at (`gpu_turn_declined`): the map's
+/// revision and the camera's zoom level, what the decline depends on.
+fn declined_at(revision: u64, cam: &Camera) -> (u64, i32) {
+    (revision, (cam.res.max(1e-9).log2().round()) as i32)
 }
 
 /// The GPU scene buffers a worker uploaded for its frame (see [`gpu_upload`]), if it did.
@@ -1765,10 +1896,9 @@ fn show_gpu_frame(
     app.map.attribution = scene.attribution;
     app.map.last_render = time;
     for e in scene.tile_errors {
-        if app.map.tile_errors.insert(e.clone()) {
-            app.session.notify(e, true);
-        }
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, e);
     }
+    say_approximations(app);
     app.map.tex_camera = cam;
     app.map.tex_size = (view.width, view.height);
     app.map.key = Some(key);
@@ -1827,13 +1957,91 @@ fn show_frame(
     app.map.attribution = r.attribution;
     app.map.last_render = time;
     for e in r.tile_errors {
-        if app.map.tile_errors.insert(e.clone()) {
-            app.session.notify(e, true);
-        }
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, e);
     }
+    say_approximations(app);
     app.map.tex_camera = cam;
     app.map.tex_size = (view.width, view.height);
     app.map.key = Some(key);
+}
+
+/// Says a tile layer's error ("{layer}: {why}", its kinds joined by "; ") once a project for each
+/// layer and kind of error, each kind a notice of its own: the count of tiles in the view a kind
+/// may carry ("12 tiles left out: …") changes with every pan or zoom, so it is said under its kind
+/// ([`tile_error_kind`]), with the count it had then, rather than again for each new count.
+/// Another kind of error, or another layer's, is said all the same. `said` is the map view's
+/// [`MapView::tile_errors`].
+pub(crate) fn say_tile_error(said: &mut std::collections::HashSet<String>, session: &mut rustgis_engine::Session, error: String) {
+    let (layer, why) = error.split_once(": ").map_or(("", error.as_str()), |(l, w)| (l, w));
+    for kind in why.split("; ") {
+        let notice = if layer.is_empty() { kind.to_string() } else { format!("{layer}: {kind}") };
+        // The layer's name as it is: only the reason loses its counts.
+        if said.insert(format!("{layer}\0{}", tile_error_kind(kind))) {
+            session.notify(notice, true);
+        }
+    }
+}
+
+/// Tile error reason `e` without its counts of tiles ("12 tiles left out", "3 tiles are partial",
+/// "2 warped tile components left out" each become `#`) or what follows the host in the
+/// addresses it names (each tile's differs, by its z/x/y): what it says beside them, the layer,
+/// the server and the reason, is its kind.
+fn tile_error_kind(e: &str) -> String {
+    let unaddressed = without_urls(e);
+    let mut out = String::with_capacity(unaddressed.len());
+    let mut rest = unaddressed.as_str();
+    while let Some(i) = rest.find(|c: char| c.is_ascii_digit()) {
+        let (head, tail) = rest.split_at(i);
+        out.push_str(head);
+        let n = tail.find(|c: char| !c.is_ascii_digit()).unwrap_or(tail.len());
+        let (digits, after) = tail.split_at(n);
+        let starts_word = !out.ends_with(|c: char| c.is_alphanumeric() || c == '.' || c == ',');
+        if starts_word && (after.starts_with(" tiles ") || after.starts_with(" warped tile")) {
+            out.push('#');
+        } else {
+            out.push_str(digits);
+        }
+        rest = after;
+    }
+    out.push_str(rest);
+    out
+}
+
+/// `e` with the rest of each web address in it after its host (`http://` or `https://`, any case,
+/// up to the next space or its end) replaced by `/…`: the path and query, which name the tile,
+/// go; the server stays, so another server's failure is a kind of its own.
+fn without_urls(e: &str) -> String {
+    // ASCII lower case keeps each byte where it is, so positions in it are positions in `e`.
+    let lower = e.to_ascii_lowercase();
+    let mut out = String::with_capacity(e.len());
+    let mut at = 0;
+    while let Some(i) = lower[at..].find("http://").into_iter().chain(lower[at..].find("https://")).min().map(|i| at + i) {
+        out.push_str(&e[at..i]);
+        let end = e[i..].find(char::is_whitespace).map_or(e.len(), |n| i + n);
+        let url = &e[i..end];
+        let host_from = url.find("://").map_or(0, |n| n + 3);
+        let host_end = url[host_from..].find(['/', '?', '#']).map_or(url.len(), |n| host_from + n);
+        out.push_str(&url[..host_end]);
+        if host_end < url.len() {
+            out.push_str("/…");
+        }
+        at = end;
+    }
+    out.push_str(&e[at..]);
+    out
+}
+
+/// Says, once a project each, what the map view's frames drew otherwise than their layers ask
+/// (a dashed line drawn solid, a fill left off a block diagram's walls, see
+/// [`rustgis_engine::render::take_approximations`]), each kind with the count it had when first
+/// seen: read after each frame it shows, with what its workers' frames handed over.
+fn say_approximations(app: &mut RustGisApp) {
+    let relays = [&app.map.tilt_settle.relay, &app.map.motion_frame.relay, &app.map.tilt_drape.relay];
+    for (kind, e) in rustgis_engine::render::take_approximations(&relays) {
+        if app.map.tile_errors.insert(format!("approximated\0{kind}")) {
+            app.session.warn(e);
+        }
+    }
 }
 
 /// How much wider and taller than the view a frame drawn mid-motion to fill a gap is, so the
@@ -2291,15 +2499,27 @@ pub(crate) fn text_graphic_at(app: &RustGisApp, ctx: &egui::Context, rect: Rect,
     let tokens = graphics::TokenValues::of(map, scale);
     // Only what is drawn, as render_frame draws it: the first layer on top, and in a layer the
     // last row. Fully transparent layers and rows beyond the view clipping distance are not drawn.
-    let clip = map.view.clip_distance.map(|d| (map.camera.center_lonlat(), d));
+    let clip = map.view.clip_distance.and_then(|d| Some((map.to_lonlat(map.camera.center)?, d)));
     map.layers.iter().filter(|l| l.graphics && l.selectable && map.draws_at(l, scale) && map.layer_opacity(l) > 0.0).find_map(|l| {
         let drawn = l.drawn_rows(scale);
+        // Boxes in longitude/latitude, as the view distance is measured there: none when the
+        // layer's coordinates can't be converted, as none of it is drawn then.
+        let to_lonlat = l.dataset.lonlat_conversion().ok()?;
         (0..l.dataset.features.len()).rev().filter(|r| drawn.get(*r) == Some(&true)).find_map(|row| {
             let g = l.dataset.features.get(row)?.geometry.as_ref()?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "View Clipping's draw distance: picks only what the renderer draws, by its test (`within_view_distance`)"
+            )]
             if let Some((centre, d)) = clip {
-                let e = g.extent();
+                // No extent (an empty geometry, or one whose conversion isn't a number): nothing
+                // of it is drawn, and clamping to its extent would panic.
+                let e = to_lonlat.feature_extent(&g.extent());
+                if e.is_empty() {
+                    return None;
+                }
                 let near = Coord::new(centre.x.clamp(e.min_x, e.max_x), centre.y.clamp(e.min_y, e.max_y));
-                if e.is_empty() || rustgis_engine::geom::haversine_m(centre, near) > d {
+                if rustgis_engine::geom::haversine_m(centre, near) > d {
                     return None;
                 }
             }
@@ -2322,7 +2542,11 @@ fn text_shown(
     use rustgis_engine::map::graphics;
     let ds = &l.dataset;
     let text = graphics::expand(graphics::label(ds, row)?, tokens);
-    let at = lonlat_to_screen(app, rect, ds.features.get(row)?.geometry.as_ref()?.label_point()?)?;
+    // Its place in longitude/latitude, from the layer's own coordinates, as the map shows them.
+    let place = ds.features.get(row)?.geometry.as_ref()?.label_point()?;
+    let to_lonlat = ds.shown_conversion().ok()?;
+    let place = if to_lonlat.is_identity() { place } else { to_lonlat.point(place)? };
+    let at = lonlat_to_screen(app, rect, place)?;
     let job = label_job(
         &text,
         graphics::font_size(ds, row),
@@ -2756,25 +2980,35 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         app.map.kept_lonlat = Some((c, app.session.map().instance_id(), app.session.opened));
     }
     let tool = app.session.tool;
+    if resp.secondary_clicked()
+        && let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p))
+    {
+        crate::shapeconvert::pick(app, c, ui.input(|i| i.modifiers.alt));
+    }
     crate::boxedit::cancel_stale(app);
     crate::circleedit::cancel_stale(app);
     if tool == Tool::RotatedBox {
         if resp.secondary_clicked() {
-            if let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p)) {
-                crate::boxedit::click(app, c, false, false);
-            }
             app.map.popup = None;
         }
         resp.context_menu(|ui| crate::boxedit::context_menu(app, ui));
     }
     if tool == Tool::Circle {
         if resp.secondary_clicked() {
-            if let Some(c) = resp.interact_pointer_pos().and_then(|p| screen_to_lonlat(app, rect, p)) {
-                crate::circleedit::click(app, c, false, false);
-            }
             app.map.popup = None;
         }
         resp.context_menu(|ui| crate::circleedit::context_menu(app, ui));
+    }
+    // Selection-area tools return early below; their right-click must still open the menu.
+    if resp.secondary_clicked() && !matches!(tool, Tool::RotatedBox | Tool::Circle) {
+        app.map.menu_lonlat = app.map.pointer_lonlat;
+        app.map.menu_text = resp.interact_pointer_pos().and_then(|p| text_graphic_at(app, ui.ctx(), rect, p));
+    }
+    // No menu off the Earth (a globe's corners): there is no place for it to act on.
+    if !matches!(tool, Tool::RotatedBox | Tool::Circle)
+        && let Some(c) = app.map.menu_lonlat
+    {
+        resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
     }
     cancel_changed_selection(app, rect);
 
@@ -3280,13 +3514,7 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
                 let r = app.session.run("identify", &json!({"lon": c.x, "lat": c.y, "tolerancePx": 5}));
                 app.map.popup = match r {
                     Ok(v) if !v.is_null() => {
-                        if let (Some(id), Some(row)) = (v["layerId"].as_u64(), v["row"].as_u64()) {
-                            let _ = app.session.run("select.rows", &json!({"layer": id, "rows": [row]}));
-                        } else if !is_found(&v) {
-                            // Only WMS layers being asked: the click found nothing yet, so it clears
-                            // the selection as an empty click does.
-                            clear_selection_quietly(app);
-                        }
+                        select_first_found(app, &v);
                         Some(Popup::new(v, c, app.session.project.active_map, app.session.opened))
                     }
                     _ => {
@@ -3369,16 +3597,6 @@ fn interact(app: &mut RustGisApp, ui: &mut Ui, resp: &egui::Response, rect: Rect
         && let Some(icon) = hover.and_then(|p| crate::circleedit::cursor(app, rect, p))
     {
         ui.ctx().set_cursor_icon(icon);
-    }
-    if resp.secondary_clicked() && !matches!(tool, Tool::RotatedBox | Tool::Circle) {
-        app.map.menu_lonlat = app.map.pointer_lonlat;
-        app.map.menu_text = resp.interact_pointer_pos().and_then(|p| text_graphic_at(app, ui.ctx(), rect, p));
-    }
-    // No menu off the Earth (a globe's corners): there is no place for it to act on.
-    if !matches!(tool, Tool::RotatedBox | Tool::Circle)
-        && let Some(c) = app.map.menu_lonlat
-    {
-        resp.context_menu(|ui| crate::mapmenu::show(app, ui, c));
     }
     if hover.is_some() && (matches!(tool, Tool::Measure | Tool::MeasureArea) || tool.draws_edit()) && !app.map.sketch.is_empty() {
         ui.ctx().request_repaint();
@@ -3500,7 +3718,8 @@ pub fn finish_graphic(app: &mut RustGisApp, shape: &str, pts: Vec<Coord>) {
         return;
     }
     let coords: Vec<[f64; 2]> = pts.iter().map(|c| [c.x, c.y]).collect();
-    let ok = app.run("graphics.add", json!({"shape": shape, "points": coords})).is_ok();
+    // Built as the view faces, as the drag previewed it.
+    let ok = app.run("graphics.add", json!({"shape": shape, "points": coords, "frame": "view"})).is_ok();
     app.map.cancel_sketch();
     // A failed graphic (a click without a drag) keeps the tool; the error is in the notices.
     if ok && !app.session.keep_tool {
@@ -3540,7 +3759,10 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         let mut verts: Vec<Coord> = Vec::new();
         for l in app.session.map().layers.iter().filter(|l| !l.selection.is_empty() && !l.is_raster() && !l.graphics) {
             for r in &l.selection {
-                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref()) {
+                // In longitude/latitude, from the layer's own coordinates, as they are drawn.
+                if let Some(g) = l.dataset.features.get(*r).and_then(|f| f.geometry.as_ref())
+                    && let Ok(g) = l.dataset.geometry_to_lonlat(g)
+                {
                     g.for_each_coord(|c| {
                         if verts.len() < 4000 {
                             verts.push(c);
@@ -3567,6 +3789,7 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     if app.session.tool == Tool::Circle {
         crate::circleedit::draw(app, p, rect, accent);
     }
+    crate::shapeconvert::draw(app, p, rect);
     // The navigator: a compass, zoom buttons and a pan pad in the top-left corner.
     if app.session.map().view.navigator {
         navigator(app, ui, p, rect, t);
@@ -3647,8 +3870,9 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
             let cam = app.session.map().camera;
             let key = [c.x, c.y, cam.center.x + cam.center.y * 1e-3, cam.res, app.session.revision as f64];
             match (&app.map.vertex_drag, &app.map.snap) {
-                // A dragged vertex has snapped already (leaving its own feature out).
-                (Some(d), _) => d.snapped.then_some(d.at),
+                // A dragged vertex has snapped already (leaving its own feature out), in view
+                // coordinates.
+                (Some(d), _) => d.snapped_lonlat,
                 (None, Some((k, at))) if *k == key => *at,
                 _ => {
                     // Asked directly, not as a command: commands mark the map changed.
@@ -3674,31 +3898,40 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
     if !app.map.sketch.is_empty()
         && let Some(shape) = drag_shape(tool).filter(|s| !matches!(*s, "freehand" | "lasso"))
     {
-        // Rectangles, circles and ellipses preview as their outline between the two points.
-        if let (Some(a), Some(b)) = (
+        // Rectangles, circles, ellipses and pictures preview as the outline they are added with
+        // (`"frame": "view"`): on a map in another projection, or turned, that is what was dragged.
+        let green = Color32::from_rgb(0x16, 0x9A, 0x5A);
+        let stroke = Stroke::new(2.0, green);
+        let outline = rustgis_engine::cmd::graphics::dragged_outline(&app.session, shape, &app.map.sketch);
+        let pts: Vec<Pos2> = outline.iter().flatten().filter_map(|c| lonlat_to_screen(app, rect, *c)).collect();
+        // A picture is drawn upright on screen between its box's north-west and south-east
+        // corners (render's picture graphics), so it previews as that, turned map or not.
+        let picture = outline
+            .as_deref()
+            .filter(|_| shape == "picture")
+            .map(|cs| {
+                cs.iter().fold(Extent::EMPTY, |mut e, c| {
+                    e.expand(*c);
+                    e
+                })
+            })
+            .filter(|e| !e.is_empty())
+            .and_then(|e| {
+                Some((
+                    lonlat_to_screen(app, rect, Coord::new(e.min_x, e.max_y))?,
+                    lonlat_to_screen(app, rect, Coord::new(e.max_x, e.min_y))?,
+                ))
+            });
+        if let Some((a, b)) = picture {
+            p.rect_stroke(Rect::from_two_pos(a, b), 0.0, stroke, egui::StrokeKind::Middle);
+        } else if shape != "picture" && pts.len() == outline.as_ref().map_or(0, Vec::len) && pts.len() >= 3 {
+            p.add(egui::Shape::closed_line(pts, stroke));
+        } else if let (Some(a), Some(b)) = (
             app.map.sketch.first().and_then(|c| lonlat_to_screen(app, rect, *c)),
             app.map.sketch.last().and_then(|c| lonlat_to_screen(app, rect, *c)),
         ) {
-            let green = Color32::from_rgb(0x16, 0x9A, 0x5A);
-            let stroke = Stroke::new(2.0, green);
-            match shape {
-                "circle" => {
-                    p.circle_stroke(a, (b - a).length(), stroke);
-                }
-                "ellipse" => {
-                    let r = Rect::from_two_pos(a, b);
-                    let pts: Vec<Pos2> = (0..72)
-                        .map(|i| {
-                            let t = i as f32 / 72.0 * std::f32::consts::TAU;
-                            pos2(r.center().x + r.width() / 2.0 * t.cos(), r.center().y + r.height() / 2.0 * t.sin())
-                        })
-                        .collect();
-                    p.add(egui::Shape::closed_line(pts, stroke));
-                }
-                _ => {
-                    p.rect_stroke(Rect::from_two_pos(a, b), 0.0, stroke, egui::StrokeKind::Middle);
-                }
-            }
+            // Not a shape yet (a click without a drag), or partly off the map: the drag itself.
+            p.rect_stroke(Rect::from_two_pos(a, b), 0.0, stroke, egui::StrokeKind::Middle);
         }
         previewed = true;
     }
@@ -3736,10 +3969,12 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
             // On the map's body: the Earth measures on the WGS 84 ellipsoid, so the panel agrees
             // with the geoprocessing tools (#939); another body measures on its sphere and scales.
             let body = app.session.map().body();
+            #[expect(clippy::disallowed_methods, reason = "another body measures on its sphere, scaled by `Body`")]
             let measure_length = |pts: &[Coord]| {
                 if body.is_earth() { wgs84_length_m(pts) } else { body.length(geodesic_length_m(pts)) }
             };
             // Perimeter and area in the map body's measurement model.
+            #[expect(clippy::disallowed_methods, reason = "another body measures on its sphere, scaled by `Body`")]
             let measure_ring = |ring: &[Coord]| {
                 if body.is_earth() {
                     wgs84_ring_perimeter_area_m2(ring)
@@ -3857,7 +4092,15 @@ fn overlays(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t:
         p.rect_filled(r, CornerRadius::same(3), t.ribbon.gamma_multiply(0.75));
         p.galley(r.min + vec2(5.0, 2.0), g, t.text_dim);
     }
-    // Navigation buttons (zoom in/out/full) in the top-right corner.
+    // Navigation buttons (zoom in/out/full) in the top-right corner. A shell with its own
+    // interface has none: a finger pinches to zoom, and the shell offers Full Extent.
+    if app.chrome.is_none() {
+        navigation(app, ui, p, rect, t);
+    }
+}
+
+/// The map's Zoom In, Zoom Out and Full Extent buttons, in the top-right corner of `rect`.
+fn navigation(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t: &Tokens) {
     let mut y = rect.min.y + 12.0;
     for (icon, id, tip) in
         [("zoom_in", "map.zoomIn", "Zoom in"), ("zoom_out", "map.zoomOut", "Zoom out"), ("zoom_full", "map.zoomFull", "Full extent")]
@@ -4025,13 +4268,37 @@ fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
     let exists = |app: &RustGisApp, layer: &str| app.session.map().tiles.iter().any(|t| t.name == layer && t.draws());
     for (layer, also, capabilities, request, r) in landed {
         // Layers removed, renamed or hidden while the answer came: nothing to show, nothing to
-        // tell. The first of a service's layers still there takes the capabilities for the rest.
-        let mut group = std::iter::once(layer).chain(also).filter(|l| exists(app, l));
+        // tell. The first of a service's layers still there takes the capabilities for the rest;
+        // capabilities go only to layers still of the service they were asked of (not another
+        // layer since given the same name).
+        let of_service = |app: &RustGisApp, l: &str| {
+            !capabilities
+                || app
+                    .session
+                    .map()
+                    .tiles
+                    .iter()
+                    .find(|t| t.name == l)
+                    .and_then(|t| rustgis_engine::data::ogc::wms_layer_of(&t.url))
+                    .map(|(c, _)| c)
+                    == request
+        };
+        let mut group = std::iter::once(layer).chain(also).filter(|l| exists(app, l) && of_service(app, l));
         let Some(layer) = group.next() else { continue };
         let also: Vec<String> = group.collect();
         // The fetch's failure, or an answer that isn't text, is told here; the command tells its
         // own errors (naming the layer).
-        let text = match r.and_then(|bytes| rustgis_engine::data::ogc::answer_text(&bytes).map(std::borrow::Cow::into_owned)) {
+        let text = match r.and_then(|(bytes, reach)| {
+            // Capabilities read from the internet hold the requests they name there, as identify's
+            // own read does (the layer then lists them with `"public"`).
+            if capabilities
+                && reach == Reach::Public
+                && let Some(caps) = &request
+            {
+                cache::restrict_to_public(caps);
+            }
+            rustgis_engine::data::ogc::answer_text(&bytes).map(std::borrow::Cow::into_owned)
+        }) {
             Ok(text) => text,
             Err(e) => {
                 app.session.notify(crate::i18n::fmt("{layer}: {e}", &[("layer", &layer), ("e", &e)]), true);
@@ -4042,13 +4309,14 @@ fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
         if capabilities {
             let p = json!({"layer": layer, "lon": lon, "lat": lat, "capabilities": text, "request": true});
             replies.push((layer, app.session.run("identify.featureInfo", &p)));
-            // The service's other layers learned their requests from the same capabilities.
-            if replies.iter().all(|(_, r)| r.is_ok()) {
-                for other in also {
-                    let p = json!({"layer": other, "lon": lon, "lat": lat, "request": true});
-                    let r = app.session.run("identify.featureInfo", &p);
-                    replies.push((other, r));
-                }
+            // The service's other layers learned their requests from the same capabilities: each is
+            // asked whatever became of the first's (one refused, for reaching past its layer, is
+            // said by its own command; capabilities that couldn't be read leave the others nothing
+            // to ask).
+            for other in also {
+                let p = json!({"layer": other, "lon": lon, "lat": lat, "request": true});
+                let r = app.session.run("identify.featureInfo", &p);
+                replies.push((other, r));
             }
         } else {
             // With the request and the point: the service's error in one answer format asks again
@@ -4057,9 +4325,11 @@ fn follow_asks(app: &mut RustGisApp, ctx: &egui::Context) {
             replies.push((layer.clone(), app.session.run("identify.featureInfo", &p)));
         }
         for (layer, r) in replies {
+            // A failure (a request refused because it reaches past the layer, too) was told by the
+            // command, as every command's error is.
             let Ok(v) = r else { continue };
             if let Some(url) = v["url"].as_str() {
-                let slot = crate::fetch_into_limited(url, rustgis_engine::data::ogc::MAX_INFO_BYTES);
+                let slot = ask_within(&v, url);
                 next.push(Ask { layer, also: Vec::new(), capabilities: false, request: Some(url.to_string()), slot });
             }
             found.extend(v["results"].as_array().cloned().unwrap_or_default());
@@ -4377,13 +4647,8 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     // Zooms to the feature shown, found by its id, as Zoom To Selection does: the selection and
     // the undo history are left as they are.
     if let (true, Some((id, fid))) = (zoom, shown) {
-        let extent = app
-            .session
-            .map()
-            .layer(id)
-            .and_then(|l| l.dataset.features.iter().find(|f| f.id == fid))
-            .and_then(|f| f.geometry.as_ref())
-            .map(|g| g.extent());
+        let extent =
+            app.session.map().layer(id).and_then(|l| l.dataset.features.iter().position(|f| f.id == fid).map(|row| l.rows_extent([row])));
         if let Some(e) = extent.filter(|e| !e.is_empty()) {
             app.session.zoom_to(&e);
         }
@@ -4396,6 +4661,18 @@ fn popup(app: &mut RustGisApp, ui: &mut Ui, rect: Rect) {
     } else if let (Some(i), Some(pp)) = (step, &mut app.map.popup) {
         pp.index = i;
         select_shown(app);
+    }
+}
+
+/// Selects the feature a click's identify shows first. One that isn't a map layer's row (a
+/// raster's pixel drawn over a polygon (#2488), a tile layer's feature, or nothing yet while WMS
+/// layers are asked) clears the selection, as an empty click does and as browsing the pop-up to it
+/// does ([`select_shown`]): the selection is what the pop-up shows.
+fn select_first_found(app: &mut RustGisApp, v: &Value) {
+    if let (Some(id), Some(row)) = (v["layerId"].as_u64(), v["row"].as_u64()) {
+        let _ = app.session.run("select.rows", &json!({"layer": id, "rows": [row]}));
+    } else {
+        clear_selection_quietly(app);
     }
 }
 
@@ -4413,7 +4690,7 @@ fn select_shown(app: &mut RustGisApp) {
     if let Some((id, row)) = found {
         rustgis_engine::cmd::select::set(&mut app.session, id, vec![row], rustgis_engine::cmd::select::Mode::New);
     } else {
-        app.session.map_mut().clear_selection();
+        rustgis_engine::cmd::select::clear(&mut app.session);
     }
     app.session.revision = app.session.revision.wrapping_add(1);
 }
@@ -4510,23 +4787,103 @@ fn navigator(app: &mut RustGisApp, ui: &mut Ui, p: &egui::Painter, rect: Rect, t
     }
 }
 
+/// Width of the New Map button after the view tabs.
+const NEW_TAB_W: f32 = 22.0;
+
+/// ModelBuilder's view tab, while it is open: its model's name.
+fn model_tab_name(app: &RustGisApp) -> Option<String> {
+    app.mb.open.then(|| if app.mb.name.trim().is_empty() { tl!("Untitled model").to_string() } else { app.mb.name.trim().to_string() })
+}
+
+/// A view tab's width: its name, icon, padding and close button.
+fn view_tab_w(ui: &Ui, name: &str) -> f32 {
+    crate::widgets::text_w(ui, name, regular(12.0)) + 46.0 + TAB_CLOSE_W
+}
+
+/// The next view tab's place in the row, `w` wide, below the strip's top margin.
+fn next_view_tab(ui: &mut Ui, w: f32) -> Rect {
+    let (r, _) = ui.allocate_exact_size(vec2(w, 30.0), Sense::hover());
+    Rect::from_min_max(pos2(r.min.x, r.min.y + 4.0), r.max)
+}
+
 /// View tabs above the map, one per map in the project, like document tabs.
+///
+/// The tabs scroll between arrow buttons when the window is too narrow for them, as the ribbon's
+/// tab strip does ([`crate::ribbon::arrow_scroll_area`]), and the one in view scrolls into sight
+/// when it changes, however it was opened (a click, the Browser, a script, a command), or when the
+/// strip's room or the tabs' widths do. The New Map button stays out of the scrolled part, so it
+/// is always in sight.
 fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
     let (r, _) = ui.allocate_exact_size(vec2(ui.available_width(), 30.0), Sense::hover());
     ui.painter().rect_filled(r, 0.0, t.tab_strip);
     ui.painter().line_segment([pos2(r.min.x, r.max.y - 0.5), pos2(r.max.x, r.max.y - 0.5)], Stroke::new(1.0, t.border));
-    let mut x = r.min.x + 6.0;
+    // The tabs take the strip but the New Map button's room and the gaps around it.
+    let room = (r.width() - 6.0 - 4.0 - NEW_TAB_W - 4.0).max(60.0);
+    let p = &app.session.project;
+    let model = model_tab_name(app);
+    let in_view = if app.mb.shown() { (2, 0) } else { app.session.active_layout.map_or((0, p.active_map), |i| (1, i)) };
+    // Where the tab in view starts in the row, and how wide it is: it moves when a tab before it
+    // changes width, even when the row's total width doesn't (two names swapped across it).
+    let tabs = p.maps.iter().enumerate().map(|(i, m)| ((0, i), &m.name));
+    let tabs = tabs.chain(p.layouts.iter().enumerate().map(|(i, l)| ((1, i), &l.name))).chain(model.iter().map(|n| ((2, 0), n)));
+    let (mut start, mut span) = (0.0, (0.0, 0.0));
+    for (tab, n) in tabs {
+        let w = view_tab_w(ui, n) + 2.0;
+        if tab == in_view {
+            span = (start, w);
+        }
+        start += w;
+    }
+    let key = (in_view, room.round() as i32, span.0.round() as i32, span.1.round() as i32);
+    let follow = crate::ribbon::follow_active(ui, egui::Id::unique("view_tabs_active"), key);
+    let strip = Rect::from_min_size(pos2(r.min.x + 6.0, r.min.y), vec2(room, r.height()));
+    let mut tabs_ui = ui.new_child(egui::UiBuilder::new().max_rect(strip).layout(egui::Layout::left_to_right(egui::Align::Min)));
+    let area = egui::ScrollArea::horizontal().id_salt("view_tabs").max_width(room);
+    let tips = [tl!("Scroll the map tabs left"), tl!("Scroll the map tabs right")];
+    let mut close = None;
+    let strip_area = crate::ribbon::arrow_scroll_area(&mut tabs_ui, t, "view_tabs", area, tips, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing = vec2(2.0, 0.0);
+            close = view_tab_row(app, ui, t, follow);
+        });
+    });
+    crate::widgets::yield_touch_drag(ui.ctx(), strip_area);
+    // Right after the tabs, or at the strip's right edge once they scroll.
+    let x = tabs_ui.min_rect().max.x + 2.0;
+    let pr = Rect::from_min_size(pos2(x + 2.0, r.min.y + 6.0), vec2(NEW_TAB_W, 20.0));
+    let resp = ui.interact(pr, egui::Id::unique("maptab_new"), Sense::click());
+    resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, tl!("New Map")));
+    if resp.hovered() {
+        ui.painter().rect_filled(pr, CornerRadius::same(4), t.hover);
+    }
+    ui.painter().text(pr.center(), Align2::CENTER_CENTER, "+", regular(15.0), t.text_dim);
+    if resp.on_hover_text(tl!("New Map")).clicked() {
+        let _ = app.run("map.new", Value::Null);
+    }
+    if close.is_some() {
+        app.map.deleting = close;
+    }
+}
+
+/// The view tabs in a row: maps, layouts, then ModelBuilder. The one in view scrolls into sight
+/// while `follow` says so. The map or layout whose close button was clicked, to confirm.
+fn view_tab_row(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens, follow: bool) -> Option<Deletion> {
     let names: Vec<String> = app.session.project.maps.iter().map(|m| m.name.clone()).collect();
     let active = if app.session.active_layout.is_some() || app.mb.shown() { usize::MAX } else { app.session.project.active_map };
     // A tab's close button asks to delete its map or layout.
     let mut close: Option<Deletion> = None;
+    let mut map_tabs = Vec::with_capacity(names.len());
     for (i, n) in names.iter().enumerate() {
-        let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
-        let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
-        let resp = ui.interact(tr, egui::Id::unique(("maptab", i)), Sense::click());
+        let tr = next_view_tab(ui, view_tab_w(ui, n));
+        let resp = ui.interact(tr, egui::Id::unique(("maptab", i)), crate::widgets::reorder_sense(ui, true));
         // Painted, so named for screen readers (and tests).
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, n));
+        let dragging = drag_tab(ui, &resp, false, n);
+        map_tabs.push(tr);
         let is = i == active;
+        if is && follow {
+            crate::ribbon::scroll_tab_into_view(ui, tr);
+        }
         // A project keeps at least one map (`map.remove` refuses the last).
         let last = names.len() < 2;
         let tip = if last { tl!("A project keeps at least one map") } else { tl!("Delete Map") };
@@ -4537,7 +4894,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
                 t.accent,
             );
-        } else if resp.contains_pointer() {
+        } else if resp.contains_pointer() || dragging {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.hover);
         }
         icons::paint(ui.painter(), Rect::from_center_size(pos2(tr.min.x + 15.0, tr.center().y), vec2(15.0, 15.0)), "map", t.icon, t.accent);
@@ -4563,16 +4920,20 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("ui.dialog", json!({"name": "renameMap", "target": n}));
         }
         resp.context_menu(|ui| crate::panes::map_menu(app, ui, n));
-        x += w + 2.0;
     }
     // Layouts, after the maps.
     let layouts: Vec<String> = app.session.project.layouts.iter().map(|l| l.name.clone()).collect();
+    let mut layout_tabs = Vec::with_capacity(layouts.len());
     for (i, n) in layouts.iter().enumerate() {
-        let w = crate::widgets::text_w(ui, n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
-        let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
-        let resp = ui.interact(tr, egui::Id::unique(("layouttab", i)), Sense::click());
+        let tr = next_view_tab(ui, view_tab_w(ui, n));
+        let resp = ui.interact(tr, egui::Id::unique(("layouttab", i)), crate::widgets::reorder_sense(ui, true));
         resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, n));
+        let dragging = drag_tab(ui, &resp, true, n);
+        layout_tabs.push(tr);
         let is = app.session.active_layout == Some(i) && !app.mb.shown();
+        if is && follow {
+            crate::ribbon::scroll_tab_into_view(ui, tr);
+        }
         if is {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.ribbon);
             ui.painter().rect_filled(
@@ -4580,7 +4941,7 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
                 CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 },
                 t.accent,
             );
-        } else if resp.contains_pointer() {
+        } else if resp.contains_pointer() || dragging {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.hover);
         }
         icons::paint(
@@ -4610,15 +4971,16 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
             let _ = app.run("ui.dialog", json!({"name": "renameLayout", "target": n}));
         }
         resp.context_menu(|ui| crate::panes::layout_menu(app, ui, n));
-        x += w + 2.0;
     }
     // ModelBuilder, after the layouts.
-    if app.mb.open {
-        let n = if app.mb.name.trim().is_empty() { tl!("Untitled model").to_string() } else { app.mb.name.trim().to_string() };
-        let w = crate::widgets::text_w(ui, &n, regular(12.0)) + 46.0 + TAB_CLOSE_W;
-        let tr = Rect::from_min_size(pos2(x, r.min.y + 4.0), vec2(w, r.height() - 4.0));
+    if let Some(n) = model_tab_name(app) {
+        let tr = next_view_tab(ui, view_tab_w(ui, &n));
         let resp = ui.interact(tr, egui::Id::unique("modeltab"), Sense::click());
+        resp.widget_info(|| egui::WidgetInfo::labeled(egui::Role::Button, true, &n));
         let is = app.mb.shown();
+        if is && follow {
+            crate::ribbon::scroll_tab_into_view(ui, tr);
+        }
         if is {
             ui.painter().rect_filled(tr, CornerRadius { nw: 6, ne: 6, sw: 0, se: 0 }, t.ribbon);
             ui.painter().rect_filled(
@@ -4649,19 +5011,85 @@ fn view_tabs(app: &mut RustGisApp, ui: &mut Ui, t: &Tokens) {
         if resp.clicked() && !is {
             let _ = app.run("ui.modelBuilder", Value::Null);
         }
-        x += w + 2.0;
     }
-    let pr = Rect::from_min_size(pos2(x + 2.0, r.min.y + 6.0), vec2(22.0, 20.0));
-    let resp = ui.interact(pr, egui::Id::unique("maptab_new"), Sense::click());
-    if resp.hovered() {
-        ui.painter().rect_filled(pr, CornerRadius::same(4), t.hover);
+    let layout = egui::DragAndDrop::payload::<DraggedTab>(ui.ctx()).is_some_and(|d| d.layout);
+    let (tabs, names) = if layout { (layout_tabs, layouts) } else { (map_tabs, names) };
+    tab_drop(app, ui, t, &tabs, &names, layout, false);
+    close
+}
+
+/// A map or layout tab, or its row in the Browser (#2829), being dragged to another place among
+/// its kind (#2802): which of the two, and its name, so a list that changes during the drag (an
+/// undo, a script) moves the same one.
+struct DraggedTab {
+    layout: bool,
+    name: String,
+}
+
+/// Starts dragging the map or layout tab or row `name` when `resp` starts a drag; whether that one
+/// is being dragged.
+pub(crate) fn drag_tab(ui: &Ui, resp: &egui::Response, layout: bool, name: &str) -> bool {
+    if crate::widgets::reorder_drag(ui, resp, true) {
+        egui::DragAndDrop::set_payload(ui.ctx(), DraggedTab { layout, name: name.to_string() });
     }
-    ui.painter().text(pr.center(), Align2::CENTER_CENTER, "+", regular(15.0), t.text_dim);
-    if resp.on_hover_text(tl!("New Map")).clicked() {
-        let _ = app.run("map.new", Value::Null);
+    egui::DragAndDrop::payload::<DraggedTab>(ui.ctx()).is_some_and(|d| d.layout == layout && d.name == name)
+}
+
+/// While an item is dragged over a list that scrolls (the view tabs, the Browser or the Layers
+/// pane), scrolls the list `ui` is in when the `pointer` is near its edge along the axis
+/// (`vertical`, else horizontal), faster the closer it is, and asks for a frame to go on (#2957).
+/// `view` is the list's visible rectangle: a `pointer` outside it scrolls nothing.
+pub(crate) fn edge_scroll(ui: &Ui, view: Rect, pointer: egui::Pos2, vertical: bool) {
+    if !view.contains(pointer) {
+        return;
     }
-    if close.is_some() {
-        app.map.deleting = close;
+    let a = usize::from(vertical);
+    let edge = 28.0;
+    let push = ((view.min[a] + edge - pointer[a]).max(0.0) - (pointer[a] - (view.max[a] - edge)).max(0.0)) / edge;
+    if push != 0.0 {
+        let dt = ui.input(|i| i.stable_dt).min(0.1);
+        let step = push * 600.0 * dt;
+        ui.scroll_with_delta_animation(if vertical { vec2(0.0, step) } else { vec2(step, 0.0) }, egui::style::ScrollAnimation::none());
+        ui.ctx().request_repaint();
+    }
+}
+
+/// While a map or layout tab is dragged over the strip, or its row over the Browser's list
+/// (`vertical`): a mark where it would land among the others of its kind (`tabs`, named `names`;
+/// layouts with `layout`, else maps), which `map.move` or `layout.move` takes it to when let go;
+/// one of the other kind lands nowhere. On the strip a map dragged past the maps lands last among
+/// them, a layout dragged before the layouts first; in the list, let go off its kind's rows it
+/// lands nowhere. Near the strip's or list's ends they scroll, faster the closer the pointer is,
+/// as the Layers pane does.
+pub(crate) fn tab_drop(app: &mut RustGisApp, ui: &Ui, t: &Tokens, tabs: &[Rect], names: &[String], layout: bool, vertical: bool) {
+    let Some(dragged) = egui::DragAndDrop::payload::<DraggedTab>(ui.ctx()).filter(|d| d.layout == layout) else { return };
+    let view = ui.clip_rect();
+    let Some(pointer) = ui.ctx().pointer_interact_pos().filter(|p| view.contains(*p)) else { return };
+    // Along the row (x) or the list (y).
+    let a = usize::from(vertical);
+    edge_scroll(ui, view, pointer, vertical);
+    let (Some(from), Some(first), Some(last)) = (names.iter().position(|n| *n == dragged.name), tabs.first(), tabs.last()) else {
+        return;
+    };
+    if vertical && (pointer.y < first.min.y || pointer.y > last.max.y) {
+        return;
+    }
+    // The tabs or rows whose middle is before the pointer go before it.
+    let slot = tabs.iter().filter(|r| r.center()[a] < pointer[a]).count();
+    let to = if slot > from { slot - 1 } else { slot };
+    if to == from {
+        return;
+    }
+    let at = tabs.get(slot).map_or(last.max[a] + 1.0, |r| r.min[a] - 1.0);
+    let mark = if vertical {
+        [pos2(last.min.x + 2.0, at), pos2(last.max.x - 2.0, at)]
+    } else {
+        [pos2(at, last.min.y + 2.0), pos2(at, last.max.y - 2.0)]
+    };
+    ui.painter().line_segment(mark, Stroke::new(2.0, t.accent));
+    if ui.input(|i| i.pointer.primary_released()) {
+        let cmd = if layout { "layout.move" } else { "map.move" };
+        let _ = app.run(cmd, json!({"name": dragged.name, "to": to}));
     }
 }
 
@@ -4802,8 +5230,19 @@ fn shown_layers(session: &rustgis_engine::Session) -> u64 {
     let mut h = std::hash::DefaultHasher::new();
     let project = &session.project;
     let map = project.map();
-    (&session.path, &project.name, project.active_map, &map.name, map.basemap, map.graticule, map.graticule_type, &map.graticule_crs)
+    (
+        &session.path,
+        &project.name,
+        project.active_map,
+        &map.name,
+        map.basemap,
+        map.paper,
+        map.graticule,
+        map.graticule_type,
+        &map.graticule_crs,
+    )
         .hash(&mut h);
+    (map.graticule_on_top, map.graticule_color).hash(&mut h);
     for l in &map.layers {
         (l.id, l.visible).hash(&mut h);
     }
@@ -4897,6 +5336,77 @@ mod tile_redraw_tests {
             assert!(app.map.tile_errors.insert(error), "reopening the same or another project reports the notice again");
             app.map.tile_errors.clear();
         }
+    }
+
+    /// A tile layer's error whose count of tiles changes as the view moves is said once for the
+    /// layer and kind; another kind or another layer's is said all the same (#2639).
+    #[test]
+    fn tile_errors_are_said_once_a_layer_and_kind_whatever_their_counts() {
+        use super::{say_tile_error, tile_error_kind};
+        assert_eq!(tile_error_kind("Tiles: 12 tiles left out: refused"), "Tiles: # tiles left out: refused");
+        assert_eq!(tile_error_kind("Tiles: 3 tiles are partial (first: HTTP 404)"), "Tiles: # tiles are partial (first: HTTP 404)");
+        assert_eq!(tile_error_kind("Layer 12: 2 warped tile components left out: x"), "Layer 12: # warped tile components left out: x");
+        assert_eq!(tile_error_kind("Tiles: missing source"), "Tiles: missing source");
+        // An address names its tile (z/x/y): two tiles' are one kind (#2657).
+        let a = tile_error_kind("1 tiles left out: https://b.s3.example/t/3/4/5.png?X-Sig=1 answered with a redirect");
+        let b = tile_error_kind("7 tiles left out: https://b.s3.example/t/9/8/7.png?X-Sig=2 answered with a redirect");
+        assert_eq!(a, b);
+        assert_eq!(a, "# tiles left out: https://b.s3.example/… answered with a redirect");
+        // Another server is another kind.
+        assert_ne!(a, tile_error_kind("1 tiles left out: https://a.s3.example/t/3/4/5.png answered with a redirect"));
+        // Two addresses, one at the end, any case.
+        assert_eq!(
+            tile_error_kind("from HTTPS://x.example/1/2/3.png to http://y.example/4/5/6.png?k=1"),
+            "from HTTPS://x.example/… to http://y.example/…"
+        );
+        assert_eq!(tile_error_kind("refused by https://x.example"), "refused by https://x.example");
+        let mut app = crate::RustGisApp::with_sample();
+        let said = |app: &crate::RustGisApp, mark| app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+        let mark = app.session.notice_mark();
+        for n in [12, 7, 30, 12] {
+            say_tile_error(&mut app.map.tile_errors, &mut app.session, format!("Tiles: {n} tiles left out: refused"));
+        }
+        assert_eq!(said(&app, mark), ["Tiles: 12 tiles left out: refused"]);
+        // A new reason, and another layer's, are new.
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Tiles: 4 tiles left out: HTTP 500".into());
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Roads: 4 tiles left out: refused".into());
+        assert_eq!(said(&app, mark).len(), 3, "{:?}", said(&app, mark));
+        // A layer's kinds joined in one error are each said once, under the layer.
+        let mark = app.session.notice_mark();
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "Tiles: 9 tiles left out: refused; sprite left out".into());
+        assert_eq!(said(&app, mark), ["Tiles: sprite left out"]);
+        // Layers whose names hold what a count looks like stay apart.
+        let mark = app.session.notice_mark();
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "2024 tiles west: missing source".into());
+        say_tile_error(&mut app.map.tile_errors, &mut app.session, "2025 tiles west: missing source".into());
+        assert_eq!(said(&app, mark).len(), 2);
+    }
+
+    /// What the map view's frames approximated is said once a project each (#2639).
+    #[test]
+    fn approximations_are_said_once_a_project() {
+        let mut app = crate::RustGisApp::with_sample();
+        rustgis_engine::render::take_approximations(&[]);
+        let mark = app.session.notice_mark();
+        super::say_approximations(&mut app);
+        assert!(!app.session.notices_since(mark).iter().any(|n| n.text.starts_with("road: ")), "nothing approximated, nothing said");
+        use rustgis_engine::data::{Dataset, Geometry, GeometryType};
+        use rustgis_engine::geom::Coord;
+        use rustgis_engine::map::{Basemap, Camera, LineStroke, Map, symbology::Dash};
+        let mut m = Map::new("Map");
+        m.basemap = Basemap::Blank;
+        let mut d = Dataset::new("road", GeometryType::Polyline, vec![]);
+        d.push(Some(Geometry::Line(vec![vec![Coord::new(-1.0, 0.0), Coord::new(1.0, 0.0)]])), vec![]);
+        let id = m.add_dataset(d);
+        m.layer_mut(id).unwrap().line_strokes = vec![LineStroke { dash: Dash::new(&[0.2, 0.2]), width: Some(4.0), ..Default::default() }];
+        let camera = Camera { center: rustgis_engine::geom::lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1500.0, bearing: 0.0, pitch: 0.0 };
+        let view = rustgis_engine::render::View { width: 200.0, height: 200.0, pixels_per_point: 1.0, camera, sky: false };
+        for _ in 0..2 {
+            rustgis_engine::render::render(&mut m, &view).unwrap();
+            super::say_approximations(&mut app);
+        }
+        let said: Vec<_> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).filter(|t| t.starts_with("road: ")).collect();
+        assert!(said.len() == 1 && said[0].starts_with("road: 1 dashed line(s) drawn solid"), "{said:?}");
     }
 
     #[test]
@@ -5292,6 +5802,8 @@ mod tests {
             sky: 0.0,
             fill: 0.0,
             rock: None,
+            ambient: None,
+            balanced: false,
         };
         let set = |map: &mut Map, shadow: f64, visible: bool| {
             let l = map.layer_mut(id).unwrap();
@@ -5357,6 +5869,182 @@ mod tests {
         }
     }
 
+    /// The WMS requests identify lists are fetched within the layer's reach (`"public"`: only the
+    /// internet), and capabilities read from the internet are recorded so the requests they name
+    /// are held there; read on the local network, neither.
+    #[test]
+    fn identify_requests_are_fetched_within_the_layers_reach() {
+        use rustgis_engine::render::rustgis_tiles::address::Origin;
+        for observed in [Reach::Public, Reach::Local] {
+            let _turn = crate::fetching::turn();
+            let host = if observed == Reach::Public { "identify-web.example" } else { "identify-intranet.example" };
+            let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let log = asked.clone();
+            cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+                let clean = cache::split_download_limit(&url).0.to_string();
+                log.lock().unwrap().push((clean.clone(), ceiling));
+                let origin = Origin::with_observed_reach(&clean, observed.min(ceiling)).unwrap();
+                done(Ok(cache::Fetched { bytes: b"<WMS_Capabilities version=\"1.3.0\"/>".to_vec(), origin }));
+            });
+            let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+            let template = format!(
+                "https://{host}/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={{bbox-epsg-3857}}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng"
+            );
+            s.run("map.addTiles", &json!({"url": template, "name": "Over", "overlay": true})).unwrap();
+            let caps = rustgis_engine::data::ogc::wms_layer_of(&template).unwrap().0;
+            let (map, opened) = (s.project.active_map, s.opened);
+            let mut app = RustGisApp::new(s);
+            let request = format!("https://{host}/info?REQUEST=GetFeatureInfo");
+            let info = json!({"featureInfo": [
+                {"tileLayer": "Over", "url": request, "public": observed == Reach::Public},
+                {"tileLayer": "Over", "capabilities": caps},
+            ]});
+            app.map.popup = Some(Popup::new(info, Coord::new(8.6, 46.65), map, opened));
+            {
+                let asked = asked.lock().unwrap();
+                assert_eq!(asked.len(), 2, "{asked:?}");
+                assert_eq!(asked[0], (request.clone(), observed), "the request, listed within {observed:?}");
+                assert_eq!(asked[1], (caps.clone(), Reach::Local), "the capabilities of the user's own layer");
+            }
+            follow_asks(&mut app, &egui::Context::default());
+            assert_eq!(cache::ceiling_for(&caps), observed, "capabilities observed {observed:?}");
+        }
+    }
+
+    /// A layer held to the internet whose capabilities name a GetFeatureInfo request on the local
+    /// network isn't asked there, and the pop-up says so, naming the request.
+    #[test]
+    fn a_refused_identify_request_is_said() {
+        use rustgis_engine::render::rustgis_tiles::address::Origin;
+        let _turn = crate::fetching::turn();
+        const CAPS: &str = r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://identify-refused.example/wms?"/></Get></HTTP></DCPType></GetMap>
+<GetFeatureInfo><Format>application/geo+json</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://192.168.7.5/info?"/></Get></HTTP></DCPType></GetFeatureInfo></Request>
+<Layer queryable="1"><Title>Root</Title><CRS>EPSG:3857</CRS><Layer><Name>over</Name><Title>Over</Title></Layer></Layer></Capability></WMS_Capabilities>"#;
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling).unwrap();
+            done(Ok(cache::Fetched { bytes: CAPS.as_bytes().to_vec(), origin }));
+        });
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        let template = "https://identify-refused.example/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        s.run("map.addTiles", &json!({"url": template, "name": "Over", "overlay": true})).unwrap();
+        // Listed by a document read from the internet.
+        cache::restrict_to_public(template);
+        s.run("map.goToXY", &json!({"lon": 8.6, "lat": 46.65, "scale": 10000})).unwrap();
+        let caps = rustgis_engine::data::ogc::wms_layer_of(template).unwrap().0;
+        let (map, opened) = (s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        let info = json!({"featureInfo": [{"tileLayer": "Over", "capabilities": caps, "public": true}]});
+        app.map.popup = Some(Popup::new(info, Coord::new(8.6, 46.65), map, opened));
+        let mark = app.session.notice_mark();
+        follow_asks(&mut app, &egui::Context::default());
+        let told: Vec<_> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(told.iter().any(|t| t.contains("http://192.168.7.5/info") && t.contains("local network")), "{told:?}");
+    }
+
+    /// Layers sharing capabilities have them asked once, within the narrowest of their reaches: one
+    /// listed by a document read from the internet holds the fetch there, though the first layer
+    /// asking is the user's own.
+    #[test]
+    fn shared_capabilities_are_asked_within_the_narrowest_reach() {
+        use rustgis_engine::render::rustgis_tiles::address::Origin;
+        let _turn = crate::fetching::turn();
+        let asked = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let log = asked.clone();
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            log.lock().unwrap().push(ceiling);
+            let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling).unwrap();
+            done(Ok(cache::Fetched { bytes: b"<WMS_Capabilities version=\"1.3.0\"/>".to_vec(), origin }));
+        });
+        let caps = "https://shared-caps.example/wms?SERVICE=WMS&REQUEST=GetCapabilities&VERSION=1.3.0";
+        let info = json!({"featureInfo": [
+            {"tileLayer": "Mine", "capabilities": caps},
+            {"tileLayer": "Listed", "capabilities": caps, "public": true},
+        ]});
+        let pp = Popup::new(info, Coord::new(8.6, 46.65), 0, 0);
+        assert_eq!(pp.asks.len(), 1, "asked once for both");
+        assert_eq!(asked.lock().unwrap().clone(), [Reach::Public]);
+    }
+
+    /// A service's other layers are asked whatever became of the first's request: one refused for
+    /// reaching past its layer is said, and the next layer, whose request is within its own, is
+    /// asked.
+    #[test]
+    fn a_services_other_layers_are_asked_when_the_first_is_refused() {
+        use rustgis_engine::render::rustgis_tiles::address::Origin;
+        let _turn = crate::fetching::turn();
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling).unwrap();
+            done(Ok(cache::Fetched { bytes: b"{}".to_vec(), origin }));
+        });
+        let host = "others-asked.example";
+        let caps = format!(
+            r#"<WMS_Capabilities version="1.3.0" xmlns="http://www.opengis.net/wms" xmlns:xlink="http://www.w3.org/1999/xlink">
+<Service><Title>Test WMS</Title></Service>
+<Capability><Request><GetMap><Format>image/png</Format><DCPType><HTTP><Get><OnlineResource xlink:href="https://{host}/wms?"/></Get></HTTP></DCPType></GetMap>
+<GetFeatureInfo><Format>application/geo+json</Format><DCPType><HTTP><Get><OnlineResource xlink:href="http://192.168.9.5/info?"/></Get></HTTP></DCPType></GetFeatureInfo></Request>
+<Layer queryable="1"><Title>Root</Title><CRS>EPSG:3857</CRS><Layer><Name>a</Name><Title>A</Title></Layer><Layer><Name>b</Name><Title>B</Title></Layer></Layer></Capability></WMS_Capabilities>"#
+        );
+        let template = |layer: &str| {
+            format!(
+                "https://{host}/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS={layer}&STYLES=&CRS=EPSG:3857&BBOX={{bbox-epsg-3857}}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng"
+            )
+        };
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        s.run("map.addTiles", &json!({"url": template("a"), "name": "A", "overlay": true})).unwrap();
+        s.run("map.addTiles", &json!({"url": template("b"), "name": "B", "overlay": true})).unwrap();
+        // A was listed by a document read from the internet; B is the user's own.
+        cache::restrict_to_public(&template("a"));
+        s.run("map.goToXY", &json!({"lon": 8.6, "lat": 46.65, "scale": 10000})).unwrap();
+        let caps_url = rustgis_engine::data::ogc::wms_layer_of(&template("a")).unwrap().0;
+        let (map, opened) = (s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        let info = json!({"featureInfo": [{"tileLayer": "A", "capabilities": caps_url}, {"tileLayer": "B", "capabilities": caps_url}]});
+        let mut pp = Popup::new(info, Coord::new(8.6, 46.65), map, opened);
+        // The capabilities answer as the service gives them.
+        pp.asks[0].slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((caps.into_bytes(), Reach::Local)))));
+        app.map.popup = Some(pp);
+        let mark = app.session.notice_mark();
+        follow_asks(&mut app, &egui::Context::default());
+        let told: Vec<_> = app.session.notices_since(mark).iter().map(|n| n.text.clone()).collect();
+        assert!(told.iter().any(|t| t.starts_with("A: ") && t.contains("local network")), "{told:?}");
+        let asked: Vec<_> = app.map.popup.as_ref().map(|pp| pp.asks.iter().map(|a| a.layer.clone()).collect()).unwrap_or_default();
+        assert_eq!(asked, ["B"], "B is asked");
+    }
+
+    /// Capabilities answer only the service they were asked of: a layer replaced meanwhile by
+    /// another service's, under the same name, neither learns from them nor has its own
+    /// capabilities held to the internet by them.
+    #[test]
+    fn capabilities_answer_only_the_service_they_were_asked_of() {
+        use rustgis_engine::render::rustgis_tiles::address::Origin;
+        let _turn = crate::fetching::turn();
+        cache::set_fetcher_with_origin(move |url, ceiling, done, _| {
+            let origin = Origin::with_observed_reach(cache::split_download_limit(&url).0, ceiling.min(Reach::Public)).unwrap();
+            done(Ok(cache::Fetched { bytes: b"<WMS_Capabilities version=\"1.3.0\"/>".to_vec(), origin }));
+        });
+        let template = |host: &str| {
+            format!(
+                "https://{host}/wms?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={{bbox-epsg-3857}}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng"
+            )
+        };
+        let (first, second) = (template("caps-asked.example"), template("caps-replacement.example"));
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        s.run("map.addTiles", &json!({"url": first, "name": "Over", "overlay": true})).unwrap();
+        let (asked, replacement) =
+            (rustgis_engine::data::ogc::wms_layer_of(&first).unwrap().0, rustgis_engine::data::ogc::wms_layer_of(&second).unwrap().0);
+        let (map, opened) = (s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        app.map.popup =
+            Some(Popup::new(json!({"featureInfo": [{"tileLayer": "Over", "capabilities": asked}]}), Coord::new(8.6, 46.65), map, opened));
+        // The layer is replaced by another service's, with the same name, while the answer comes.
+        app.session.map_mut().tiles[0].url = second.clone();
+        follow_asks(&mut app, &egui::Context::default());
+        assert_eq!(cache::ceiling_for(&replacement), Reach::Local, "the replacement's own capabilities aren't held by another's answer");
+        assert!(app.session.map().tiles[0].feature_info.is_none(), "nor learned from it");
+    }
+
     /// Answers that land while the pop-up waits open it on the top result, with its feature
     /// selected: drawn over Countries, Over's feature comes first, and Switzerland, selected by the
     /// click, no longer is.
@@ -5376,7 +6064,7 @@ mod tests {
         let mut app = RustGisApp::new(s);
         let mut pp = Popup::new(info, Coord::new(8.6, 46.65), map, opened);
         let answer = br#"{"type":"FeatureCollection","features":[{"type":"Feature","properties":{"name":"Bern"},"geometry":null}]}"#;
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Ok(answer.to_vec()))));
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(Some(Ok((answer.to_vec(), Reach::Local)))));
         pp.asks.push(Ask { layer: "Over".into(), also: Vec::new(), capabilities: false, request: None, slot });
         app.map.popup = Some(pp);
         follow_asks(&mut app, &egui::Context::default());
@@ -5385,6 +6073,58 @@ mod tests {
             pp.info["results"].as_array().unwrap().iter().map(|r| r["tileLayer"].as_str().or(r["layer"].as_str()).unwrap()).collect();
         assert_eq!((shown, pp.index), (vec!["Over", "Countries"], 0));
         assert!(app.session.map().layer_by_name("Countries").unwrap().selection.is_empty());
+    }
+
+    /// Browsing to a service result clears vector selection without an Undo step. A Similar
+    /// read prepared before that actual pop-up gesture must not replace the user's clear.
+    #[test]
+    fn popup_clear_preserves_selection_intent_against_pending_similar() {
+        use egui_kittest::kittest::Queryable;
+        use rustgis_engine::analysis::control::Control;
+        use rustgis_engine::cmd::reads::{read_ahead, read_land};
+        use rustgis_engine::data::{Dataset, Field, FieldType, Geometry, GeometryType, Value as Cell};
+        let mut s = rustgis_engine::Session::new(rustgis_engine::Project::default());
+        let mut data = Dataset::new("values", GeometryType::Point, vec![Field::new("n", FieldType::Integer)]);
+        for n in [0, 2, 10] {
+            data.push(Some(Geometry::Point(Coord::new(n as f64, 0.0))), vec![Cell::Int(n)]);
+        }
+        let id = rustgis_engine::cmd::layer::add_dataset(&mut s, data);
+        let fid = s.map().layer(id).unwrap().dataset.features[0].id;
+        let url = "https://wms.example.org/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
+        s.run("map.addTiles", &json!({"url":url,"name":"Remote","overlay":true})).unwrap();
+        s.run("select.rows", &json!({"layer":id,"rows":[0]})).unwrap();
+        let pending = read_ahead(&mut s, "data.similar", &json!({"layer":id,"row":0,"fields":["n"],"count":1})).unwrap();
+        let depth = s.undo_depth();
+        let first = json!({"layerId":id,"fid":fid,"layer":"values","attributes":{"name":"Reference"}});
+        let mut info = first.clone();
+        info["results"] = json!([first,{"tileLayer":"Remote","attributes":{"name":"Remote feature"}}]);
+        let pp = Popup::new(info, Coord::new(0.0, 0.0), s.project.active_map, s.opened);
+        let mut app = RustGisApp::new(s);
+        app.map.popup = Some(pp);
+        let mut fonts = false;
+        let mut h = egui_kittest::Harness::builder().with_size(vec2(1000.0, 700.0)).build_ui_state(
+            move |ui, app: &mut RustGisApp| {
+                if !fonts {
+                    crate::theme::install_fonts(ui.ctx(), &[], None);
+                    fonts = true;
+                    return;
+                }
+                let rect = ui.max_rect();
+                popup(app, ui, rect);
+            },
+            app,
+        );
+        h.run();
+        h.get_by_role_and_label(egui::accesskit::Role::Button, "›").click();
+        h.run();
+        assert_eq!(h.state().map.popup.as_ref().unwrap().index, 1);
+        assert!(h.state().session.map().layer(id).unwrap().selection.is_empty());
+        assert_eq!(h.state().session.undo_depth(), depth, "pop-up browsing creates no Undo step");
+        let mark = h.state().session.notice_mark();
+        let answer = read_land(&mut h.state_mut().session, pending.run(&Control::stoppable()).unwrap()).unwrap();
+        assert_eq!(answer["similar"][0]["row"], 1);
+        assert!(h.state().session.map().layer(id).unwrap().selection.is_empty(), "the pending read must preserve the pop-up clear");
+        assert!(h.state().session.notices_since(mark).iter().any(|n| n.text.contains("without replacing the current selection")));
     }
 
     /// A WMS layer's answer comes in the drawing order (#808): drawn over Countries, its feature
@@ -5442,6 +6182,49 @@ mod tests {
         follow_popup(&mut app);
         let popup = app.map.popup.as_ref().unwrap();
         assert_eq!((shown(&popup.info), popup.index), (vec!["Countries".to_string()], 0), "hidden, in the pop-up");
+    }
+
+    /// A click whose pop-up shows a raster's pixel first, drawn over a polygon, or a tile layer's
+    /// feature first, selects nothing (#2488): an earlier selection doesn't stay under it, as
+    /// browsing the pop-up to either clears it; a feature shown first is selected.
+    #[test]
+    fn a_click_showing_a_pixel_or_tile_feature_first_leaves_nothing_selected() {
+        let s = rustgis_engine::Session::new(rustgis_engine::sample::world_project());
+        let mut app = RustGisApp::new(s);
+        let countries = app.session.map().layer_by_name("Countries").map(|l| l.id).unwrap();
+        let feature = json!({"layer": "Countries", "layerId": countries, "row": 3, "fid": 3, "attributes": {}});
+        select_first_found(&mut app, &feature);
+        assert_eq!(app.session.map().selection_count(), 1);
+        let pixel = json!({"layer": "scene", "layerId": 999, "raster": true, "attributes": {"Band 1": "7"},
+            "results": [{"layer": "scene", "layerId": 999, "raster": true, "attributes": {"Band 1": "7"}}, feature]});
+        select_first_found(&mut app, &pixel);
+        assert_eq!(app.session.map().selection_count(), 0);
+        // A vector tile layer's feature shown first (it has no row in a map layer) clears it too.
+        select_first_found(&mut app, &feature);
+        assert_eq!(app.session.map().selection_count(), 1);
+        let tile = json!({"layer": "Roads", "tileLayer": "Roads", "sourceLayer": "roads", "attributes": {"name": "Main"},
+            "results": [{"layer": "Roads", "tileLayer": "Roads", "sourceLayer": "roads", "attributes": {"name": "Main"}}, feature]});
+        select_first_found(&mut app, &tile);
+        assert_eq!(app.session.map().selection_count(), 0);
+    }
+
+    /// A WMS layer's answer takes its place by the depth priority too, as identify ranks the
+    /// features (#2488): Countries, with a higher priority, is drawn over the WMS layer and stays
+    /// first.
+    #[test]
+    fn a_wms_answer_goes_under_a_layer_of_higher_priority() {
+        let mut s = rustgis_engine::Session::new(rustgis_engine::sample::world_project());
+        s.run("map.addTiles", &json!({"url": "https://wms.example.org/{z}/{x}/{y}.png", "name": "Over", "overlay": true})).unwrap();
+        s.run("layer.priority", &json!({"layer": "Countries", "value": 1})).unwrap();
+        let answer = json!({"layer": "Over", "tileLayer": "Over", "sourceLayer": null, "attributes": {"name": "Bern"}});
+        s.run("map.popupMode", &json!({"mode": "visible"})).unwrap();
+        let info = s.run("identify", &json!({"lon": 8.6, "lat": 46.65, "tolerancePx": 0})).unwrap();
+        assert_eq!(info["layer"], "Countries");
+        let v = with_answers(s.map(), &info, vec![answer]).unwrap();
+        let shown: Vec<&str> =
+            v["results"].as_array().unwrap().iter().map(|r| r["tileLayer"].as_str().or(r["layer"].as_str()).unwrap()).collect();
+        assert_eq!(shown, ["Countries", "Over"]);
+        assert_eq!(v["layer"], "Countries");
     }
 
     fn selection_harness() -> egui_kittest::Harness<'static, RustGisApp> {
@@ -5665,6 +6448,18 @@ mod tests {
     #[test]
     fn explore_click_asking_only_wms_clears_without_a_notice() {
         let _turn = crate::fetching::turn();
+        use rustgis_engine::render::rustgis_tiles::cache;
+        let (send, requests) = std::sync::mpsc::channel();
+        // Hold only identify requests: a fast network failure used to close the popup in the
+        // release frame, before the assertion. Tile fetches never reach a real server either.
+        cache::set_fetcher(move |url, done| {
+            let lower = url.to_ascii_lowercase();
+            if lower.contains("request=getcapabilities") || lower.contains("request=getfeatureinfo") {
+                send.send((url, done)).unwrap();
+            } else {
+                done(Err("tile fixture failure".into()));
+            }
+        });
         let mut h = selection_harness();
         let url = "https://wms.example.org/?SERVICE=WMS&VERSION=1.3.0&REQUEST=GetMap&LAYERS=over&STYLES=&CRS=EPSG:3857&BBOX={bbox-epsg-3857}&WIDTH=256&HEIGHT=256&FORMAT=image%2Fpng";
         h.state_mut().run("map.addTiles", json!({"url": url, "name": "Over", "overlay": true})).unwrap();
@@ -5674,10 +6469,22 @@ mod tests {
         selection_click(&mut h, [3.5, 1.5]);
         assert!(h.state().map.popup.is_some(), "the click asks the WMS layer");
         assert!(selection_rows(&h).is_empty());
+        let (asked, done) = requests.try_recv().unwrap();
+        assert!(asked.to_ascii_lowercase().contains("request=getcapabilities"));
+        done(Err("WMS fixture failure".into()));
+        h.step();
+        assert!(h.state().map.popup.is_none(), "the completed failure closes the empty popup");
         h.state_mut().run("select.rows", json!({"layer": "Points", "rows": [1]})).unwrap();
         selection_click(&mut h, [1.0, 3.5]);
         assert!(selection_rows(&h).is_empty(), "the click clears the selection");
-        // The made-up WMS server's own failure may land too: only the refusal is checked.
+        assert!(h.state().map.popup.is_some(), "the second click asks the WMS layer");
+        let (_, done) = requests.try_recv().unwrap();
+        done(Err("WMS fixture failure".into()));
+        h.step();
+        assert!(h.state().map.popup.is_none());
+        assert!(selection_rows(&h).is_empty());
+        let failures = h.state().session.notices_since(mark).iter().filter(|n| n.error && n.text.contains("WMS fixture failure")).count();
+        assert_eq!(failures, 2, "both WMS failures completed before checking notices");
         let refused = h.state().session.notices_since(mark).iter().any(|n| n.error && n.text.contains("nothing is selected"));
         assert!(!refused, "no \"nothing is selected\" notice");
     }
@@ -5929,47 +6736,27 @@ mod tests {
     fn a_moving_flat_maps_gap_frame_is_drawn_off_the_ui_thread() {
         let _turn = crate::fetching::turn();
         let app = RustGisApp::with_sample();
-        let mut h =
-            egui_kittest::Harness::builder().with_size(vec2(900.0, 550.0)).with_step_dt(0.000_05).with_max_steps(10_000).build_ui_state(
-                |ui, app: &mut RustGisApp| {
-                    let ctx = ui.ctx().clone();
-                    app.logic(&ctx);
-                    app.ui(ui);
-                },
-                app,
-            );
-        let exact = |h: &mut egui_kittest::Harness<'_, RustGisApp>, what: &str| {
-            let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-            loop {
-                h.step();
-                let st = h.state();
-                let res = (st.session.map().camera.res * 1000.0) as i64;
-                if st.map.key.is_some_and(|k| k.rev == st.session.revision && !k.draft && k.cam.2 == res) && !st.map.drawing() {
-                    break;
-                }
-                assert!(std::time::Instant::now() < end, "{what}");
-                std::thread::sleep(std::time::Duration::from_millis(2)); // test-wait: legacy polling for the moving flat frame
-            }
-        };
-        exact(&mut h, "the first frame did not arrive");
-        let before = h.state().map.key.expect("a frame");
+        // Give the map widget a fixed viewport so changes in surrounding UI cannot request a redraw.
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(vec2(900.0, 550.0))
+            .with_context_setup(|ctx| crate::theme::install_fonts(ctx, &[], None))
+            .build_ui_state(|ui, app| show(app, ui), app);
+        let before = h.state().map.key.expect("the first frame");
+        assert!(!before.draft && !h.state().map.drawing());
         // The wheel zooming out, mid-gesture (the camera moved as the wheel moves it, not by a
         // command, which changes the map's revision): the frame no longer covers the view.
         h.state_mut().map.last_interaction = f64::MAX;
         h.state_mut().session.map_mut().camera.res *= 2.0;
         let res = h.state().session.map().camera.res;
         h.step();
-        assert!(h.state().map.motion_frame.busy(), "the gap's frame is drawn on the worker");
+        let gap = h.state().map.motion_frame.key().expect("the gap's frame is drawn on the worker");
+        assert!(gap.draft && gap.rev == before.rev, "the worker draws a draft for the same map: {gap:?}");
         assert_eq!(h.state().map.key, Some(before), "the last frame stays on screen meanwhile");
         // It lands while the map still moves, drawn for the zoomed-out camera.
-        let end = std::time::Instant::now() + std::time::Duration::from_secs(30);
-        while h.state().map.key == Some(before) {
-            assert!(std::time::Instant::now() < end, "the gap's frame never landed");
-            std::thread::sleep(std::time::Duration::from_millis(2)); // test-wait: legacy polling for the gap frame
-            h.step();
-        }
+        h.state_mut().map.motion_frame.wait_for_result().expect("the gap frame worker must return a result");
+        h.step();
         let st = h.state();
-        assert!(st.map.key.is_some_and(|k| k.draft && k.rev == before.rev), "a frame drawn mid-motion stands in for the exact one");
+        assert_eq!(st.map.key, Some(gap), "the worker's draft is shown mid-motion");
         assert_eq!(st.map.tex_camera.res, res, "it was drawn for the camera the map had zoomed out to");
         assert!(st.map.tex_size.0 > st.session.view_size.0 * 1.2, "and over more than the view, for the next steps");
         // One still being drawn when the map comes to rest is stopped and dropped; the exact frame
@@ -5978,8 +6765,17 @@ mod tests {
         h.step();
         assert!(h.state().map.motion_frame.busy(), "the next gap's frame is drawn on the worker");
         h.state_mut().map.last_interaction = -10.0;
-        exact(&mut h, "the frame of the resting map did not arrive");
-        assert!(!h.state().map.motion_frame.busy() && !h.state().map.motion_dropped);
+        h.step();
+        let st = h.state_mut();
+        if st.map.motion_frame.busy() {
+            st.map.motion_frame.wait_for_result().expect("the obsolete gap frame worker must return a result");
+        }
+        let exact = st.map.tilt_settle.key().expect("the resting map draws an exact frame on the worker");
+        assert!(!exact.draft && exact.rev == before.rev && exact.cam.2 == (st.session.map().camera.res * 1000.0) as i64);
+        st.map.tilt_settle.wait_for_result().expect("the exact frame worker must return a result");
+        h.step();
+        assert_eq!(h.state().map.key, Some(exact), "the worker's exact frame is shown at rest");
+        assert!(!h.state().map.drawing() && !h.state().map.motion_dropped);
     }
 
     /// #1750: where frames are drawn on the UI thread (the browser), a slow map's gap frame
@@ -6346,6 +7142,31 @@ mod tests {
         assert_eq!(probe(&app), hit);
         app.run("group.set", json!({"group": "Notes", "transparency": 100})).unwrap();
         assert_eq!(probe(&app), None, "on a fully transparent layer");
+    }
+
+    /// #2008: with the view clipped at a distance, a graphic with no extent (an empty geometry)
+    /// is passed over, as it isn't drawn: the view's centre was clamped to its extent, from +∞
+    /// to −∞, which panicked. The text under it is still found.
+    #[test]
+    fn a_graphic_without_an_extent_is_passed_over_at_a_clipping_distance() {
+        let mut app = RustGisApp::with_sample();
+        let c = app.session.map().center_lonlat();
+        let r = app.run("graphics.add", json!({"shape": "text", "points": [[c.x, c.y]], "text": "Here", "fontSize": 20})).unwrap();
+        let hit = r["layer"].as_u64().zip(r["row"].as_u64()).map(|(l, r)| (l as u32, r as usize));
+        let id = hit.map(|(l, _)| l).expect("a graphics layer");
+        // Rows are looked at last first: the empty one, above the text, comes first.
+        let l = app.session.map_mut().layer_mut(id).expect("the graphics layer");
+        l.dataset.push(Some(rustgis_engine::data::Geometry::MultiPoint(Vec::new())), Vec::new());
+        l.touch_geometry();
+        app.run("map.clipping", json!({"distance": 1_000_000.0})).unwrap();
+        let rect = Rect::from_min_size(Pos2::ZERO, vec2(800.0, 600.0));
+        let mut found = None;
+        let mut out = egui::Context::default().run_ui(Default::default(), |ui| {
+            let at = lonlat_to_screen(&app, rect, c).unwrap();
+            found = text_graphic_at(&app, ui.ctx(), rect, at);
+        });
+        out.textures_delta.clear();
+        assert_eq!(found, hit);
     }
 
     /// Trace follows the edge under two clicks; finishing a Reshape or Cut Polygon sketch (what a

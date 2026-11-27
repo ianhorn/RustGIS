@@ -35,10 +35,10 @@ fn need_report(s: &Session) -> Option<&'static str> {
 pub fn commands() -> Vec<C> {
     vec![
         C::new("report.new", "New Report", "Publish › Report", new_report).inputs(new_inputs).roles(&[]).effects(crate::policy::Effects::NONE).params(
-            r#"{"layer"?: name (default: the selected layer), "name"?, "title"?, "fields"?: [names] (default: all), "where"?: SQL, "selectedOnly"?: bool, "groups"?: [fields], "sort"?: field, "descending"?: bool, "page"?: "letter"|"a4"|…, "orientation"?: "portrait"|"landscape"}"#,
+            r#"{"layer"?: name (default: the selected layer), "name"?, "title"?, "fields"?: [names] (default: all), "where"?: sql, "selectedOnly"?: bool, "groups"?: [fields], "sort"?: field, "descending"?: bool, "page"?: "letter"|"a4"|…, "orientation"?: "portrait"|"landscape"}"#,
         ),
         C::new("report.update", "Report Properties", "Report", update).inputs(update_inputs).roles(&[]).effects(crate::policy::Effects::NONE).when(need_report).params(
-            r#"{"report"?: name|index, "name"?, "title"?, "layer"?, "where"?, "selectedOnly"?, "sort"?: field|null, "descending"?, "page"?, "orientation"?, "width"?, "height"?: mm}"#,
+            r#"{"report"?: name|index, "name"?, "title"?, "layer"?, "where"?: sql, "selectedOnly"?, "sort"?: field|null, "descending"?, "page"?, "orientation"?, "width"?, "height"?: mm}"#,
         ),
         C::new("report.activate", "Open Report", "Browser", |s, p| {
             let i = index(s, p)?;
@@ -1022,7 +1022,7 @@ pub fn pages(s: &Session, i: usize) -> Result<(Doc, Vec<rustgis_render::report::
 pub fn report_bytes(s: &mut Session, i: usize, dpi: f64, pdf: bool) -> Result<(Vec<u8>, usize), String> {
     let name = s.project.reports.get(i).map(|r| r.name.clone()).unwrap_or_default();
     let (bytes, mut copy) = whole_bytes(detached(&s.project), s.path.clone(), i, dpi, pdf);
-    super::exports::say(s, super::exports::copy_notices(&mut copy, &name));
+    super::exports::say_coded(s, super::exports::copy_notices_coded(&mut copy, &name));
     bytes
 }
 
@@ -1047,8 +1047,8 @@ pub(crate) fn export_work(s: &Session, p: &Value) -> Result<super::exports::Work
         });
         // The layers it lists are read whole; a layout drawn in it draws the others' views, and
         // one whose source fails there is said, as Export Layout says it.
-        let said = super::exports::copy_notices(&mut copy, &path);
-        super::exports::drawn(&copy.project.maps, said, written, path)
+        // What reading the layers lost keeps its code: said with the export's notes.
+        super::exports::drawn_on(&mut copy, written, path)
     }))
 }
 

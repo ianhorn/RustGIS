@@ -1082,6 +1082,7 @@ fn redact_scan(text: &str, diagnostic: bool) -> String {
     out
 }
 
+#[expect(clippy::disallowed_methods, reason = "a thread the system refuses fails the test, as it should")]
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1187,6 +1188,18 @@ mod tests {
         assert_eq!(redact("https://host/data?sig=abc: HTTP 503"), "https://host/data[query and the rest omitted]");
         let connection = redact("Server=localhost;User ID=alice;Password='hidden;more'");
         assert!(!connection.contains("alice") && !connection.contains("hidden"), "{connection}");
+    }
+
+    /// `<Null>` is a tag to the redactor wherever it is, quoted or in a notice's words, so what
+    /// follows is omitted; read notices name the marker as `Null` and pass whole.
+    #[test]
+    fn a_null_marker_in_a_diagnostic_is_markup() {
+        for tag in ["reply <null>hidden</null>", "reply '<null>'hidden<tag>", "reply '<null>' was read as empty hidden"] {
+            let out = redact(tag);
+            assert!(!out.contains("hidden") && out.contains("[structured content omitted]"), "{tag}: {out}");
+        }
+        let note = "zoning: 1 value written as Null was read as empty, in 'ZONING'";
+        assert_eq!(redact(note), note);
     }
 
     #[test]
