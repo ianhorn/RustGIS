@@ -3957,4 +3957,51 @@ mod tests {
         let notices = h.state().session.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
         assert!(notices.iter().any(|n| n.contains("Reading https://stac.example/a.tif")), "{notices:?}");
     }
+
+    #[test]
+    fn an_assets_row_acts_on_the_address_the_documents_row_shows_even_when_the_search_item_has_none() {
+        let _turn = crate::fetching::turn();
+        use egui_kittest::kittest::Queryable;
+        cache::set_fetcher(|_, done| {
+            // `extra` is only in the document (a relative address); `visual` is at another
+            // address than the search item gave it.
+            let doc = json!({
+                "type": "Feature", "id": "scene-1", "collection": "c",
+                "assets": {
+                    "extra": {"href": "./extra.tif", "type": "image/tiff"},
+                    "visual": {"href": "https://stac.example/doc/visual.tif", "type": "image/tiff"},
+                },
+            });
+            done(Ok(doc.to_string().into_bytes()));
+        });
+        let mut app = RustGisApp::with_sample();
+        app.ui.stac.chosen = vec![String::new()];
+        app.ui.stac.items = vec![json_test_item(true)];
+        let mut h = egui_kittest::Harness::builder()
+            .with_size(egui::vec2(900.0, 900.0))
+            .build_ui_state(|ui, app: &mut RustGisApp| results(app, ui), app);
+        h.step();
+        h.get_by_label("Details").click();
+        h.step();
+        let ctx = h.ctx.clone();
+        poll_json(h.state_mut(), &ctx);
+        h.step();
+        h.step();
+        // Both rows offer a download, though the search item has no `extra` asset.
+        assert_eq!(h.get_all_by_label("Download").count(), 2);
+        // The keys come out in order: extra, then visual.
+        h.get_all_by_label("Add to map").next().unwrap().click();
+        h.step();
+        h.step();
+        h.get_all_by_label("Add to map").nth(1).unwrap().click();
+        h.step();
+        h.step();
+        let said = h.state().ui.stac.error.clone();
+        assert!(said.is_none(), "{said:?}");
+        let notices = h.state().session.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
+        let read = |url: &str| notices.iter().any(|n| n.contains(&format!("Reading {url}")));
+        assert!(read("https://stac.example/api/collections/c/items/extra.tif"), "{notices:?}");
+        assert!(read("https://stac.example/doc/visual.tif"), "{notices:?}");
+        assert!(!read("https://stac.example/a.tif"), "the search item's address was used: {notices:?}");
+    }
 }
