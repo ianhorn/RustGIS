@@ -1010,19 +1010,25 @@ impl Item {
     /// may point to, not one that needs signing or a cloud store's own protocol.
     pub fn asset_href(&self, key: Option<&str>) -> Result<(String, String), String> {
         let a = self.pick(key)?;
-        let lower = crate::logins::inner(&a.href).to_ascii_lowercase();
+        self.check_asset_href(&a.key, &a.href)?;
+        Ok((a.key.clone(), a.href.clone()))
+    }
+
+    /// Checks an address given for asset `key` as [`Item::asset_href`] checks the item's own: a
+    /// web or s3:// address that the item's origin and reach allow.
+    pub fn check_asset_href(&self, key: &str, href: &str) -> Result<(), String> {
+        let lower = crate::logins::inner(href).to_ascii_lowercase();
         if !(lower.starts_with("https://") || lower.starts_with("http://") || crate::s3::is_s3(&lower)) {
             let scheme = lower.split("://").next().unwrap_or("");
             return Err(format!(
-                "{}: asset '{}' is at {} (a {scheme}:// address); RustGIS adds assets by their web or s3:// address",
-                self.id, a.key, a.href
+                "{}: asset '{key}' is at {href} (a {scheme}:// address); RustGIS adds assets by their web or s3:// address",
+                self.id
             ));
         }
         // Judged by where the item came from; an item given whole may only point at public
         // addresses (as a document on the web may). A Planetary Computer asset is signed by the
         // caller ([`needs_signing`]).
-        self.check_href(&a.href)?;
-        Ok((a.key.clone(), a.href.clone()))
+        self.check_href(href)
     }
 }
 

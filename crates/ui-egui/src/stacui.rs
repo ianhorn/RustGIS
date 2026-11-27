@@ -847,6 +847,17 @@ fn add_item_asset(app: &mut RustGisApp, item: &Item, key: Option<&str>) {
     }
 }
 
+/// Adds the asset `key` at `href`, the address its document shows, under the item's name, after
+/// the checks [`Item::asset_href`] makes.
+fn add_document_asset(app: &mut RustGisApp, item: &Item, key: &str, href: &str) {
+    let from = item_document_origin(app, item);
+    let public = item.origin_reach == Reach::Public;
+    match item.check_asset_href(key, href) {
+        Ok(()) => add_signed(app, href, &format!("{} {key}", item.id), &from, public),
+        Err(e) => app.ui.stac.error = Some(e),
+    }
+}
+
 /// Opens the dialog on an item's or a collection's address (a `?stac=` link), fetching it off
 /// the frame.
 pub fn open_link(app: &mut RustGisApp, url: &str) -> Result<(), String> {
@@ -2015,7 +2026,7 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
     // The view picked on an open card (true: JSON), whether Copy was clicked, and whether Cancel.
     let (mut view, mut copy, mut cancel) = (None::<bool>, false, false);
     // The asset picked in an open card's Formatted tab: its item's place and its key.
-    let mut asset: Option<(usize, String)> = None;
+    let mut asset: Option<(usize, String, String)> = None;
     // The band combination picked on a card: its item's place and the combination's id.
     #[cfg_attr(target_arch = "wasm32", allow(unused_mut))]
     let mut bands: Option<(usize, &'static str)> = None;
@@ -2134,8 +2145,8 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
                     let did = inspector(ui, j, item);
                     view = view.or(did.tab);
                     (copy, cancel) = (copy || did.copy, cancel || did.cancel);
-                    if let Some(key) = did.add {
-                        asset = Some((i, key));
+                    if let Some((key, href)) = did.add {
+                        asset = Some((i, key, href));
                     }
                 }
             });
@@ -2154,9 +2165,9 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if let (Some(text_tab), Some(j)) = (view, app.ui.stac.json.as_mut()) {
         j.text_tab = text_tab;
     }
-    if let Some((i, key)) = asset {
+    if let Some((i, key, href)) = asset {
         let Some(item) = app.ui.stac.items.get(i).cloned() else { return };
-        add_item_asset(app, &item, Some(key.as_str()));
+        add_document_asset(app, &item, &key, &href);
     }
     if cancel {
         // Stops the read, and with it the card's details: nothing else is there to show.
@@ -2363,8 +2374,8 @@ struct Inspected {
     /// A tab: true for the JSON text.
     tab: Option<bool>,
     copy: bool,
-    /// The key of an asset to add to the map.
-    add: Option<String>,
+    /// The key and the shown address of an asset to add to the map.
+    add: Option<(String, String)>,
     cancel: bool,
 }
 
@@ -2447,7 +2458,7 @@ fn section(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, title:
 
 /// An item's document laid out as a page: what it is, its properties, its assets and its links.
 /// Only what the document holds is drawn; a section it lacks is left out.
-fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option<&str>, item: &Item) -> Option<String> {
+fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option<&str>, item: &Item) -> Option<(String, String)> {
     let field = |k: &str| doc.get(k).filter(|v| !v.is_null()).map(short_value);
     let head: Vec<(String, String)> = [
         (tl!("ID"), field("id")),
@@ -2478,10 +2489,9 @@ fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option
             let href =
                 a.get("href").and_then(|h| h.as_str()).map(|h| base.and_then(|b| stac::resolve(b, h)).unwrap_or_else(|| h.to_string()));
             // Offered to the browser only where the item may read it from and it needs no signing.
-            let web = item
-                .asset_href(Some(key))
-                .ok()
-                .map(|(_, h)| h)
+            let web = href
+                .clone()
+                .filter(|h| item.check_asset_href(key, h).is_ok())
                 .filter(|h| h.starts_with("https://") || h.starts_with("http://"))
                 .filter(|h| !stac::needs_signing(h));
             ui.push_id(("stac_asset", id, key), |ui| {
@@ -2496,8 +2506,12 @@ fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option
                     .on_hover_text(h);
                 }
                 ui.horizontal(|ui| {
-                    if ui.add(egui::Button::new(tl!("Add to map")).small()).on_hover_text(tl!("Add this asset to the map")).clicked() {
-                        add = Some(key.clone());
+                    // The address added is the one shown in this row; a row with none has nothing to add.
+                    let button = egui::Button::new(tl!("Add to map")).small();
+                    if ui.add_enabled(href.is_some(), button).on_hover_text(tl!("Add this asset to the map")).clicked()
+                        && let Some(h) = &href
+                    {
+                        add = Some((key.clone(), h.clone()));
                     }
                     if let Some(h) = &web {
                         ui.hyperlink_to(egui::RichText::new(tl!("Download")).small(), h).on_hover_text(h);
