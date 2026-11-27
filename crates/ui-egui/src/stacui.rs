@@ -343,7 +343,9 @@ enum Raw {
     Loading(Answer),
     /// Ready: the whole text (what Copy takes), how much of it the pane draws, and a line saying
     /// what is not the catalog's whole document or why not (read failed, text cut).
-    Shown { text: String, drawn: usize, note: Option<String>, doc: serde_json::Value },
+    /// `base` is the address the document was read from (its relative links resolve against it);
+    /// none when the pane shows what RustGIS read instead.
+    Shown { text: String, drawn: usize, note: Option<String>, doc: serde_json::Value, base: Option<String> },
 }
 
 /// An item's preview picture: being fetched, shown, or not to be had.
@@ -886,6 +888,8 @@ fn landed_link(app: &mut RustGisApp, requested_url: &str, r: Result<cache::Fetch
                 app.ui.stac.collection = item.collection.clone();
                 app.ui.stac.chosen = vec![item.pick(None).map(|a| a.key.clone()).unwrap_or_default()];
                 app.ui.stac.items = vec![item.clone()];
+                app.ui.stac.details = None;
+                app.ui.stac.json = None;
                 app.ui.stac.searched_area = None;
                 let found = api.is_some();
                 if let Some(api) = api {
@@ -2299,7 +2303,7 @@ fn start_json(app: &mut RustGisApp, i: usize) {
     let trimmed = |why: String| {
         let (text, drawn, doc) = trimmed_text(&item);
         let note = raw_note(&text, drawn, Some(why));
-        Raw::Shown { text, drawn, note, doc }
+        Raw::Shown { text, drawn, note, doc, base: None }
     };
     let Some(url) = item.url.clone() else {
         let why = tl!(
@@ -2334,10 +2338,11 @@ fn poll_json(app: &mut RustGisApp, ctx: &egui::Context) {
         app.ui.stac.json = None;
         return;
     };
+    let base = r.as_ref().ok().map(|f| f.origin.url().to_string());
     let raw = match r.and_then(|f| raw_text(&f.bytes)) {
         Ok((text, drawn, doc)) => {
             let note = raw_note(&text, drawn, None);
-            Raw::Shown { text, drawn, note, doc }
+            Raw::Shown { text, drawn, note, doc, base }
         }
         Err(e) => {
             let (text, drawn, doc) = trimmed_text(&item);
@@ -2346,7 +2351,7 @@ fn poll_json(app: &mut RustGisApp, ctx: &egui::Context) {
                 &[("e", &e)],
             );
             let note = raw_note(&text, drawn, Some(why));
-            Raw::Shown { text, drawn, note, doc }
+            Raw::Shown { text, drawn, note, doc, base: None }
         }
     };
     app.ui.stac.json = Some(JsonView { item: i, text_tab, raw });
@@ -2386,7 +2391,7 @@ fn inspector(ui: &mut egui::Ui, view: &JsonView, item: &Item) -> Inspected {
                 did.cancel = ui.button(tl!("Cancel")).clicked();
             });
         }
-        Raw::Shown { text, drawn, note, doc } => {
+        Raw::Shown { text, drawn, note, doc, base } => {
             if let Some(note) = note {
                 ui.label(egui::RichText::new(note).small().weak());
             }
@@ -2396,7 +2401,7 @@ fn inspector(ui: &mut egui::Ui, view: &JsonView, item: &Item) -> Inspected {
                     ui.add(egui::TextEdit::multiline(&mut shown).code_editor().desired_width(f32::INFINITY).interactive(true));
                 });
             } else {
-                did.add = formatted(ui, view.item, doc, item);
+                did.add = formatted(ui, view.item, doc, base.as_deref(), item);
             }
         }
     }
@@ -2442,7 +2447,7 @@ fn section(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, title:
 
 /// An item's document laid out as a page: what it is, its properties, its assets and its links.
 /// Only what the document holds is drawn; a section it lacks is left out.
-fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, item: &Item) -> Option<String> {
+fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option<&str>, item: &Item) -> Option<String> {
     let field = |k: &str| doc.get(k).filter(|v| !v.is_null()).map(short_value);
     let head: Vec<(String, String)> = [
         (tl!("ID"), field("id")),
@@ -2467,8 +2472,11 @@ fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, item: &Item)
         for (key, a) in assets.iter().take(FORMATTED_ROWS) {
             let part = |k: &str| a.get(k).filter(|v| !v.is_null()).map(short_value);
             let detail = [part("title"), part("type"), part("roles")].into_iter().flatten().collect::<Vec<_>>().join(" · ");
-            // The address as the item resolves it (a relative one against the item), else as written.
-            let href = item.assets.iter().find(|x| &x.key == key).map(|x| x.href.clone()).or_else(|| part("href"));
+            // The document's own address for the asset, a relative one resolved against the address
+            // the document was read from (as written when it can't be). The full address, not the
+            // shortened label, is what Copy link takes.
+            let href =
+                a.get("href").and_then(|h| h.as_str()).map(|h| base.and_then(|b| stac::resolve(b, h)).unwrap_or_else(|| h.to_string()));
             // Offered to the browser only where the item may read it from and it needs no signing.
             let web = item
                 .asset_href(Some(key))
