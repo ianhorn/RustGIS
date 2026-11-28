@@ -326,6 +326,44 @@ fn post_service(app: &mut RustGisApp, url: &str, body: String) -> Answer {
     }
 }
 
+/// Reads an item's own document off the frame, at most [`cache::MAX_BYTES`] (an item is far below
+/// it), and has it parsed and printed there too, so the window only takes the finished text. The
+/// document must be this item (a `Feature` with its id), else it is refused with the reason. The
+/// read can't be stopped once started: an abandoned one runs to its end and its answer is dropped.
+fn fetch_document(app: &mut RustGisApp, url: &str, from_document: bool, id: &str) -> DocAnswer {
+    let from_document = from_document || app.ui.stac.api_from_document;
+    let connection = selected_connection(app);
+    let base = app.ui.stac.api.clone();
+    let url = match crate::serviceui::request_from(app, connection.as_deref(), &base, url) {
+        Ok(url) => url,
+        Err(e) => return Slot::new(std::sync::Mutex::new(Some(Err(crate::connectionui::translated(&e))))),
+    };
+    let slot: DocAnswer = Slot::default();
+    let land = slot.clone();
+    let id = id.to_string();
+    let done = Box::new(move |r: Result<cache::Fetched, String>| {
+        *land.lock().unwrap_or_else(|e| e.into_inner()) = Some(r.and_then(|f| land_document(f, &id)));
+    });
+    let ceiling = if from_document { Reach::Public } else { Reach::Local };
+    cache::download_limited_reaching_with_origin(&url, cache::MAX_BYTES, None, ceiling, done);
+    slot
+}
+
+/// A fetched document as the inspector shows it, if it is the item `id`.
+fn land_document(f: cache::Fetched, id: &str) -> Result<Landed, String> {
+    if f.bytes.len() > cache::MAX_BYTES {
+        return Err(i18n::fmt("larger than {n} MB", &[("n", &(cache::MAX_BYTES >> 20).to_string())]));
+    }
+    let (text, drawn, doc) = raw_text(&f.bytes)?;
+    let is = doc.get("type").and_then(|t| t.as_str()) == Some("Feature");
+    let found = doc.get("id").and_then(|i| i.as_str());
+    if !is || found != Some(id) {
+        let found = found.map(|f| f.chars().take(100).collect::<String>()).unwrap_or_default();
+        return Err(i18n::fmt("the address answered with a document that is not this item ({found})", &[("found", &found)]));
+    }
+    Ok(Landed { text, drawn, doc, source: (f.origin.url().to_string(), f.origin.reach()) })
+}
+
 /// The most of an item's JSON the pane draws: more is cut from the view (Copy still takes it all).
 const JSON_SHOWN_BYTES: usize = 200_000;
 
@@ -337,15 +375,27 @@ struct JsonView {
     raw: Raw,
 }
 
-/// An item's own document as the catalog sent it, for the JSON view.
+/// An item's own document, read and made ready off the frame.
+struct Landed {
+    text: String,
+    drawn: usize,
+    doc: serde_json::Value,
+    /// The address it was read from and the reach it was read under.
+    source: (String, Reach),
+}
+
+type DocAnswer = Slot<Result<Landed, String>>;
+
+/// An item's own document as the catalog sent it (its keys sorted), for the JSON view.
 enum Raw {
     /// Being read from the item's own address.
-    Loading(Answer),
+    Loading(DocAnswer),
     /// Ready: the whole text (what Copy takes), how much of it the pane draws, and a line saying
     /// what is not the catalog's whole document or why not (read failed, text cut).
-    /// `base` is the address the document was read from (its relative links resolve against it);
-    /// none when the pane shows what RustGIS read instead.
-    Shown { text: String, drawn: usize, note: Option<String>, doc: serde_json::Value, base: Option<String> },
+    /// `source` is the address the document was read from, with the reach it was read under: its
+    /// relative links resolve against the address, and its asset addresses are held to the reach.
+    /// None when the pane shows what RustGIS read instead.
+    Shown { text: String, drawn: usize, note: Option<String>, doc: serde_json::Value, source: Option<(String, Reach)> },
 }
 
 /// An item's preview picture: being fetched, shown, or not to be had.
@@ -847,12 +897,37 @@ fn add_item_asset(app: &mut RustGisApp, item: &Item, key: Option<&str>) {
     }
 }
 
+/// Whether the asset `key` at `href`, an address a document gave, may be added: the checks
+/// [`Item::asset_href`] makes, held to where the document was read and the reach it was read
+/// under (`source`), or to the item's own when the pane shows only what RustGIS read.
+fn document_asset_allowed(item: &Item, key: &str, href: &str, source: Option<(&str, Reach)>) -> Result<(), String> {
+    match source {
+        Some((base, reach)) => {
+            item.check_asset_scheme(key, href)?;
+            Origin::with_observed_reach(base, reach)?.check(href)
+        }
+        None => item.check_asset_href(key, href),
+    }
+}
+
+/// The address and reach the open inspector's document was read under, if it was read.
+fn document_source(app: &RustGisApp) -> Option<(String, Reach)> {
+    match &app.ui.stac.json {
+        Some(JsonView { raw: Raw::Shown { source, .. }, .. }) => source.clone(),
+        _ => None,
+    }
+}
+
 /// Adds the asset `key` at `href`, the address its document shows, under the item's name, after
-/// the checks [`Item::asset_href`] makes.
+/// the checks [`Item::asset_href`] makes, held to the document's own reach.
 fn add_document_asset(app: &mut RustGisApp, item: &Item, key: &str, href: &str) {
-    let from = item_document_origin(app, item);
-    let public = item.origin_reach == Reach::Public;
-    match item.check_asset_href(key, href) {
+    let source = document_source(app);
+    let allowed = document_asset_allowed(item, key, href, source.as_ref().map(|(b, r)| (b.as_str(), *r)));
+    let (from, public) = match source {
+        Some((base, reach)) => (base, reach == Reach::Public),
+        None => (item_document_origin(app, item), item.origin_reach == Reach::Public),
+    };
+    match allowed {
         Ok(()) => add_signed(app, href, &format!("{} {key}", item.id), &from, public),
         Err(e) => app.ui.stac.error = Some(e),
     }
@@ -2171,7 +2246,8 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
         add_document_asset(app, &item, &key, &href);
     }
     if cancel {
-        // Stops the read, and with it the card's details: nothing else is there to show.
+        // Drops the read (a download can't be stopped once started: it runs to its end, at most
+        // 16 MB, and its answer is not kept) and with it the card's details.
         app.ui.stac.json = None;
         app.ui.stac.details = None;
     }
@@ -2315,7 +2391,7 @@ fn start_json(app: &mut RustGisApp, i: usize) {
     let trimmed = |why: String| {
         let (text, drawn, doc) = trimmed_text(&item);
         let note = raw_note(&text, drawn, Some(why));
-        Raw::Shown { text, drawn, note, doc, base: None }
+        Raw::Shown { text, drawn, note, doc, source: None }
     };
     let Some(url) = item.url.clone() else {
         let why = tl!(
@@ -2329,7 +2405,7 @@ fn start_json(app: &mut RustGisApp, i: usize) {
     let from = item_document_origin(app, &item);
     let ceiling = rustgis_engine::cmd::layer::origin_ceiling(Some(&from), public);
     let raw = match address::check_reach(&url, ceiling) {
-        Ok(()) => Raw::Loading(fetch_service(app, &url, public)),
+        Ok(()) => Raw::Loading(fetch_document(app, &url, public, &item.id)),
         Err(e) => trimmed(i18n::fmt(
             "{url} was not read: {e}. This is what RustGIS read of the item instead: the first 100 plain properties, long text cut.",
             &[("url", &rustgis_engine::sources::address_in_message(&url)), ("e", &e)],
@@ -2350,11 +2426,10 @@ fn poll_json(app: &mut RustGisApp, ctx: &egui::Context) {
         app.ui.stac.json = None;
         return;
     };
-    let base = r.as_ref().ok().map(|f| f.origin.url().to_string());
-    let raw = match r.and_then(|f| raw_text(&f.bytes)) {
-        Ok((text, drawn, doc)) => {
+    let raw = match r {
+        Ok(Landed { text, drawn, doc, source }) => {
             let note = raw_note(&text, drawn, None);
-            Raw::Shown { text, drawn, note, doc, base }
+            Raw::Shown { text, drawn, note, doc, source: Some(source) }
         }
         Err(e) => {
             let (text, drawn, doc) = trimmed_text(&item);
@@ -2363,7 +2438,7 @@ fn poll_json(app: &mut RustGisApp, ctx: &egui::Context) {
                 &[("e", &e)],
             );
             let note = raw_note(&text, drawn, Some(why));
-            Raw::Shown { text, drawn, note, doc, base: None }
+            Raw::Shown { text, drawn, note, doc, source: None }
         }
     };
     app.ui.stac.json = Some(JsonView { item: i, text_tab, raw });
@@ -2403,17 +2478,25 @@ fn inspector(ui: &mut egui::Ui, view: &JsonView, item: &Item) -> Inspected {
                 did.cancel = ui.button(tl!("Cancel")).clicked();
             });
         }
-        Raw::Shown { text, drawn, note, doc, base } => {
+        Raw::Shown { text, drawn, note, doc, source } => {
             if let Some(note) = note {
                 ui.label(egui::RichText::new(note).small().weak());
             }
             if view.text_tab {
+                if source.is_some() {
+                    // The document is read into a tree of sorted keys, so it is not shown as written.
+                    ui.label(
+                        egui::RichText::new(tl!("Keys are listed in alphabetical order, and a repeated key keeps its last value."))
+                            .small()
+                            .weak(),
+                    );
+                }
                 egui::ScrollArea::both().id_salt(("stac_json", view.item)).max_height(260.0).show(ui, |ui| {
                     let mut shown = text.get(..*drawn).unwrap_or_default();
                     ui.add(egui::TextEdit::multiline(&mut shown).code_editor().desired_width(f32::INFINITY).interactive(true));
                 });
             } else {
-                did.add = formatted(ui, view.item, doc, base.as_deref(), item);
+                did.add = formatted(ui, view.item, doc, source.as_ref().map(|(b, r)| (b.as_str(), *r)), item);
             }
         }
     }
@@ -2423,16 +2506,43 @@ fn inspector(ui: &mut egui::Ui, view: &JsonView, item: &Item) -> Inspected {
 /// The most rows a section of the formatted page draws; the rest is said, not dropped.
 const FORMATTED_ROWS: usize = 200;
 
-/// A value as one short line: text as it is, anything else as JSON, cut at 160 characters.
-fn short_value(v: &serde_json::Value) -> String {
-    let text = match v {
-        serde_json::Value::String(s) => s.clone(),
-        other => other.to_string(),
-    };
-    let mut short: String = text.chars().take(160).collect();
-    if short.len() < text.len() {
-        short.push('…');
+/// Takes bytes up to a limit and then refuses more, so printing a large value stops at the limit
+/// (the page draws every frame, and a value can be as large as the document).
+struct Bounded(Vec<u8>);
+
+impl std::io::Write for Bounded {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        // Four bytes a character at most: the first 160 characters are within it.
+        let room = (4 * SHORT_VALUE_CHARS).saturating_sub(self.0.len());
+        self.0.extend_from_slice(buf.get(..room.min(buf.len())).unwrap_or_default());
+        if buf.len() > room { Err(std::io::Error::other("full")) } else { Ok(buf.len()) }
     }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// The most characters of a value the formatted page shows on a line.
+const SHORT_VALUE_CHARS: usize = 160;
+
+/// A value as one short line: text as it is, anything else as JSON, cut at 160 characters. Work
+/// is bounded by the cut, not by the value's size.
+fn short_value(v: &serde_json::Value) -> String {
+    let (text, whole): (String, bool) = match v {
+        serde_json::Value::String(s) => (s.chars().take(SHORT_VALUE_CHARS + 1).collect(), true),
+        other => {
+            let mut out = Bounded(Vec::new());
+            let whole = serde_json::to_writer(&mut out, other).is_ok();
+            (String::from_utf8_lossy(&out.0).chars().take(SHORT_VALUE_CHARS + 1).collect(), whole)
+        }
+    };
+    // Past the line, or cut by the limit on the way: ends in an ellipsis.
+    if whole && text.chars().count() <= SHORT_VALUE_CHARS {
+        return text;
+    }
+    let mut short: String = text.chars().take(SHORT_VALUE_CHARS).collect();
+    short.push('…');
     short
 }
 
@@ -2459,7 +2569,14 @@ fn section(ui: &mut egui::Ui, id: impl std::hash::Hash + std::fmt::Debug, title:
 
 /// An item's document laid out as a page: what it is, its properties, its assets and its links.
 /// Only what the document holds is drawn; a section it lacks is left out.
-fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option<&str>, item: &Item) -> Option<(String, String)> {
+fn formatted(
+    ui: &mut egui::Ui,
+    id: usize,
+    doc: &serde_json::Value,
+    source: Option<(&str, Reach)>,
+    item: &Item,
+) -> Option<(String, String)> {
+    let base = source.map(|(b, _)| b);
     let field = |k: &str| doc.get(k).filter(|v| !v.is_null()).map(short_value);
     let head: Vec<(String, String)> = [
         (tl!("ID"), field("id")),
@@ -2492,7 +2609,7 @@ fn formatted(ui: &mut egui::Ui, id: usize, doc: &serde_json::Value, base: Option
             // Offered to the browser only where the item may read it from and it needs no signing.
             let web = href
                 .clone()
-                .filter(|h| item.check_asset_href(key, h).is_ok())
+                .filter(|h| document_asset_allowed(item, key, h, source).is_ok())
                 .filter(|h| h.starts_with("https://") || h.starts_with("http://"))
                 .filter(|h| !stac::needs_signing(h));
             ui.push_id(("stac_asset", id, key), |ui| {
@@ -3957,6 +4074,57 @@ mod tests {
         // The https asset was read (the s3 one wasn't asked for).
         let notices = h.state().session.notices.iter().map(|n| n.text.clone()).collect::<Vec<_>>();
         assert!(notices.iter().any(|n| n.contains("Reading https://stac.example/a.tif")), "{notices:?}");
+    }
+
+    #[test]
+    fn a_document_that_is_not_this_item_or_is_over_the_cap_falls_back_with_the_reason() {
+        let _turn = crate::fetching::turn();
+        let ctx = egui::Context::default();
+        let mut app = RustGisApp::with_sample();
+        app.ui.stac.items = vec![json_test_item(true)];
+        // Another item, a collection, and a document with no id: none is this item's own.
+        for doc in [json!({"type": "Feature", "id": "other"}), json!({"type": "Collection", "id": "scene-1"}), json!({"type": "Feature"})] {
+            cache::set_fetcher(move |_, done| done(Ok(doc.to_string().into_bytes())));
+            start_json(&mut app, 0);
+            poll_json(&mut app, &ctx);
+            let Some(JsonView { raw: Raw::Shown { note, source, .. }, .. }) = &app.ui.stac.json else { panic!("landed") };
+            let note = note.as_deref().unwrap_or("");
+            assert!(note.contains("not this item") && source.is_none(), "{note}");
+        }
+        // More than the cap: said, and the trimmed copy shown, not the document.
+        cache::set_fetcher(|_, done| done(Ok(vec![b' '; cache::MAX_BYTES + 1])));
+        start_json(&mut app, 0);
+        poll_json(&mut app, &ctx);
+        let Some(JsonView { raw: Raw::Shown { note, source, .. }, .. }) = &app.ui.stac.json else { panic!("landed") };
+        assert!(note.as_deref().unwrap_or("").contains("larger than 16 MB") && source.is_none(), "{note:?}");
+    }
+
+    #[test]
+    fn a_value_is_cut_at_a_line_without_printing_all_of_it() {
+        let line = SHORT_VALUE_CHARS;
+        let exact = "é".repeat(line);
+        assert_eq!(short_value(&json!(exact)), exact, "a value that fits is shown as it is");
+        assert_eq!(short_value(&json!(format!("{exact}x"))), format!("{exact}…"));
+        // A nested value far larger than the line: a line of it, and the cut said.
+        let big = json!({"k": (0..100_000).collect::<Vec<u32>>()});
+        let short = short_value(&big);
+        assert!(short.chars().count() == line + 1 && short.ends_with('…') && short.starts_with("{\"k\":[0,1,2"), "{short}");
+        assert_eq!(short_value(&json!([1, 2])), "[1,2]");
+    }
+
+    #[test]
+    fn an_assets_address_from_a_document_is_held_to_the_documents_reach_and_a_relative_one_is_named() {
+        let item = json_test_item(true);
+        let public = Some(("https://stac.example/api/items/scene-1", Reach::Public));
+        assert!(document_asset_allowed(&item, "k", "https://stac.example/a.tif", public).is_ok());
+        // A document read from the public web may not point at the user's own machine.
+        for local in ["http://localhost/a.tif", "http://127.0.0.1:8080/a.tif", "http://192.168.1.5/a.tif"] {
+            assert!(document_asset_allowed(&item, "k", local, public).is_err(), "{local}");
+        }
+        let said = document_asset_allowed(&item, "k", "./extra.tif", public).unwrap_err();
+        assert!(said.contains("relative address") && !said.contains("://  "), "{said}");
+        let said = document_asset_allowed(&item, "k", "ftp://x/a.tif", public).unwrap_err();
+        assert!(said.contains("a ftp:// address"), "{said}");
     }
 
     #[test]

@@ -1017,18 +1017,25 @@ impl Item {
     /// Checks an address given for asset `key` as [`Item::asset_href`] checks the item's own: a
     /// web or s3:// address that the item's origin and reach allow.
     pub fn check_asset_href(&self, key: &str, href: &str) -> Result<(), String> {
-        let lower = crate::logins::inner(href).to_ascii_lowercase();
-        if !(lower.starts_with("https://") || lower.starts_with("http://") || crate::s3::is_s3(&lower)) {
-            let scheme = lower.split("://").next().unwrap_or("");
-            return Err(format!(
-                "{}: asset '{key}' is at {href} (a {scheme}:// address); RustGIS adds assets by their web or s3:// address",
-                self.id
-            ));
-        }
+        self.check_asset_scheme(key, href)?;
         // Judged by where the item came from; an item given whole may only point at public
         // addresses (as a document on the web may). A Planetary Computer asset is signed by the
         // caller ([`needs_signing`]).
         self.check_href(href)
+    }
+
+    /// The scheme half of [`Item::check_asset_href`], for an address judged against another
+    /// document's origin: a web or s3:// address, else an error naming what it is.
+    pub fn check_asset_scheme(&self, key: &str, href: &str) -> Result<(), String> {
+        let lower = crate::logins::inner(href).to_ascii_lowercase();
+        if lower.starts_with("https://") || lower.starts_with("http://") || crate::s3::is_s3(&lower) {
+            return Ok(());
+        }
+        let what = match lower.split_once("://") {
+            Some((scheme, _)) => format!("a {scheme}:// address"),
+            None => "a relative address that couldn't be made absolute".to_string(),
+        };
+        Err(format!("{}: asset '{key}' is at {href} ({what}); RustGIS adds assets by their web or s3:// address", self.id))
     }
 }
 
