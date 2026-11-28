@@ -386,7 +386,9 @@ fn draw_page(
             let scale = map.ground_res_at(&cam) / rustgis_geom::PIXEL_M;
             map.sync_sources_in(&lonlat, own.as_ref(), scale, true, env);
             let mut failed_source = None;
-            let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &mut failed_source, env) else {
+            // Every layer, those a legend leaves out too: the frame draws them, and the legends of
+            // a frame share this read, each leaving out its own as it lists its rows.
+            let Some(entries) = complete_shown_legends(map, scale, *show_no_data, &[], &mut failed_source, env) else {
                 *source_error = failed_source_error(map, failed_source);
                 return None;
             };
@@ -524,6 +526,7 @@ fn draw_page(
                 text_size,
                 fit,
                 show_layer_names,
+                class_labels,
             } => {
                 if let Some(&(_, mi, cam, ..)) = frame(*f)
                     && let Some(map) = maps.get(mi)
@@ -552,6 +555,7 @@ fn draw_page(
                         names,
                         exclude,
                         labels,
+                        class_labels,
                         scale,
                         size,
                         text_size: *text_size,
@@ -663,6 +667,7 @@ fn draw_page(
                 });
                 match data {
                     Some(data) => {
+                        drawn_chart(e.id, &data);
                         let look = e.kind.chart_look().unwrap_or_default();
                         chart(&mut pm, r, &data, &look, color.unwrap_or(INK), ppp, layout.decimal_comma)
                     }
@@ -1009,6 +1014,7 @@ pub(crate) fn legend_pin_pages() -> Vec<(Layout, Vec<Map>)> {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         };
         f(&mut kind);
         l.add("Legend", at, kind);

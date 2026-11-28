@@ -1,7 +1,9 @@
-//! Publication Layout Wizard: `layout.publication` asked step by step (size, map, style, texts,
-//! sources and reference, accent), then made at once, as the New Layout › Publication Layout menu
-//! makes it (#2850).
+//! Publication Layout Wizard: `layout.publication` asked step by step (size, map, style, elements,
+//! placement, texts, sources and reference, accent), then made at once, as the New Layout ›
+//! Publication Layout menu makes it (#2850).
 mod accent;
+mod arrange;
+mod elements;
 mod map;
 mod review;
 mod size;
@@ -12,6 +14,8 @@ mod texts;
 use crate::textform::StatLayer;
 use crate::{RustGisApp, i18n, theme::Tokens};
 use accent::accent_step;
+use arrange::{Arrangement, arrange_step};
+use elements::{Elements, elements_step};
 use map::{Area, area_extent, map_step};
 use review::review_step;
 use rustgis_engine::Session;
@@ -34,6 +38,9 @@ pub enum Step {
     Size,
     Map,
     Style,
+    /// What is drawn around the map.
+    Elements,
+    Placement,
     Texts,
     Sources,
     /// A figure's cartographic reference, the one text it draws.
@@ -44,7 +51,8 @@ pub enum Step {
 
 impl Step {
     /// Where [`Draft`] keeps what each of the two steps with text fields has of its own: the
-    /// texts step's at 0, the sources step's at 1.
+    /// texts step's at 0, the sources step's at 1. A figure's reference step has none: it reads as
+    /// 0, so [`limit_note`] leaves the refusal out there.
     fn slot(self) -> usize {
         usize::from(self == Step::Sources)
     }
@@ -124,6 +132,14 @@ pub struct Draft {
     pub accent: Option<egui::Color32>,
     /// The colour last picked, which the swatch comes back with when the box is ticked again.
     picked: Option<egui::Color32>,
+    /// What is drawn around the map, and how.
+    pub elements: Elements,
+    /// Whether the list of steps has yet to bring the current one into view.
+    list_follows: bool,
+    /// The corners the surrounds take.
+    pub arrangement: Arrangement,
+    /// Whether Create also sets a chosen arrangement as the favourite.
+    pub make_favourite: bool,
 }
 
 impl Draft {
@@ -152,6 +168,10 @@ impl Draft {
             refused: [false; 2],
             accent: None,
             picked: None,
+            elements: Elements::default(),
+            list_follows: true,
+            arrangement: Arrangement::Best,
+            make_favourite: false,
         }
     }
 
@@ -172,9 +192,21 @@ impl Draft {
     /// The steps this draft goes through, in order.
     fn steps(&self) -> &'static [Step] {
         if self.figure() {
-            return &[Step::Size, Step::Map, Step::Reference, Step::Review];
+            return &[Step::Size, Step::Map, Step::Elements, Step::Placement, Step::Reference, Step::Review];
         }
-        &[Step::Size, Step::Map, Step::Style, Step::Texts, Step::Sources, Step::Accent, Step::Review]
+        &[Step::Size, Step::Map, Step::Style, Step::Elements, Step::Placement, Step::Texts, Step::Sources, Step::Accent, Step::Review]
+    }
+
+    /// Goes to `step`, which the list of steps then brings into view.
+    fn go(&mut self, step: Step) {
+        self.step = step;
+        self.list_follows = true;
+    }
+
+    /// The favourite Create sets once the layout is made, if any: what the review says and what
+    /// Create does.
+    fn favourite_to_set(&self, s: &Session) -> Option<Value> {
+        self.arrangement.as_favourite(s).filter(|_| self.make_favourite)
     }
 
     /// The step `by` places from this one, if there is one.
@@ -193,6 +225,9 @@ impl Draft {
             (false, Orientation::Landscape) => format!("{}-landscape", self.size),
         };
         let mut p = json!({"profile": profile});
+        if let Some(arrangement) = self.arrangement.value() {
+            p["arrangement"] = arrangement;
+        }
         if !self.name.trim().is_empty() {
             p["name"] = json!(self.name.trim());
         }
@@ -322,7 +357,7 @@ fn statistic_menu(ui: &mut egui::Ui, d: &mut Draft, map: &Map, own: Field) {
 /// done unseen.
 fn limit_note(ui: &mut egui::Ui, d: &mut Draft, fields: &[Field]) {
     let limit = [("limit", &*MAX_PUBLICATION_TEXT.to_string())];
-    // A figure's step adds no statistic: a refusal on the sheet's sources step isn't its own.
+    // A figure's step adds no statistic, so no step's refusal is its own.
     let note = if d.step != Step::Reference && d.refused[d.step.slot()] {
         i18n::fmt("The statistic wasn't added: each field takes at most {limit} characters.", &limit)
     } else if fields.iter().any(|&f| !d.off(f) && d.field_mut(f).chars().count() >= MAX_PUBLICATION_TEXT) {
@@ -353,6 +388,8 @@ fn step_name(step: Step) -> &'static str {
         Step::Size => tl_raw!("Size"),
         Step::Map => tl_raw!("Map"),
         Step::Style => tl_raw!("Style"),
+        Step::Elements => tl_raw!("Elements"),
+        Step::Placement => tl_raw!("Placement"),
         Step::Texts => tl_raw!("Texts"),
         Step::Sources => tl_raw!("Sources and reference"),
         Step::Reference => tl_raw!("Reference"),
@@ -367,6 +404,8 @@ fn step_label(step: Step) -> &'static str {
         Step::Size => tl!("Size"),
         Step::Map => tl!("Map"),
         Step::Style => tl!("Style"),
+        Step::Elements => tl!("Elements"),
+        Step::Placement => tl!("Placement"),
         Step::Texts => tl!("Texts"),
         Step::Sources => tl!("Sources"),
         Step::Reference => tl!("Reference"),
@@ -415,16 +454,26 @@ const LIST_FROM: f32 = 480.0;
 /// The width of the list of steps.
 const LIST_WIDTH: f32 = 110.0;
 
-/// The steps of this draft, each clickable to go to it.
-fn step_list(ui: &mut egui::Ui, d: &mut Draft) {
+/// The steps of this draft, each clickable to go to it, in `height`: a shorter window scrolls
+/// them, bringing the current one into view once when it changes, not each frame, so the list can
+/// be scrolled by hand.
+fn step_list(ui: &mut egui::Ui, d: &mut Draft, height: f32) {
     ui.vertical(|ui| {
         ui.set_width(LIST_WIDTH);
-        for &step in d.steps() {
-            let item = egui::Button::selectable(d.step == step, step_label(step)).wrap().min_size(egui::vec2(LIST_WIDTH, 0.0));
-            if ui.add(item).clicked() {
-                d.step = step;
+        egui::ScrollArea::vertical().id_salt("publication_wizard_steps").max_height(height).auto_shrink([false, false]).show(ui, |ui| {
+            let follow = std::mem::take(&mut d.list_follows);
+            for &step in d.steps() {
+                let width = ui.available_width();
+                let item = egui::Button::selectable(d.step == step, step_label(step)).wrap().min_size(egui::vec2(width, 0.0));
+                let item = ui.add(item);
+                if follow && d.step == step {
+                    item.scroll_to_me(None);
+                }
+                if item.clicked() {
+                    d.go(step);
+                }
             }
-        }
+        });
     });
 }
 
@@ -480,7 +529,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
             ui.allocate_ui_with_layout(body, egui::Layout::left_to_right(egui::Align::Min), |ui| {
                 ui.set_min_size(body);
                 if list {
-                    step_list(ui, &mut d);
+                    step_list(ui, &mut d, body.y);
                     ui.separator();
                 }
                 ui.vertical(|ui| {
@@ -492,6 +541,8 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                             Step::Size => size_step(ui, &mut d),
                             Step::Map => map_step(ui, &app.session, &mut d),
                             Step::Style => style_step(ui, &mut d, t.accent),
+                            Step::Elements => elements_step(ui, &app.session, &mut d),
+                            Step::Placement => arrange_step(ui, &app.session, &mut d),
                             Step::Texts => texts_step(ui, &mut d, app.session.map()),
                             Step::Sources => sources_step(ui, &mut d, app.session.map()),
                             Step::Reference => reference_step(ui, &mut d),
@@ -506,7 +557,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     match d.moved(1) {
                         Some(next) => {
                             if crate::widgets::dialog_button(ui, tl!("Next"), Some(t.accent), size).clicked() {
-                                d.step = next;
+                                d.go(next);
                             }
                         }
                         None => create = crate::widgets::dialog_button(ui, tl!("Create"), Some(t.accent), size).clicked(),
@@ -515,7 +566,7 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
                     if ui.add_enabled_ui(back.is_some(), |ui| crate::widgets::dialog_button(ui, tl!("Back"), None, size).clicked()).inner
                         && let Some(back) = back
                     {
-                        d.step = back;
+                        d.go(back);
                     }
                     close = crate::widgets::dialog_button(ui, tl!("Cancel"), None, size).clicked();
                 });
@@ -523,13 +574,22 @@ pub fn show(app: &mut RustGisApp, ctx: &egui::Context) {
         });
     // A layout the command refuses is said (a map with no extent), and the wizard stays.
     if create {
-        match area_extent(&app.session, &d.area) {
+        let held = d.arrangement.held(&app.session).map_err(String::from);
+        match held.and_then(|_| area_extent(&app.session, &d.area)) {
             Ok(extent) => {
-                let mut params = d.params();
+                let mut params = d.sent(&app.session);
                 if let Some(extent) = extent {
                     params["extent"] = json!(extent);
                 }
-                close |= crate::ribbon::make_publication(app, params);
+                if crate::ribbon::make_publication(app, params) {
+                    close = true;
+                    // Only once the layout is made: a refused one changes no preference.
+                    if let Some(favourite) = d.favourite_to_set(&app.session)
+                        && let Err(e) = app.run("layout.arrangement", json!({"favourite": favourite}))
+                    {
+                        app.session.notify(e, true);
+                    }
+                }
             }
             Err(e) => app.session.notify(e, true),
         }
@@ -651,32 +711,32 @@ mod tests {
         assert_eq!(d.params(), json!({"profile": "figure-1col"}));
     }
 
-    /// A sheet goes through the seven steps; a figure goes from its size to its map, its reference
-    /// and the review, the steps it takes nothing from skipped both ways. Back is off on the first
-    /// step; Next becomes Create on the last.
+    /// A sheet goes through the eight steps; a figure goes from its size to its map, its placement,
+    /// its reference and the review, the steps it takes nothing from skipped both ways. Back is off
+    /// on the first step; Next becomes Create on the last.
     #[test]
     fn a_sheet_takes_every_step_and_a_figure_skips_what_it_doesnt_draw() {
         let mut app = app();
         open(&mut app);
         let mut h = harness(app);
         assert!(h.get_by_role_and_label(Role::Button, "Back").accesskit_node().is_disabled(), "Back is off");
-        for want in [Step::Map, Step::Style, Step::Texts, Step::Sources, Step::Accent, Step::Review] {
+        for want in [Step::Map, Step::Style, Step::Elements, Step::Placement, Step::Texts, Step::Sources, Step::Accent, Step::Review] {
             click(&mut h, "Next");
             assert_eq!(step(&h), want);
         }
         assert!(h.query_by_role_and_label(Role::Button, "Next").is_none());
         assert!(h.query_by_role_and_label(Role::Button, "Create").is_some());
-        for want in [Step::Accent, Step::Sources, Step::Texts, Step::Style, Step::Map, Step::Size] {
+        for want in [Step::Accent, Step::Sources, Step::Texts, Step::Placement, Step::Elements, Step::Style, Step::Map, Step::Size] {
             click(&mut h, "Back");
             assert_eq!(step(&h), want);
         }
         h.state_mut().dialogs.publication.as_mut().unwrap().size = "figure-2col".into();
         h.run_steps(2);
-        for want in [Step::Map, Step::Reference, Step::Review] {
+        for want in [Step::Map, Step::Elements, Step::Placement, Step::Reference, Step::Review] {
             click(&mut h, "Next");
             assert_eq!(step(&h), want);
         }
-        for want in [Step::Reference, Step::Map, Step::Size] {
+        for want in [Step::Reference, Step::Placement, Step::Elements, Step::Map, Step::Size] {
             click(&mut h, "Back");
             assert_eq!(step(&h), want);
         }
@@ -737,7 +797,7 @@ mod tests {
     /// The names the step list holds, in order, and the one it marks as the current step.
     fn listed(h: &egui_kittest::Harness<'static, RustGisApp>) -> (Vec<&'static str>, Vec<&'static str>) {
         let (mut names, mut current) = (Vec::new(), Vec::new());
-        for name in ["Size", "Map", "Style", "Texts", "Sources", "Reference", "Accent", "Review"] {
+        for name in ["Size", "Map", "Style", "Elements", "Placement", "Texts", "Sources", "Reference", "Accent", "Review"] {
             if let Some(n) = h.query_by_role_and_label(Role::Button, name) {
                 names.push(name);
                 if n.accesskit_node().toggled() == Some(egui::accesskit::Toggled::True) {
@@ -772,13 +832,16 @@ mod tests {
         let mut app = app();
         open(&mut app);
         let mut h = harness(app);
-        assert_eq!(listed(&h), (vec!["Size", "Map", "Style", "Texts", "Sources", "Accent", "Review"], vec!["Size"]));
+        assert_eq!(
+            listed(&h),
+            (vec!["Size", "Map", "Style", "Elements", "Placement", "Texts", "Sources", "Accent", "Review"], vec!["Size"])
+        );
         click(&mut h, "Next");
         assert_eq!(listed(&h).1, ["Map"]);
         click(&mut h, "Back");
         h.state_mut().dialogs.publication.as_mut().unwrap().size = "figure-1col".into();
         h.run_steps(2);
-        assert_eq!(listed(&h), (vec!["Size", "Map", "Reference", "Review"], vec!["Size"]));
+        assert_eq!(listed(&h), (vec!["Size", "Map", "Elements", "Placement", "Reference", "Review"], vec!["Size"]));
     }
 
     /// A step clicked in the list is the one shown, first, middle or last, keeping what was
@@ -799,6 +862,43 @@ mod tests {
         assert_eq!(h.state().dialogs.publication.as_ref().unwrap().subtitle, "Kept");
     }
 
+    /// The smallest window scrolls its list: a list scrolled by hand stays where it was put, and
+    /// going to a step brings it into view.
+    #[test]
+    fn a_short_window_scrolls_its_list_to_the_current_step() {
+        let mut app = app();
+        open(&mut app);
+        let mut h = harness(app);
+        resize(&mut h, vec2(-500.0, -400.0));
+        // Taller entries, so the nine overflow by far more than a platform's font metrics differ.
+        h.ctx.all_styles_mut(|s| s.spacing.interact_size.y = 40.0);
+        h.run_steps(30);
+        // The top of the list, where its first step is before any scrolling.
+        let first = h.get_by_role_and_label(Role::Button, "Size").rect();
+        let inside = |h: &egui_kittest::Harness<'static, RustGisApp>, name: &str| {
+            let item = h.get_by_role_and_label(Role::Button, name).rect();
+            let next = h.get_by_role_and_label(Role::Button, "Next").rect();
+            // Above the separator over the buttons (6 points) and the spacing beside it.
+            item.top() >= first.top() - 0.5 && item.bottom() <= next.top() - 10.0
+        };
+        assert!(inside(&h, "Size") && !inside(&h, "Review"), "9 steps don't fit");
+        h.hover_at(first.center());
+        h.event(egui::Event::MouseWheel {
+            unit: egui::MouseWheelUnit::Point,
+            source: egui::MouseWheelSource::Wheel,
+            delta: vec2(0.0, -500.0),
+            modifiers: egui::Modifiers::NONE,
+            phase: egui::TouchPhase::Move,
+        });
+        h.run_steps(30);
+        assert!(inside(&h, "Review"), "scrolled by hand");
+        h.run_steps(10);
+        assert!(inside(&h, "Review") && !inside(&h, "Size"), "not pinned to the current step");
+        click(&mut h, "Next");
+        h.run_steps(30);
+        assert!(inside(&h, "Map"), "Next brings its step into view");
+    }
+
     /// Each step in the list is reached with Tab.
     #[test]
     fn tab_reaches_every_step_in_the_list() {
@@ -806,16 +906,16 @@ mod tests {
         open(&mut app);
         let mut h = harness(app);
         let mut reached = Vec::new();
-        for _ in 0..30 {
+        for _ in 0..40 {
             h.key_press(egui::Key::Tab);
             h.run_steps(2);
-            for name in ["Size", "Map", "Style", "Texts", "Sources", "Accent", "Review"] {
+            for name in ["Size", "Map", "Style", "Elements", "Placement", "Texts", "Sources", "Accent", "Review"] {
                 if h.query_by_role_and_label(Role::Button, name).is_some_and(|n| n.accesskit_node().is_focused()) {
                     reached.push(name);
                 }
             }
         }
-        for name in ["Size", "Map", "Style", "Texts", "Sources", "Accent", "Review"] {
+        for name in ["Size", "Map", "Style", "Elements", "Placement", "Texts", "Sources", "Accent", "Review"] {
             assert!(reached.contains(&name), "{name} not reached: {reached:?}");
         }
     }
@@ -836,9 +936,9 @@ mod tests {
         assert!((415.0..=460.0).contains(&small.width()) && (355.0..=420.0).contains(&small.height()), "smallest {small:?}");
         let next = h.get_by_role_and_label(Role::Button, "Next").rect();
         assert!(small.contains_rect(next), "Next at {next:?} outside {small:?}");
-        assert_eq!(listed(&h).0.len(), 7, "the list stays");
+        assert_eq!(listed(&h).0.len(), 9, "the list stays");
         // Each step wraps or scrolls inside that size: none makes the window wider or taller.
-        for _ in 0..6 {
+        for _ in 0..8 {
             click(&mut h, "Next");
             // Within the point a high-density screen's rounding of a wrapped line may add.
             let now = window(&h).size();
@@ -861,7 +961,7 @@ mod tests {
         let larger = at(&h);
         let moved = larger.right_bottom() - before.right_bottom();
         assert!(moved.y > 50.0, "Next moved by {moved:?}");
-        for _ in 0..5 {
+        for _ in 0..7 {
             click(&mut h, "Next");
             assert_eq!(at(&h), larger, "{:?}", step(&h));
         }
@@ -875,7 +975,7 @@ mod tests {
         let mut h = harness(app);
         let at = |h: &egui_kittest::Harness<'static, RustGisApp>| h.get_by_role_and_label(Role::Button, "Next").rect();
         let first = at(&h);
-        for _ in 0..5 {
+        for _ in 0..7 {
             click(&mut h, "Next");
             assert_eq!(at(&h), first, "{:?}", step(&h));
         }
@@ -896,7 +996,7 @@ mod tests {
             assert_ne!(next, "Next", "{code}: the language changed");
             let at = |h: &egui_kittest::Harness<'static, RustGisApp>| h.get_by_role_and_label(Role::Button, &next).rect();
             let first = at(&h);
-            for _ in 0..5 {
+            for _ in 0..7 {
                 h.get_by_role_and_label(Role::Button, &next).click();
                 h.run_steps(4);
                 assert_eq!(at(&h), first, "{code}: {:?}", step(&h));
@@ -927,7 +1027,7 @@ mod tests {
         let text = h.get_by_label(about).rect();
         assert!(text.right() <= 320.0, "{text:?} runs off a screen 320 wide");
         assert_eq!(listed(&h).0, Vec::<&str>::new(), "the list is hidden");
-        assert!(h.query_by_label("Step 3 of 7: Style").is_some(), "the heading still says the step");
+        assert!(h.query_by_label("Step 3 of 9: Style").is_some(), "the heading still says the step");
     }
 
     /// A screen that narrows while the wizard is open (a phone turned, a browser resized) keeps

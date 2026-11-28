@@ -280,14 +280,48 @@ fn stacked_bars_draw_their_stretches_and_key() {
     short.labelled = true;
     let (w, h) = (200.0 / PT_PER_MM, 40.0 / PT_PER_MM);
     let valued = |orientation| ChartLook { orientation, values: true, ..ChartLook::default() };
-    assert!(chart_crowded(&short, &valued(Orientation::Vertical), w, h));
-    assert!(!chart_crowded(&short, &valued(Orientation::Horizontal), w, h));
-    assert!(!chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Vertical), w, h), Some(Crowded::Head));
+    assert_eq!(chart_crowded(&short, &valued(Orientation::Horizontal), w, h), None);
+    assert_eq!(chart_crowded(&stacked(vec![6.0, 4.0]), &ChartLook::default(), w, 120.0 / PT_PER_MM), None);
+    // Unstacked, columns without height and bars under a point are told apart; no bar, nothing.
+    let mut plain = short.clone();
+    (plain.key, plain.stretches) = (Vec::new(), Vec::new());
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 20.0 / PT_PER_MM), Some(Crowded::Columns));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), 1.0 / PT_PER_MM, h * 2.0), Some(Crowded::Thin));
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Horizontal), w, 1.0 / PT_PER_MM), Some(Crowded::Thin));
+    // Columns left some height, under a point of it.
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 28.5 / PT_PER_MM), Some(Crowded::Thin));
+    plain.bars = vec![(0.0, String::new())];
+    assert_eq!(chart_crowded(&plain, &valued(Orientation::Vertical), w, 1.0 / PT_PER_MM), None);
     // A box narrower than a swatch draws the placeholder too, nothing past its right.
     // Sample above the centered "Chart" label so system font glyph shapes at y=60 don't mask the fill.
     let mut c = Canvas::new(200, 120).unwrap();
     chart(&mut c, Rect::from_xywh(0.0, 0.0, 5.0, 120.0).unwrap(), &stacked(vec![6.0, 4.0]), &ChartLook::default(), INK, 1.0, false);
     assert!(is(&c, 2, 10, Rgba::rgb(0xF0, 0xF1, 0xF3)) && (6..20).all(|x| c.pixmap().pixel(x, 7).is_some_and(|p| p.alpha() == 0)));
+}
+
+/// An unstacked chart in a box too small draws what it did before it was warned of (#3156): as
+/// columns without height its placeholder; across, bars under a point high.
+#[test]
+fn an_unstacked_chart_too_small_draws_as_before() {
+    let data = rustgis_map::layout::ChartData {
+        bars: (0..4).map(|k| (f64::from(k + 1), String::new())).collect(),
+        title: "Shops".into(),
+        labelled: true,
+        ..Default::default()
+    };
+    let draw = |orientation, h: f32| {
+        let mut c = Canvas::new(200, 60).unwrap();
+        let look = ChartLook { orientation, values: true, ..ChartLook::default() };
+        chart(&mut c, Rect::from_xywh(0.0, 0.0, 200.0, h).unwrap(), &data, &look, INK, 1.0, false);
+        c
+    };
+    let c = draw(Orientation::Vertical, 40.0);
+    assert!(c.pixmap().pixel(100, 5).is_some_and(|p| p.red() == 0xF0 && p.blue() == 0xF3), "the placeholder");
+    // 4 pt under its title: bars a pixel high, no placeholder.
+    let c = draw(Orientation::Horizontal, 20.0);
+    assert!((0..200).all(|x| c.pixmap().pixel(x, 40).is_some_and(|p| p.alpha() == 0)), "nothing under the box");
+    assert!((100..110).any(|x| (15..21).any(|y| c.pixmap().pixel(x, y).is_some_and(|p| p.alpha() > 0))), "its bars");
 }
 
 fn bar_blue(c: &Canvas, x: u32, y: u32) -> bool {
@@ -707,6 +741,7 @@ fn an_ink_colours_legends_colorbars_tables_and_charts() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let grey = ColorScale::Ramp { lo: 0.0, hi: 10.0, colors: vec![Rgba::rgb(0, 0, 0), Rgba::rgb(255, 255, 255)] };
     let bar = |ink| Bar {
@@ -764,7 +799,7 @@ fn layout_no_data_legend_follows_the_frame() {
     .unwrap();
     let fallback = l.renderer.symbol_for(&l.dataset, 2);
     let listed = |map: &mut Map, all: bool, show: bool| {
-        let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &mut None, &Env::default()).unwrap());
+        let drawn = (!all).then(|| complete_shown_legends(map, 1e6, show, &[], &mut None, &Env::default()).unwrap());
         let opts = LegendOptions {
             show_no_data: show,
             hide_other: true,
@@ -774,6 +809,7 @@ fn layout_no_data_legend_follows_the_frame() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_rows(map, drawn.as_deref(), &opts)
             .into_iter()
@@ -839,6 +875,7 @@ fn layout_text_clipping_uses_ink_and_visibility() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     assert_eq!(clipped_text(&l, &[Map::new("m")], 96.0, &info), vec![(legend, "Legend".into())]);
@@ -868,6 +905,7 @@ impl Drop for ShortLegendWait {
 
 /// No layer labelled: every layer under its name.
 static NO_LABELS: BTreeMap<String, String> = BTreeMap::new();
+static NO_CLASS_LABELS: rustgis_map::layout::ClassLabels = rustgis_map::layout::ClassLabels::NONE;
 
 fn legend_page(url: &str) -> (Layout, Vec<Map>) {
     let (mut page, mut maps) = vector_page();
@@ -889,6 +927,7 @@ fn legend_page(url: &str) -> (Layout, Vec<Map>) {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     let mut tile = rustgis_map::TileLayer::new("Walls", rustgis_map::TileKind::Raster, "https://tiles.test/red/{z}/{x}/{y}.png");
@@ -998,6 +1037,7 @@ fn an_svg_export_gives_up_on_held_legends_at_one_deadline() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             fit: rustgis_map::layout::LegendFit::Manual,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     // The thread-local budget and the shortened wait belong to this worker alone.
@@ -1057,6 +1097,7 @@ fn a_legend_says_from_the_lookup_that_draws_it_whether_a_picture_is_missing() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let mut canvas = Canvas::new(200, 200).unwrap();
     let draw = |canvas: &mut Canvas| {
@@ -1369,6 +1410,7 @@ fn a_web_layers_legend_is_its_services_picture() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, width, 400.0).unwrap(), map, ("", 1), None, opts, 1.0));
         let hits: Vec<u32> = (0..pm.height())
@@ -1408,6 +1450,7 @@ fn a_web_layers_legend_is_its_services_picture() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 70.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     let red_rows =
@@ -1731,6 +1774,7 @@ fn a_legends_rows_go_into_columns() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts());
     assert_eq!(rows.len(), 32);
@@ -1826,6 +1870,7 @@ fn a_layers_name_stays_with_its_class_only_in_columns() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts());
     let (starts, _) = flow_at(&rows, 2, LEGEND_ROW, (1e6, 1.0));
@@ -1859,6 +1904,7 @@ fn a_legends_columns_hold_large_point_symbols() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let rows = legend_rows(&map, None, &opts);
     let tall = rows[1].height(1e6, 1.0);
@@ -1925,7 +1971,17 @@ fn point_rows_map(n: usize, symbol_size: Option<f64>) -> Map {
 /// A legend's options at 1:1e6 and its default text size, with or without its layers' names.
 fn opts(names: bool) -> LegendOptions<'static> {
     let text_size = rustgis_map::layout::LEGEND_TEXT_PT;
-    LegendOptions { show_no_data: false, hide_other: false, names, exclude: &[], labels: &NO_LABELS, scale: 1e6, size: 1.0, text_size }
+    LegendOptions {
+        show_no_data: false,
+        hide_other: false,
+        names,
+        exclude: &[],
+        labels: &NO_LABELS,
+        scale: 1e6,
+        size: 1.0,
+        text_size,
+        class_labels: &NO_CLASS_LABELS,
+    }
 }
 
 /// The legend of `map` titled `title`, its text `text_size` points, in `columns` under `fit`, in
@@ -2094,6 +2150,7 @@ fn layer_names_can_be_left_off_a_legend() {
             text_size: rustgis_map::layout::LEGEND_TEXT_PT,
             exclude: &[],
             labels: &NO_LABELS,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_sizes_asked_mm(&mut map.clone(), 1e6, &asked).unwrap()[0].1
     };
@@ -2170,6 +2227,7 @@ fn fit_page(map: Map, (w, h): (f64, f64), (columns, fit): (usize, LegendFit), (t
             text_size,
             fit,
             show_layer_names: rustgis_map::layout::LayerNames::Shown,
+            class_labels: Default::default(),
         },
     );
     let scale = frame_render_scale(&map, Coord::new(0.0, 0.0), 150_000_000.0);
@@ -2190,6 +2248,7 @@ fn a_legends_fit_is_the_same_at_every_resolution() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     for (fit, room) in [(LegendFit::AdjustSize, (40.0, 20.0 * row)), (LegendFit::AdjustColumns, (100.0, 12.0 * row))] {
         let (page, mut maps, scale) = fit_page(rows_map(32), room, (1, fit), ("", 9.0));
@@ -2227,6 +2286,7 @@ fn a_fitted_legend_exports_as_a_manual_legend_of_its_fitted_size() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     let info = PageInfo::default();
     let export = |(page, mut maps, _): (Layout, Vec<Map>, f64)| {
@@ -2554,6 +2614,7 @@ fn a_legend_measured_in_its_own_columns_lays_out_only_those() {
         text_size: 9.0,
         exclude: &[],
         labels: &NO_LABELS,
+        class_labels: &NO_CLASS_LABELS,
     };
     let six = legend_sizes_asked_mm(&mut map, 1e6, &asked).unwrap();
     for (columns, laid_in) in [(0, 1), (1, 1), (2, 2), (3, 3), (6, 6), (9, 6)] {
@@ -2603,6 +2664,7 @@ fn a_legend_shows_a_layers_label() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         legend_rows(&map, None, &opts)
             .iter()
@@ -2637,6 +2699,7 @@ fn a_legend_shows_a_layers_label() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 400.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -2689,6 +2752,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 300.0, 400.0).unwrap(), map, ("", 1), drawn, opts, 1.0)
@@ -2727,6 +2791,7 @@ fn legends_leave_out_what_the_frame_does_not_draw() {
                     size: 1.0,
                     names: true,
                     text_size: 9.0,
+                    class_labels: &NO_CLASS_LABELS,
                 },
                 1.0,
             )
@@ -2858,6 +2923,7 @@ fn a_page_says_why_a_frame_drew_no_cast_shadows() {
         rock: None,
         ambient: None,
         balanced: false,
+        shadow_softness: None,
     };
     for shadow in [0.0, 1.0] {
         let map = ramp_map(relief(shadow), rustgis_map::raster::Stretch::MinMax);
@@ -2910,6 +2976,7 @@ fn page_settles_with_suns(suns: &[f64]) {
             rock: None,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         };
         let mut m = Map::new(name.clone());
         assert_eq!(m.add_raster("dem", copy), 1);
@@ -2954,6 +3021,68 @@ fn two_maps_lit_otherwise_on_a_page_keep_their_own_shadows() {
 #[test]
 fn many_maps_lit_otherwise_on_a_page_all_get_their_shadows() {
     page_settles_with_suns(&[315.0, 135.0, 45.0, 225.0, 0.0]);
+}
+
+/// A page exported with a relief's shadow softness (#3144): left out or set to the default's own
+/// value it draws today's pixels; a crisp or a wide one draws other pixels, the change growing
+/// with the distance from the default.
+#[test]
+fn a_reliefs_shadow_softness_changes_its_page_only_off_the_default() {
+    use rustgis_data::raster::{ColorHint, Crs, GeoTransform, Raster};
+    let n = 300usize;
+    let heights: Vec<f32> = (0..n * n).map(|i| (((i % n) as f32 / 9.0).sin() + ((i / n) as f32 / 7.0).cos()) * 400.0).collect();
+    let gt = GeoTransform { origin_x: -1.0, origin_y: 1.0, pixel_width: 2.0 / n as f64, pixel_height: -2.0 / n as f64 };
+    let dem = Raster::new("dem", n as u32, n as u32, vec![heights], gt, Crs::LonLat, None, ColorHint::Gray, "Float32").unwrap();
+    let page = |softness: Option<f64>| {
+        let mut rl = rustgis_map::raster::RasterLayer::from_path(dem.clone(), "dem.tif");
+        rl.style.renderer = rustgis_map::raster::RasterRenderer::ShadedRelief {
+            band: 0,
+            ramp: None,
+            azimuth: 315.0,
+            altitude: 15.0,
+            // Slopes up to about 35°, so that much of the page lies in or at the edge of a shadow.
+            z_factor: 12.0,
+            shadow: 1.0,
+            sky: 0.0,
+            fill: 0.0,
+            rock: None,
+            ambient: None,
+            balanced: false,
+            shadow_softness: softness,
+        };
+        let mut m = Map::new("m");
+        assert_eq!(m.add_raster("dem", rl), 1);
+        let mut l = Layout::new("Layout", 100.0, 100.0);
+        let frame = ElementKind::MapFrame {
+            map: "m".into(),
+            center: Coord::new(0.0, 0.0),
+            scale: 2.5e6,
+            shape: FrameShape::Rectangle,
+            grid: None,
+            sections: Vec::new(),
+            extent_of: None,
+            extent_color: rustgis_map::layout::INDICATOR_COLOR,
+            extent_width: rustgis_map::layout::INDICATOR_WIDTH,
+            border_color: rustgis_map::layout::FRAME_BORDER_COLOR,
+            border_width: rustgis_map::layout::FRAME_BORDER_WIDTH,
+            bearing: 0.0,
+            pitch: 0.0,
+        };
+        l.add("m", (5.0, 5.0, 90.0, 90.0), frame);
+        let (drawn, said) = crate::shadows_said(|| render(&l, &mut [m], 48.0, &PageInfo::default()));
+        assert!(said.notices.is_empty() && !said.to_come, "{softness:?}: {said:?}");
+        drawn.unwrap().data().to_vec()
+    };
+    let today = page(None);
+    assert_eq!(page(Some(rustgis_map::shadow::SOFT_EDGE)), today, "the default's own value draws today's page");
+    // The mean change of a channel from today's page.
+    let change = |other: &[u8]| {
+        assert_eq!(other.len(), today.len());
+        other.iter().zip(&today).map(|(a, b)| f64::from(a.abs_diff(*b))).sum::<f64>() / today.len() as f64
+    };
+    let (crisp, wide, widest) = (change(&page(Some(1.0))), change(&page(Some(10.0))), change(&page(Some(15.0))));
+    assert!(crisp > 0.0 && wide > 0.0, "crisp {crisp}, wide {wide}");
+    assert!(widest > wide, "wide {wide}, widest {widest}");
 }
 
 /// A map with one 100 × 1 raster valued 0–99 by column, styled by `renderer`.
@@ -3004,6 +3133,7 @@ fn a_legend_lists_a_classified_rasters_classes() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     let labels = |rows: &[LegendRow]| -> Vec<String> {
         rows.iter()
@@ -6904,6 +7034,7 @@ fn point_legend(map: &Map) -> Pixmap {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), map, ("", 1), None, opts, 1.0));
     pm
@@ -6922,6 +7053,7 @@ fn recorded_legend(map: &Map, side: u32) -> Pixmap {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     legend(&mut c, Rect::from_xywh(0.0, 0.0, side as f32, side as f32).unwrap(), map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7146,6 +7278,7 @@ fn a_legend_grows_to_hold_a_large_point() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 47.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(pm.data() == blank.data());
@@ -7190,6 +7323,7 @@ fn a_legends_text_size_scales_its_rows_but_not_its_point_symbols() {
         size: 2.0,
         names: true,
         text_size: 18.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| legend(c, Rect::from_xywh(0.0, 0.0, 200.0, 200.0).unwrap(), &map, ("", 1), None, opts, 1.0));
     assert!(same_corner(&pm, &drawn_point(&s(40.0), &[], (24.0, 24.0), 1.0), 48, 48), "the symbol as the map draws it");
@@ -7609,6 +7743,7 @@ fn a_recorded_point_is_cut_at_its_box() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     legend(&mut c, Rect::from_xywh(0.5, 0.5, 2099.0, 2099.0).unwrap(), &map, ("", 1), None, opts, 1.0);
     let (_, _, items) = c.into_drawing().unwrap().finish();
@@ -7742,6 +7877,7 @@ fn an_oversized_point_stays_in_its_row() {
             size: 1.0,
             names: true,
             text_size: 9.0,
+            class_labels: &NO_CLASS_LABELS,
         };
         crate::canvas::with_canvas(&mut pm, |c| {
             legend(c, Rect::from_xywh(0.0, 0.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -7780,6 +7916,7 @@ fn a_see_through_point_larger_than_the_canvas_covers_it_from_off_its_edge() {
         size: 1.0,
         names: true,
         text_size: 9.0,
+        class_labels: &NO_CLASS_LABELS,
     };
     crate::canvas::with_canvas(&mut pm, |c| {
         legend(c, Rect::from_xywh(-50.0, -50.0, 2100.0, 2100.0).unwrap(), &map, ("", 1), None, opts, 1.0)
@@ -7993,6 +8130,60 @@ fn a_section_line_past_mercators_reach_is_not_drawn() {
     assert!(end(85.0).is_ok(), "{:?}", end(85.0));
 }
 
+/// A section line moved across itself is drawn where it was moved to, its place kept along it
+/// whatever the frame's projection or bearing; in a round frame its place goes where the pointer
+/// is when the shape leaves it out. Off the frame, its ground or its projection, it isn't moved.
+#[test]
+fn a_section_line_moves_across_its_frame() {
+    use rustgis_map::Projection;
+    let (w, h) = (400.0, 200.0);
+    let at = Coord::new(-44.66, -22.38);
+    let moved = |map: &Map, (c, scale, bearing, pitch): (Coord, f64, f64, f64), shape: &FrameShape, line, by, along| {
+        section_moved(map, &frame_camera(map, c, scale, bearing, pitch), (w, h), shape, line, by, along)
+    };
+    let rect = FrameShape::Rectangle;
+    let mut albers = Map::new("albers");
+    albers.projection = Projection::Custom("EPSG:10857".into());
+    for (map, bearing) in [(Map::new("m"), 0.0), (Map::new("m"), 40.0), (albers, -30.0)] {
+        let view = (Coord::new(at.x - 0.1, at.y + 0.05), 1e6, bearing, 0.0);
+        let cam = frame_camera(&map, view.0, view.1, view.2, view.3);
+        let px = |at: Coord| cam.try_to_screen(map.to_map(at).unwrap(), w, h).unwrap();
+        let (x, y) = px(at);
+        let near = |a: (f64, f64), b: (f64, f64)| (a.0 - b.0).abs() < 0.01 && (a.1 - b.1).abs() < 0.01;
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Horizontal(at), -20.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x, y - 20.0)) && matches!(line, SectionLine::Horizontal(_)), "{line:?}");
+        assert!(near(ends[0], (0.0, y - 20.0)) && near(ends[1], (w, y - 20.0)), "{ends:?}");
+        let (line, ends) = moved(&map, view, &rect, SectionLine::Vertical(at), 25.0, 7.0).unwrap();
+        assert!(near(px(line.at()), (x + 25.0, y)) && matches!(line, SectionLine::Vertical(_)), "{line:?}");
+        assert!(near(ends[0], (x + 25.0, 0.0)) && near(ends[1], (x + 25.0, h)), "{ends:?}");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Horizontal(at), h, 7.0), None, "below the frame");
+        assert_eq!(moved(&map, view, &rect, SectionLine::Vertical(at), -w, 7.0), None, "left of the frame");
+    }
+    // A place by a round frame's edge, moved up: the shape is narrower there, so it goes to the
+    // pointer, and there is no line where the pointer is off the shape too.
+    let map = Map::new("m");
+    let here = (at, 1e6, 0.0, 0.0);
+    let cam = frame_camera(&map, at, 1e6, 0.0, 0.0);
+    let edge = SectionLine::Horizontal(map.to_lonlat(cam.to_map(110.0, h / 2.0, w, h)).unwrap());
+    let (line, _) = moved(&map, here, &FrameShape::Circle, edge, -80.0, 210.0).unwrap();
+    let (x, y) = cam.try_to_screen(map.to_map(line.at()).unwrap(), w, h).unwrap();
+    assert!((x - 210.0).abs() < 0.01 && (y - 20.0).abs() < 0.01, "{x} {y}");
+    assert_eq!(moved(&map, here, &FrameShape::Circle, edge, -80.0, 110.0), None);
+    // Across 180°, the place keeps within the longitudes a command takes.
+    let line = SectionLine::Vertical(Coord::new(179.5, 0.0));
+    let (line, _) = moved(&map, (Coord::new(179.5, 0.0), 1e7, 0.0, 0.0), &rect, line, 60.0, 100.0).unwrap();
+    assert!((-180.0..-175.0).contains(&line.at().x), "{line:?}");
+    // Not over the horizon, nor off the globe.
+    let tilted = (at, 5e4, 0.0, 80.0);
+    assert!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), 20.0, 200.0).is_some());
+    assert_eq!(moved(&map, tilted, &rect, SectionLine::Horizontal(at), -99.0, 200.0), None);
+    let mut globe = Map::new("g");
+    globe.projection = Projection::Globe;
+    let whole = (at, 5e8, 0.0, 0.0);
+    assert!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 20.0, 100.0).is_some());
+    assert_eq!(moved(&globe, whole, &rect, SectionLine::Vertical(at), 190.0, 100.0), None);
+}
+
 /// A frame's section lines are drawn over its map in their colour, dashed, with their names at
 /// both ends, clipped to its shape, as pixels and as vectors in a layer of their own; a frame
 /// without one draws the same page as before.
@@ -8093,4 +8284,55 @@ fn section_lines_are_drawn_over_their_frame() {
     };
     let (solid, half) = (faded(255), faded(128));
     assert!(solid == (0, 0, 255) && half.2 == 255 && (100..160).contains(&half.0), "{solid:?} {half:?}");
+}
+
+/// A legend's own text for a class (#3187) stands in for the label the layer gives it, in its rows
+/// and so in what is measured; every other row, and the layer, keep their labels.
+#[test]
+fn a_legend_labels_a_layers_classes_itself() {
+    use rustgis_map::layout::ClassLabels;
+    let mut map = rows_map(4);
+    let labels_of = |rows: &[LegendRow]| -> Vec<String> {
+        rows.iter().filter_map(|r| if let LegendRow::Class(_, e) = r { Some(e.label.clone()) } else { None }).collect()
+    };
+    let listed = ClassLabels::NONE;
+    let opts = |class_labels, hide_other| LegendOptions {
+        show_no_data: false,
+        hide_other,
+        names: true,
+        exclude: &[],
+        labels: &NO_LABELS,
+        class_labels,
+        scale: 1e6,
+        size: 1.0,
+        text_size: 9.0,
+    };
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&listed, false))), ["c0", "c1", "c99"]);
+    assert_eq!(class_row_labels(&map.layers[0]), ["c0", "c1", "c99"]);
+    let mut own = ClassLabels::default();
+    own.by_layer.insert(
+        "PTS".into(),
+        BTreeMap::from([("c0".into(), "First".into()), ("c99".into(), "Elsewhere".into()), ("gone".into(), "Unused".into())]),
+    );
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&own, false))), ["First", "c1", "Elsewhere"]);
+    // The fallback row is still the fallback, whatever it says.
+    assert_eq!(labels_of(&legend_rows(&map, None, &opts(&own, true))), ["First", "c1"]);
+    assert_eq!(class_row_labels(&map.layers[0]), ["c0", "c1", "c99"], "the layer keeps its own");
+    // A longer text is measured as it is drawn.
+    let mut width = |class_labels: &ClassLabels| {
+        let asked = LegendAsked {
+            all_classes: true,
+            hide_other: false,
+            show_no_data: false,
+            layer_names: true,
+            text_size: 9.0,
+            exclude: &[],
+            labels: &NO_LABELS,
+            class_labels,
+        };
+        legend_size_asked_mm(&mut map, 1e6, &asked, 1).unwrap().0
+    };
+    let plain = width(&listed);
+    own.by_layer.get_mut("PTS").unwrap().insert("c1".into(), "A much longer text for the second class".into());
+    assert!(width(&own) > plain);
 }

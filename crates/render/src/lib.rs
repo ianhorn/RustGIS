@@ -618,6 +618,12 @@ pub fn picture_size(b64: &str) -> Option<(u32, u32)> {
     picture::size(b64)
 }
 
+/// The pixel size a base64 picture is drawn from, `None` when a layout draws a placeholder instead.
+/// Decodes the whole image, as drawing it does: [`picture_size`] reads only the header.
+pub fn picture_drawn_size(b64: &str) -> Option<(u32, u32)> {
+    picture::decode(b64).map(|pm| (pm.width(), pm.height()))
+}
+
 pub use picture::{MARKER_PIXELS, MARKER_PIXELS_SIDE, MarkerRefusal, RUN_MARKER_BYTES, RUN_MARKER_PIXELS, SVG_DEPTH, SVG_XML_NODES};
 
 /// Base64 `b64` as a picture marker's image (one kept already, or one before it is set): its
@@ -627,6 +633,13 @@ pub use picture::{MARKER_PIXELS, MARKER_PIXELS_SIDE, MarkerRefusal, RUN_MARKER_B
 /// as a circle. Decoded once for the run, where drawing it finds it.
 pub fn picture_marker_check(b64: &str) -> Result<f32, MarkerRefusal> {
     picture::check(b64)
+}
+
+/// Base64 `b64`, an SVG marker's image from a style that sets its colours, with its `param(…)`
+/// values set from `colours`, or `None` for an image with none; to be checked after
+/// ([`picture_marker_check`]).
+pub fn picture_marker_with_params(b64: &str, colours: &rustgis_map::qgis::SvgColours) -> Result<Option<String>, MarkerRefusal> {
+    picture::with_params(b64, colours)
 }
 
 /// [`picture_marker_check`] for picture marker `p` (one a file gives).
@@ -5617,6 +5630,13 @@ fn render_frame(
                 let collected = match keeping.as_ref().and_then(|(look, made)| layer_meshes::take(&mut cmds, look, made, &rows)) {
                     Some(used) => Ok(used),
                     None => {
+                        // Panned since, the tiles still in the scene are taken as they were made.
+                        let kept_tiles = match &keeping {
+                            Some((look, made)) if mesh_tiled.is_some() => layer_meshes::tiles(look, made, &rows),
+                            _ => std::sync::Arc::from(Vec::new()),
+                        };
+                        let mut made_tiles = Vec::new();
+                        let tiling = mesh_tiled.map(|area| mesh_tiles::Tiling { area, kept: &kept_tiles, made: &mut made_tiles });
                         let collected = mesh::collect_layer(
                             &mut cmds,
                             layer,
@@ -5624,7 +5644,7 @@ fn render_frame(
                             extents,
                             &rows,
                             &mesh_visible,
-                            mesh_tiled,
+                            tiling,
                             ctx.wireframe,
                             ctx.ppp,
                             map_per_px,
@@ -5632,7 +5652,7 @@ fn render_frame(
                         );
                         if let (Ok(used), Some((look, made))) = (collected, keeping) {
                             let kept = cmds.get(before..).unwrap_or_default();
-                            layer_meshes::keep(layer.instance_id(), look, made, &rows, kept, used, layer.selection.len());
+                            layer_meshes::keep(layer.instance_id(), look, made, &rows, kept, made_tiles, used, layer.selection.len());
                         }
                         collected
                     }
@@ -12295,6 +12315,7 @@ mod tests {
                 rock: None,
                 ambient: None,
                 balanced: false,
+                shadow_softness: None,
             };
         };
         let camera = Camera { center: lonlat_to_merc(Coord::new(0.0, 0.0)), res: 1200.0, bearing: 0.0, pitch: 0.0 };
@@ -12332,6 +12353,7 @@ mod tests {
             rock: None,
             ambient: None,
             balanced: false,
+            shadow_softness: None,
         };
         // Drawn only zoomed out past a scale between the centre's and the far band's.
         l.max_scale = Some((centre + farthest) / 2.0);
@@ -12380,6 +12402,7 @@ mod tests {
                 rock: None,
                 ambient: None,
                 balanced: false,
+                shadow_softness: None,
             };
             // Drawn only zoomed in past 1:1: or in a group drawn only there.
             if grouped {
