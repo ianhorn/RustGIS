@@ -1033,7 +1033,8 @@ impl Item {
         }
         // The scheme is the letters before the first colon (`data:` and `mailto:` have no `//`).
         let scheme = lower.split_once(':').map(|(s, _)| s).filter(|s| s.len() > 1 && s.bytes().all(|b| b.is_ascii_alphabetic()));
-        let what = match (scheme, lower.contains("://")) {
+        let slashes = lower.split_once(':').is_some_and(|(_, rest)| rest.starts_with("//"));
+        let what = match (scheme, slashes) {
             (Some(scheme), true) => format!("a {scheme}:// address"),
             (Some(scheme), false) => format!("a {scheme}: address"),
             (None, _) => "a relative address that couldn't be made absolute".to_string(),
