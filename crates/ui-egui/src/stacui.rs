@@ -2303,7 +2303,7 @@ fn raw_note(text: &str, drawn: usize, why: Option<String>) -> Option<String> {
         )
     });
     match (why, cut) {
-        (Some(why), Some(cut)) => Some(format!("{why} {cut}")),
+        (Some(why), Some(cut)) => Some(i18n::fmt("{why} {cut}", &[("why", &why), ("cut", &cut)])),
         (why, cut) => why.or(cut),
     }
 }
