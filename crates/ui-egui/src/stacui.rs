@@ -2612,7 +2612,7 @@ fn formatted(
             let web = href
                 .clone()
                 .filter(|h| document_asset_allowed(item, key, h, source).is_ok())
-                .filter(|h| h.starts_with("https://") || h.starts_with("http://"))
+                .filter(|h| address::is_https(h) || h.get(..7).is_some_and(|s| s.eq_ignore_ascii_case("http://")))
                 .filter(|h| !stac::needs_signing(h));
             ui.push_id(("stac_asset", id, key), |ui| {
                 ui.label(egui::RichText::new(key).small().strong());
