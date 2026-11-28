@@ -331,7 +331,8 @@ fn post_service(app: &mut RustGisApp, url: &str, body: String) -> Answer {
 /// document must be this item (a `Feature` with its id), else it is refused with the reason. The
 /// read can't be stopped once started: an abandoned one runs to its end and its answer is dropped.
 fn fetch_document(app: &mut RustGisApp, url: &str, from_document: bool, id: &str) -> DocAnswer {
-    let from_document = from_document || app.ui.stac.api_from_document;
+    // Read under the reach `start_json` checked the address under (the item's own), not widened
+    // by whether the dialog's API came from a document.
     let connection = selected_connection(app);
     let base = app.ui.stac.api.clone();
     let url = match crate::serviceui::request_from(app, connection.as_deref(), &base, url) {
@@ -386,7 +387,8 @@ struct Landed {
 
 type DocAnswer = Slot<Result<Landed, String>>;
 
-/// An item's own document as the catalog sent it (its keys sorted), for the JSON view.
+/// An item's own document, pretty-printed with its keys sorted (a repeated key keeps its last
+/// value), for the JSON view.
 enum Raw {
     /// Being read from the item's own address.
     Loading(DocAnswer),
@@ -4125,6 +4127,10 @@ mod tests {
         assert!(said.contains("relative address") && !said.contains("://  "), "{said}");
         let said = document_asset_allowed(&item, "k", "ftp://x/a.tif", public).unwrap_err();
         assert!(said.contains("a ftp:// address"), "{said}");
+        for (href, named) in [("data:text/plain;base64,AAAA", "a data: address"), ("mailto:a@b.c", "a mailto: address")] {
+            let said = document_asset_allowed(&item, "k", href, public).unwrap_err();
+            assert!(said.contains(named) && !said.contains("relative"), "{said}");
+        }
     }
 
     #[test]

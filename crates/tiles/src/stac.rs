@@ -1031,9 +1031,12 @@ impl Item {
         if lower.starts_with("https://") || lower.starts_with("http://") || crate::s3::is_s3(&lower) {
             return Ok(());
         }
-        let what = match lower.split_once("://") {
-            Some((scheme, _)) => format!("a {scheme}:// address"),
-            None => "a relative address that couldn't be made absolute".to_string(),
+        // The scheme is the letters before the first colon (`data:` and `mailto:` have no `//`).
+        let scheme = lower.split_once(':').map(|(s, _)| s).filter(|s| s.len() > 1 && s.bytes().all(|b| b.is_ascii_alphabetic()));
+        let what = match (scheme, lower.contains("://")) {
+            (Some(scheme), true) => format!("a {scheme}:// address"),
+            (Some(scheme), false) => format!("a {scheme}: address"),
+            (None, _) => "a relative address that couldn't be made absolute".to_string(),
         };
         Err(format!("{}: asset '{key}' is at {href} ({what}); RustGIS adds assets by their web or s3:// address", self.id))
     }
