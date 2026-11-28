@@ -2165,8 +2165,9 @@ fn results(app: &mut RustGisApp, ui: &mut egui::Ui) {
     if let (Some(text_tab), Some(j)) = (view, app.ui.stac.json.as_mut()) {
         j.text_tab = text_tab;
     }
-    if let Some((i, key, href)) = asset {
-        let Some(item) = app.ui.stac.items.get(i).cloned() else { return };
+    if let Some((i, key, href)) = asset
+        && let Some(item) = app.ui.stac.items.get(i).cloned()
+    {
         add_document_asset(app, &item, &key, &href);
     }
     if cancel {
